@@ -5,7 +5,7 @@ Layout (unzip into <game>/platform/steam/):
   server/ rsrv.exe  pbzmp_server.py  开服务器.bat
   sdk/    README.md  pbz_host.h  example/
 """
-import os, shutil, zipfile
+import os, re, shutil, zipfile
 
 R = os.path.dirname(os.path.abspath(__file__))
 OUT, D = os.path.join(R, "out"), os.path.join(R, "dist", "pbz_pvp")
@@ -43,7 +43,11 @@ with open(os.path.join(R, "sdk/example/example.cpp"), "rb") as f:
 with open(os.path.join(D, "sdk/example/example.cpp"), "wb") as f:
     f.write(src)
 with open(os.path.join(R, "mods/pvp/README.md"), encoding="utf-8") as f:
-    text("README.txt", f.read())
+    md = f.read().split("## 开发者")[0]  # players get everything above the developer section
+lines = [l for l in md.splitlines() if not l.startswith("![")]
+body = "\n".join(lines).replace("`", "")
+body = re.sub(r"(?m)^#+ ", "", body)
+text("README.txt", re.sub(r"\n{3,}", "\n\n", body).strip() + "\n")
 
 z = os.path.join(R, "dist", "pbz_pvp.zip")
 with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:

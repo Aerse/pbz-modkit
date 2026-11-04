@@ -5,6 +5,12 @@
 > 非官方项目，与游戏开发商无关。仓库不含任何游戏文件或资源，不解锁付费 DLC。
 > 内存偏移和游戏版本绑定（当前适配 UE 5.7 的 PC 版），游戏更新后可能失效。使用 Mod 的风险自负，建议先备份存档。
 
+| 联机大厅 | 比赛中 |
+|---|---|
+| ![大厅](docs/images/pvp-lobby.jpg) | ![比赛](docs/images/pvp-fight.jpg) |
+| **CS 步枪（AWP）** | **Mod管理器** |
+| ![AWP](docs/images/sniper-awp.jpg) | ![Mod管理器](docs/images/modman.png) |
+
 ## 功能一览
 
 **加载器（`version.dll`）**
