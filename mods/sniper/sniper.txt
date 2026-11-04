@@ -1,0 +1,6 @@
+name=CS 步枪
+version=0.1
+author=Seed
+api=1
+mp=block
+desc=AWP / AK-47 / M4A4，F6 拿出或收起，1/2/3 切枪
