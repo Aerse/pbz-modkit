@@ -31,7 +31,10 @@ static std::wstring g_dir;          // <exe dir>pbzmp (with a trailing backslash
 static std::vector<Mod> g_mods;     // listed (not hidden) mods, list view order
 static std::vector<std::wstring> g_auto;  // autorun.txt as read (order kept)
 static HWND g_list, g_info;
-enum { kList = 100, kSave, kSaveRun, kFolder };
+enum { kList = 100, kSave, kSaveRun, kFolder, kLink };
+// footer: who made the manager and where to follow updates
+static const wchar_t kAuthor[] = L"Seed";
+static const wchar_t kHome[] = L"https://space.bilibili.com/3361730";
 
 static std::wstring Trim(std::wstring s) {
     while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n' || s.back() == L' ' || s.back() == L'\t')) s.pop_back();
@@ -219,7 +222,8 @@ static void Fill() {
         LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = i; it.pszText = const_cast<wchar_t*>(m.name.c_str());
         ListView_InsertItem(g_list, &it);
         ListView_SetItemText(g_list, i, 1, const_cast<wchar_t*>(m.version.c_str()));
-        ListView_SetItemText(g_list, i, 2, const_cast<wchar_t*>(m.desc.c_str()));
+        ListView_SetItemText(g_list, i, 2, const_cast<wchar_t*>(m.author.c_str()));
+        ListView_SetItemText(g_list, i, 3, const_cast<wchar_t*>(m.desc.c_str()));
         ListView_SetCheckState(g_list, i, m.on);
     }
     g_filling = false;
@@ -249,13 +253,16 @@ static LRESULT CALLBACK Wnd(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                                  12, 12, 600, 260, w, HMENU(kList), nullptr, nullptr);
         SendMessageW(g_list, WM_SETFONT, WPARAM(g_font), TRUE);
         ListView_SetExtendedListViewStyle(g_list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-        const wchar_t* cols[] = {L"Mod", L"版本", L"说明"}; int widths[] = {170, 70, 340};
-        for (int i = 0; i < 3; ++i) { LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = const_cast<wchar_t*>(cols[i]); c.cx = widths[i]; ListView_InsertColumn(g_list, i, &c); }
+        const wchar_t* cols[] = {L"Mod", L"版本", L"作者", L"说明"}; int widths[] = {150, 60, 90, 280};
+        for (int i = 0; i < 4; ++i) { LVCOLUMNW c{}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = const_cast<wchar_t*>(cols[i]); c.cx = widths[i]; ListView_InsertColumn(g_list, i, &c); }
         g_info = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 282, 600, 72, w, nullptr, nullptr, nullptr);
         SendMessageW(g_info, WM_SETFONT, WPARAM(g_font), TRUE);
         Btn(w, L"打开 Mod 文件夹", kFolder, 12, 362, 150);
         Btn(w, L"保存", kSave, 352, 362, 110);
         Btn(w, L"保存并启动游戏", kSaveRun, 472, 362, 140);
+        std::wstring foot = std::wstring(L"作者 ") + kAuthor + L"　　B站主页（点击打开）：" + kHome;
+        HWND link = CreateWindowExW(0, L"STATIC", foot.c_str(), WS_CHILD | WS_VISIBLE | SS_NOTIFY, 12, 404, 600, 22, w, HMENU(kLink), nullptr, nullptr);
+        SendMessageW(link, WM_SETFONT, WPARAM(g_font), TRUE);
         Scan(); Fill(); ShowInfo(-1);
         if (GetFileAttributesW(g_dir.c_str()) == INVALID_FILE_ATTRIBUTES)
             MessageBoxW(w, (L"没找到 Mod 文件夹：\n" + g_dir + L"\n\n请把 Mod管理器.exe 放在游戏的 platform\\steam 文件夹里（和 PBZ.exe、version.dll 同一层）。").c_str(), L"Mod管理器", MB_ICONWARNING);
@@ -282,8 +289,15 @@ static LRESULT CALLBACK Wnd(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == kSave) DoSave(w, false);
         else if (LOWORD(wp) == kSaveRun) DoSave(w, true);
+        else if (LOWORD(wp) == kLink && HIWORD(wp) == STN_CLICKED) ShellExecuteW(nullptr, L"open", kHome, nullptr, nullptr, SW_SHOWNORMAL);
         else if (LOWORD(wp) == kFolder) ShellExecuteW(nullptr, L"open", g_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
+    case WM_CTLCOLORSTATIC:  // the footer link in blue
+        if (GetDlgCtrlID(HWND(lp)) == kLink) { SetTextColor(HDC(wp), RGB(0, 102, 204)); SetBkMode(HDC(wp), TRANSPARENT); return LRESULT(GetSysColorBrush(COLOR_BTNFACE)); }
+        break;
+    case WM_SETCURSOR:
+        if (GetDlgCtrlID(HWND(wp)) == kLink) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+        break;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(w, msg, wp, lp);
@@ -300,6 +314,7 @@ static int Cli(const std::wstring& cmd) {
         out += (ok ? L"saved: " : L"refused: ") + msg + L"\n";
     }
     for (auto& m : g_mods) out += (m.on ? L"[x] " : L"[ ] ") + m.id + L" | " + m.name + L" | " + m.version + L"\n";
+    out += std::wstring(L"author: ") + kAuthor + L" " + kHome + L"\n";
     out += L"autorun:"; for (auto& a : g_auto) out += L" " + a; out += L"\n";
     if (cmd == L"--chain") { std::wstring m; ChainForeign(g_dir.substr(0, g_dir.size() - 6), &m); out += L"chain: " + m + L"\n"; }
     else if (!g_loaderNote.empty()) out += L"loader: " + g_loaderNote + L"\n";
@@ -317,7 +332,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmdline, int show) {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = HBRUSH(COLOR_BTNFACE + 1);
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassW(&wc);
-    RECT r{0, 0, 624, 406}; AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    RECT r{0, 0, 624, 434}; AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     HWND w = CreateWindowW(L"PbzModMan", L"影之刃零 Mod管理器", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, hi, nullptr);
     ShowWindow(w, show);
