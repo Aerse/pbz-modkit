@@ -58,6 +58,7 @@ desc=一句话说明
 requires=seed.pvp>=1.1,other   # 前置 Mod，可带最低版本；缺了不让保存
 conflicts=zhang.camera          # 不能同时启用
 api=2                           # 需要的 host 版本；加载器太旧时不加载，管理器也会提示
+game=CL-302256_JKS-17280        # 适配的游戏版本（PBZ.exe 的文件版本），游戏更新后用来判断是否需要重新适配
 mp=allow                        # allow：能带进联机；block：房间里有人启用时不能开始对战（修改器、作弊类请写 block）
 hidden=1                        # 框架类 Mod，不在列表里显示
 ```

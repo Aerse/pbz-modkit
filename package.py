@@ -24,6 +24,9 @@ def info(path, key):
 
 VER = info("mods/pvp/mp.txt", "version")
 SNIPER_VER = info("mods/sniper/sniper.txt", "version")
+GAME = info("mods/pvp/mp.txt", "game")  # PBZ.exe file version the offsets are for
+if FULL and info("mods/sniper/sniper.txt", "game") != GAME:
+    sys.exit("mp.txt and sniper.txt are for different game versions")
 OUT, D = os.path.join(R, "out"), os.path.join(R, "dist", "pbz_pvp")
 
 
@@ -81,7 +84,9 @@ def plain(md_path, cut=None):
 
 
 name = f"pbz_mods_full-v{VER}" if FULL else f"pbz_pvp-v{VER}"
-head = f"影之刃零 Mod 包 v{VER}\n\n包含: 联机 PVP {VER}"
+head = (f"影之刃零 Mod 包 v{VER}\n\n适配游戏版本: {GAME}（Steam 版 PBZ.exe 的文件版本，右键 → 属性 → 详细信息可查看）\n"
+        "游戏更新后 Mod 可能失效，请等待对应的新版本。\n\n"
+        f"包含: 联机 PVP {VER}")
 if FULL:
     head += f"、CS 步枪 {SNIPER_VER}（仅自测，资源版权属于 Valve，不要外传）"
 readme = head + "\n解压到游戏目录的 platform\\steam\\（和 PBZ.exe 同一层）。\n\n" + "=" * 40 + "\n\n"
