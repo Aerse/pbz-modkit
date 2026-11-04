@@ -750,6 +750,9 @@ std::wstring InfoVal(const std::wstring& path, const wchar_t* key) {
     }
     fclose(f); return out;
 }
+// mp=block mods are unloaded (loader "stop X") while we are in a room and run again after,
+// so they never take part in a match and are not reported to the room.
+static std::vector<std::wstring> g_blockedMods;
 const std::string& LocalMods() {
     static std::string list; static bool done;
     if (done) return list;
@@ -765,7 +768,8 @@ const std::string& LocalMods() {
         if (id.empty() || id[0] == L'#' || id == L"nosave") continue;  // nosave: test-instance helper
         std::wstring info = dir + id + L".txt";
         if (GetFileAttributesW(info.c_str()) == INVALID_FILE_ATTRIBUTES) info = dir + id + L"\\" + id + L".txt";
-        std::string e = uex::Utf8(id) + ":" + uex::Utf8(InfoVal(info, L"version")) + ":" + (InfoVal(info, L"mp") == L"block" ? "b" : "a");
+        if (InfoVal(info, L"mp") == L"block") { g_blockedMods.push_back(id); continue; }
+        std::string e = uex::Utf8(id) + ":" + uex::Utf8(InfoVal(info, L"version")) + ":a";
         for (char& c : e) if (c == ';' || c == ' ') c = '_';
         if (list.size() + e.size() + 1 > 200) break;  // the server's field limit
         if (!list.empty()) list += ';';
@@ -773,6 +777,19 @@ const std::string& LocalMods() {
     }
     fclose(f);
     return list;
+}
+static void SuspendBlocked(bool on) {
+    static bool suspended;
+    LocalMods();
+    if (on == suspended || g_blockedMods.empty()) return;
+    suspended = on;
+    auto h = uex::Host(); if (!h) return;
+    FILE* f = _wfopen((std::wstring(h->dir) + L"cmd.txt").c_str(), L"a, ccs=UTF-8"); if (!f) return;
+    for (auto& id : g_blockedMods) {
+        fwprintf(f, L"\n%ls %ls\n", on ? L"stop" : L"run", id.c_str());
+        h->log((std::wstring(on ? L"mp: room, unloading " : L"mp: left room, running ") + id).c_str());
+    }
+    fclose(f);
 }
 // "" = fine; else who runs a blocked mod, or whose mod versions differ (a warning only)
 std::wstring ModProblem(const net::Room& r, bool* block) {
@@ -1350,6 +1367,7 @@ void Tick(float) {
         if (r.phase == "lobby" && !g.lastPhase.empty()) SetOpen(true);  // back from a match
         g.lastPhase = r.phase;
     }
+    SuspendBlocked(inRoom || st == net::Status::Connecting);
     if (!inRoom) {
         // the room was lost mid-match (server gone, host left): the panel shows why
         if (!g.lastPhase.empty() && g.lastPhase != "lobby" && st == net::Status::Failed && !g.open) SetOpen(true);
