@@ -2,6 +2,8 @@
 
 和朋友在《影之刃零》里 1v1 对战：标题页多出「多人游戏」，建房间、选武器 / 杀器 / 外观和擂台地图，打 BO3。支持 Steam 联机（不用架服务器）和自建中转服务器两种连接方式。
 
+▶ 演示视频：[哔哩哔哩 BV1ERxQ6mEo1](https://www.bilibili.com/video/BV1ERxQ6mEo1/)
+
 ![多人游戏菜单](../../docs/images/pvp-menu.jpg)
 
 ![房间大厅](../../docs/images/pvp-lobby.jpg)

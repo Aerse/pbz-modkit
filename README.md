@@ -5,6 +5,8 @@
 > 非官方项目，与游戏开发商无关。仓库不含任何游戏文件或资源，不解锁付费 DLC。
 > 内存偏移和游戏版本绑定（当前适配 UE 5.7 的 PC 版），游戏更新后可能失效。使用 Mod 的风险自负，建议先备份存档。
 
+▶ 联机 PvP 演示视频：[哔哩哔哩 BV1ERxQ6mEo1](https://www.bilibili.com/video/BV1ERxQ6mEo1/)
+
 | 联机大厅 | 比赛中 |
 |---|---|
 | ![大厅](docs/images/pvp-lobby.jpg) | ![比赛](docs/images/pvp-fight.jpg) |
