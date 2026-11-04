@@ -1,0 +1,6 @@
+name=联机 PVP
+version=1.1
+author=Seed
+api=1
+mp=allow
+desc=和朋友 1v1 对战：多人游戏菜单、房间、武器 / 杀器 / 外观选择、擂台地图

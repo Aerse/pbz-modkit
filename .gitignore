@@ -1,0 +1,11 @@
+out/
+dist/
+*.obj
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.map
+*.ilk
+__pycache__/

@@ -1,0 +1,6 @@
+name=示例 Mod
+version=1.0
+author=你的名字
+desc=SDK 示例：每帧回调、Ctrl+F9 快捷键、函数钩子
+api=2
+mp=allow
