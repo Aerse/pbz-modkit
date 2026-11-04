@@ -69,7 +69,7 @@ host=<slot> left=<本阶段剩余毫秒，0=不限时> winner=<slot|-1> [msg=<�
 （实际是一行。）
 
 - v：房间状态版本，每次变化加 1。客户端对同一房间只接受更大的 v。
-- `m<slot>` 的值是 `name,ready,weapon,score,alive,conn,edge,mods` 八个子字段（旧服务器没有第 7、8 个，客户端按空值处理；旧服务器对 set 的 edge / mods 键回 `bad`，所以 mods 单独发一条 set）。mods 是 `id:版本:标记` 用 `;` 连起来，标记 `a` = 可联机，`b` = 信息文件写了 `mp=block`；房间里任何人有 `b` 时客户端不让房主开始，版本不同只提示，每个先各自做百分号编码，再用逗号连起来（子字段里的逗号因此会被编码），整体不再编码。ready/alive/conn 为 0/1。
+- `m<slot>` 的值是 `name,ready,weapon,score,alive,conn,edge,mods` 八个子字段（旧服务器没有第 7、8 个，客户端按空值处理；旧服务器对 set 的 edge / mods 键回 `bad`，所以 mods 单独发一条 set）。mods 是 `id:版本:标记` 用 `;` 连起来，标记 `a` = 可联机，`b` = 信息文件写了 `mp=block`；新客户端在房间里会先卸载 `mp=block` 的 Mod、不上报它们；房间里任何人有 `b` 时客户端不让房主开始，版本不同只提示，每个先各自做百分号编码，再用逗号连起来（子字段里的逗号因此会被编码），整体不再编码。ready/alive/conn 为 0/1。
 - you 按接收者填写。
 
 ## 阶段
