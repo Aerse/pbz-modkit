@@ -35,7 +35,7 @@
 ```
 pbz-modkit/
 ├─ build.bat            一键构建，产物都放在 out\
-├─ package.py           打 PvP 玩家包 dist\pbz_pvp.zip
+├─ package.py           打玩家包 dist\pbz_pvp-v<版本>.zip
 ├─ loader/              加载器：main.cpp、host.h（Mod 接口）、proxy_exports.h
 ├─ modman/              Mod管理器
 ├─ framework/           UE 5.7 运行时访问，给 Mod 静态链接
@@ -71,7 +71,8 @@ PvP 的详细玩法和开服说明见 [mods/pvp/README.md](mods/pvp/README.md)�
 
 ```bat
 build.bat            :: 编译全部：version.dll modman.exe mp.dll sniper.dll example.dll nettest.exe rsrv.exe
-python package.py    :: 生成 dist\pbz_pvp.zip
+python package.py    :: 生成 dist\pbz_pvp-v<版本>.zip（版本取 mods/pvp/mp.txt 的 version=）
+python package.py --full   :: 本地自测包，额外带 CS 步枪和本地资源，不要发布
 ```
 
 `build.bat` 会自动调用 VS 2022 Build Tools 的 `vcvars64.bat`。如果你装的是其他版本，先在「x64 Native Tools Command Prompt」里运行它，或者修改脚本开头的 `VCVARS`。
