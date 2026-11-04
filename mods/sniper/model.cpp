@@ -45,9 +45,14 @@ ik::V Sock(UObject* m, const wchar_t* b) {
     ue::Params s(uex::Fn(m, L"GetSocketLocation")); s.Set(L"InSocketName", uex::Name(b)); s.Call(m);
     return ik::FromU(s.Get<uex::Vec>(L"ReturnValue"));
 }
-void SetFov(float fov) {  // PlayerController exec FOV; 0 restores the default
+void SetFov(float fov) {  // PlayerCameraManager LockedFOV (what the FOV exec sets); 0 unlocks
+    // the PlayerController FOV exec does nothing in shipping builds since the 11-04 update.
+    // LockedFOV is native, right after DefaultFOV (APlayerCameraManager: DefaultFOV, LockedFOV, ...)
     auto pc = uex::PC(); if (!pc) return;
-    if (auto f = uex::Fn(pc, L"FOV")) { ue::Params p(f); p.Set<float>(L"NewFOV", fov); p.Call(pc); }
+    int po = ue::FindProp(pc->cls, L"PlayerCameraManager").offset; if (po < 0) return;
+    auto cm = ue::At<UObject*>(pc, po); if (!cm) return;
+    int fo = ue::FindProp(cm->cls, L"DefaultFOV").offset; if (fo < 0) return;
+    *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(cm) + fo + 4) = fov > 0 ? fov : 0.f;
 }
 
 // ---- meshes: glb metres, Y up, barrel along +Z -> UE cm, Z up, barrel along +X ----

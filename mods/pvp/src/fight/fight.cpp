@@ -351,7 +351,7 @@ void DriveGhost(Ghost& g, const net::State& s) {
     // walking follows the local floor), velocity stays for the locomotion graph
     Place(a, {dst.x, dst.y, std::fabs(dz) < 40 ? c.z : dst.z}, g.yaw, false);
     VelRef(cm) = vel;
-    if (now >= g.nextLog) { g.nextLog = now + 2; uex::Log(L"fight: ghost %d err %.0f v %.0f ctrl %p", g.slot, dist, std::hypot(vel.x, vel.y), At<UObject*>(a, 0x2e0)); }
+    if (now >= g.nextLog) { g.nextLog = now + 2; auto st = net::GetStats(g.slot); uex::Log(L"fight: ghost %d err %.0f v %.0f ctrl %p rx %.0f/s rtt %d delay %.0f jit %.0f starves %d", g.slot, dist, std::hypot(vel.x, vel.y), At<UObject*>(a, 0x2e0), st.rxPerSec, st.rttMs, st.delayMs, st.jitterMs, st.starves); }
 }
 
 int DmgPct() { net::Room r; return net::GetRoom(r) && r.dmg > 0 ? r.dmg : 100; }
