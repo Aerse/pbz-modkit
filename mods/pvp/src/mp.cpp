@@ -38,7 +38,7 @@ static bool AtTitle() { return WorldPkg() == kTitle; }
 static void Open(const wchar_t* level) {
     uex::SaveVeto(true); fileguard::On();  // before the open: the level writes the save right away
     uex::Log(L"open %s (from %s)", level, WorldPkg().c_str());
-    uex::Console((std::wstring(L"open ") + level).c_str());
+    uex::OpenLevel(level);
     g_opened = g_guarded = true; g_travel = true; g_travelAt = net::Now(); g_arrivedAt = -1;
 }
 static void GoTitle() {

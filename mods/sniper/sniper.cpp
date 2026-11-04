@@ -263,7 +263,7 @@ static void Tick(void*, float dtf) {
     bool rk = Pressed('R'), tk = Pressed('T'), ek = Pressed('E');
     if (!me) { if (g_on) Unequip(); return; }
     bool in = InputOk();
-    if (f6 && in) { if (g_on) Unequip(); else Equip(me, g_cur); }
+    if ((f6 && in) || g_test.equip) { g_test.equip = false; if (g_on) Unequip(); else Equip(me, g_cur); }
     TestCmds(me);
     AimStep();
     FxTick(dt);

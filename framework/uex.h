@@ -65,6 +65,7 @@ void SetAttr(UObject* ch, int off, float v);    // base and current
 // assets, console
 UObject* LoadAsset(const wchar_t* path);  // "/Game/.../X.X" soft path, blocking, cached
 void Console(const wchar_t* cmd);
+void OpenLevel(const wchar_t* level);
 
 // strings
 FText Text(const std::wstring& s);   // cached per string

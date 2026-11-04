@@ -8,7 +8,7 @@ namespace ue {
 // tens of MB per FindObject, about 220 GB in an hour of tests.)
 // Pool layout: +0x08 current block (u32), +0x10 block pointers. An entry is 2-byte aligned:
 // u16 header (length << 6 | wide flag in bit 0), then the characters.
-constexpr uintptr_t kNamePool = 0x14dd11ac0;
+constexpr uintptr_t kNamePool = 0x14dd86ac0;
 
 static const uint8_t* Entry(uint32_t id) {
     auto pool = reinterpret_cast<const uint8_t*>(kNamePool);

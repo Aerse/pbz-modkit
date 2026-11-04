@@ -1,11 +1,11 @@
-// Minimal UE5.7 runtime access for PBZ (CL-301524_JKS-17219). Offsets are tied to this game build.
+// Minimal UE5.7 runtime access for PBZ (CL-302256_JKS-17280, 2026-11-04 build). Offsets are tied to this game build.
 #pragma once
 #include <cstdint>
 #include <string>
 
 namespace ue {
-constexpr uintptr_t kObjObjects    = 0x14ddb3c58;  // FUObjectItem** chunk table
-constexpr uintptr_t kNumElements   = 0x14ddb3c60;  // int32
+constexpr uintptr_t kObjObjects    = 0x14de28c68;  // FUObjectItem** chunk table
+constexpr uintptr_t kNumElements   = 0x14de28c70;  // int32
 constexpr uintptr_t kFNameToString = 0x14144d2c0;  // void(const FName*, FString*); allocates, don't use
 constexpr int kItemSize = 24, kItemObjOff = 8, kChunk = 65536;
 

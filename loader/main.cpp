@@ -55,9 +55,9 @@ static std::wstring ModDir() {
 }
 
 // ---- tick hub ------------------------------------------------------------------------------
-constexpr uintptr_t kEngineVTable = 0x14b1b3900;
-constexpr int kTickSlot = 0xd2;
-constexpr uintptr_t kNumObjects = 0x14ddb3c60;
+constexpr uintptr_t kEngineVTable = 0x14b1f9290;
+constexpr int kTickSlot = 0x5e;
+constexpr uintptr_t kNumObjects = 0x14de28c70;
 using TickFn = void(__fastcall*)(void*, float, bool);
 
 struct TickEntry { int id; void (*fn)(void*, float); void* ctx; HMODULE owner; };

@@ -52,6 +52,7 @@ void TestCmds(UObject* me) {
         double v[4]{};
         if (MainCmd(me, c)) continue;
         if (c == L"fire") g_test.fire = true;
+        else if (c == L"equip") g_test.equip = true;
         else if (starts(L"skip ")) g_test.skip = _wtoi(arg(5));
         else if (c == L"interact") g_test.interact = true;
         else if (starts(L"icheck")) {  // the player's interact component: why the prompt is off

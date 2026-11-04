@@ -139,7 +139,7 @@ bool Pressed(int vk);  // edge since the last call for this key
 void BlockKeys(bool on);
 
 // ---- tests (tests.cpp): <mod dir>sniper.cmd, one command per line, read every tick ----
-struct TestState { int skip = 0; bool interact = false, fire = false, hold = false, aimHead = false, ads = false; int burst = 0, aimSteps = 0; UObject* aimAt = nullptr; double aimOff = 30; double walkT = 0, walkF = 0, walkR = 0; };
+struct TestState { int skip = 0; bool interact = false, equip = false, fire = false, hold = false, aimHead = false, ads = false; int burst = 0, aimSteps = 0; UObject* aimAt = nullptr; double aimOff = 30; double walkT = 0, walkF = 0, walkR = 0; };
 extern TestState g_test;
 void TestCmds(UObject* me);
 void AimStep();  // turns the camera onto g_test.aimAt, a step per tick

@@ -254,6 +254,14 @@ void Console(const wchar_t* cmd) {
     p.Call(lib);
 }
 
+// GameplayStatics.OpenLevel: the "open" console command does nothing in shipping builds since the 11-04 update
+void OpenLevel(const wchar_t* level) {
+    auto gs = GameplayStatics(); auto w = World(); if (!gs || !w) return;
+    Params p(Fn(gs, L"OpenLevel"));
+    p.Set(L"WorldContextObject", w); p.Set(L"LevelName", Name(level)); p.Set<bool>(L"bAbsolute", true);
+    p.Call(gs);
+}
+
 FText Text(const std::wstring& s) {
     static std::unordered_map<std::wstring, FText> cache;
     if (auto it = cache.find(s); it != cache.end()) return it->second;
