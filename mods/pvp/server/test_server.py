@@ -594,6 +594,208 @@ class TestMatch(Base):
         h.wait_phase("count", timeout=2)
 
 
+def mf(st, slot):
+    """Member subfields of STATE m<slot>: name,ready,weapon,score,alive,conn,edge,modh,life,deaths."""
+    return st["m%d" % slot].split(",")
+
+
+class TestV2(Base):
+    def room(self, n, **conf):
+        """n members in an ffa room (max = conf max or n), conf applied, all ready."""
+        cs = [self.client() for _ in range(n)]
+        ok, r = cs[0].create(max=conf.pop("max", n))
+        self.assertTrue(ok)
+        for c in cs[1:]:
+            self.assertTrue(c.join(r["code"], name="p%d" % len(self.clients))[0])
+        if conf:
+            self.assertEqual(cs[0].ctrl("conf", **conf), (True, {}))
+        for c in cs[1:]:
+            self.assertTrue(c.ctrl("set", ready=1)[0])
+        return cs
+
+    def wait_member(self, c, slot, pred, timeout=3.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            c.pump(0.02)
+            if c.states and pred(mf(c.states[-1], slot)):
+                return c.states[-1]
+        raise AssertionError(f"m{slot} condition not met, last={c.states[-1] if c.states else None}")
+
+    def test_version(self):
+        h = self.client()
+        ok, r = h.create()
+        self.assertTrue(ok)
+        g = self.client()
+        self.assertEqual(g.join(r["code"], ver=1)[1]["reason"], "version")
+        self.assertEqual(g.join(r["code"], ver=3)[1]["reason"], "version")
+        self.assertTrue(g.join(r["code"])[0])
+        self.assertEqual(srv.VERSION, 1)  # the header version stays 1
+
+    def test_state_escaping(self):
+        h = self.client()
+        name = "甲 a,b=c%d"
+        ok, r = h.create(name=name)
+        self.assertTrue(ok)
+        h.pump(0.1)
+        st = h.states[-1]
+        # UTF-8 raw, only space , = % (and controls) escaped
+        self.assertEqual(mf(st, 0)[0], "甲%20a%2Cb%3Dc%25d")
+        self.assertEqual(srv.state_enc(name), "甲%20a%2Cb%3Dc%25d")
+        self.assertEqual(st["msg"], name + " created the room")
+        self.assertTrue(h.ctrl("set", weapon="/Game/武器 1,2")[0])
+        h.pump(0.1)
+        self.assertEqual(mf(h.states[-1], 0)[2], "/Game/武器%201%2C2")
+        self.assertTrue(h.ctrl("conf", rules="a:1,bb:22")[0])
+        h.pump(0.1)
+        self.assertEqual(h.states[-1]["rules"], "a:1,bb:22")  # sent as a:1%2Cbb:22
+
+    def test_mods_query(self):
+        h, g, _ = self.room2()
+        mods = "mp:1.5:a;外挂:2,x:b"
+        self.assertTrue(g.ctrl("set", mods=mods)[0])
+        h.pump(0.1)
+        self.assertEqual(mf(h.states[-1], 1)[7], srv.mod_hash(mods))
+        self.assertEqual(mf(h.states[-1], 0)[7], "")
+        self.assertEqual(h.ctrl("mods", slot=1), (True, {"slot": "1", "mods": mods}))
+        self.assertEqual(g.ctrl("mods", slot=0), (True, {"slot": "0", "mods": ""}))
+        self.assertEqual(h.ctrl("mods", slot=5)[1]["reason"], "value")
+        self.assertEqual(h.ctrl("mods", slot=8)[1]["reason"], "bad")
+        self.assertEqual(h.ctrl("mods")[1]["reason"], "bad")
+
+    def test_eight_players_ffa(self):
+        cs = self.room(8, rounds=1, time=0)
+        st = cs[0].state()
+        self.assertEqual((st["mode"], st["max"], st["cap"]), ("ffa", "8", "8"))
+        self.assertEqual(sorted(k for k in st if k[:1] == "m" and k[1:].isdigit()), ["m%d" % i for i in range(8)])
+        self.assertEqual(self.client().join(st["code"])[1]["reason"], "full")
+        self.assertEqual(cs[0].ctrl("start"), (True, {}))
+        self.to_fight(1, *cs)
+        self.assertEqual(cs[7].ctrl("dead", round=1, by=8)[1]["reason"], "bad")
+        for i in range(1, 7):
+            self.assertTrue(cs[i].ctrl("dead", round=1, by=7 if i < 6 else 0)[0])
+        cs[0].pump(0.1)
+        st = cs[0].states[-1]
+        self.assertEqual(st["phase"], "fight")  # two still alive
+        self.assertEqual([mf(st, i)[4] for i in range(8)], ["1"] + ["0"] * 6 + ["1"])
+        self.assertEqual(mf(st, 3)[9], "1")  # deaths count in every mode
+        self.assertTrue(cs[0].ctrl("dead", round=1, by=7)[0])
+        st = cs[3].wait_phase("end")
+        self.assertEqual((st["winner"], mf(st, 7)[3], mf(st, 0)[3]), ("7", "1", "0"))  # ffa: round win = score
+        st = cs[3].wait_phase("over")
+        self.assertEqual(st["winner"], "7")
+
+    def test_max_above_cap(self):
+        self.assertEqual(self.client().create(max=9)[1]["reason"], "value")
+        self.server.lim.max_players = 4
+        self.assertEqual(self.client().create(max=5)[1]["reason"], "value")
+        h = self.client()
+        ok, r = h.create(max=4)
+        self.assertTrue(ok)
+        st = h.state()
+        self.assertEqual((st["cap"], st["max"], st["mode"]), ("4", "4", "ffa"))
+        self.assertEqual(h.ctrl("conf", max=5)[1]["reason"], "value")
+        self.assertTrue(h.ctrl("conf", max=3)[0])
+
+    def test_rules_validation(self):
+        cs = self.room(3, max=4)
+        h = cs[0]
+        bad = [{"mode": "tdm"}, {"mode": "DUEL"}, {"maps": 65536}, {"maps": -1}, {"respawn": 0},
+               {"respawn": 11}, {"kills": 51}, {"kills": -1}, {"rules": "A:1"}, {"rules": "a=1"},
+               {"rules": "a:1;b:2"}, {"rules": "a" * 201}, {"time": 601}, {"time": 29},
+               {"mode": "duel"},           # sets max 2 but slot 2 is taken
+               {"mode": "duel", "max": 3}, {"max": 2},
+               {"rounds": 3, "kills": 51}]  # nothing of a rejected conf applies
+        for kw in bad:
+            self.assertEqual(h.ctrl("conf", **kw)[1]["reason"], "value", kw)
+        st = h.state()
+        self.assertEqual((st["mode"], st["max"], st["rounds"], st["kills"]), ("ffa", "4", "3", "10"))
+        ok = {"mode": "kill", "maps": 65535, "respawn": 10, "kills": 50, "rules": "a" * 200, "time": 600}
+        self.assertEqual(h.ctrl("conf", **ok), (True, {}))
+        st = h.state()
+        self.assertEqual((st["mode"], st["maps"], st["respawn"], st["kills"], st["rules"], st["time"]),
+                         ("kill", "65535", "10", "50", "a" * 200, "600"))
+        self.assertTrue(h.ctrl("conf", respawn=1, kills=0, rules="")[0])
+        cs[2].ctrl("leave")
+        self.assertTrue(h.ctrl("conf", mode="duel")[0])  # max follows
+        st = h.state()
+        self.assertEqual((st["mode"], st["max"]), ("duel", "2"))
+
+    def test_maps(self):
+        h, g, _ = self.room2(maps=1 << 13)
+        self.start_match(h, g)
+        self.assertEqual(h.wait_phase("load")["map"], "13")
+        h2, g2, _ = self.room2(maps=(1 << 2) | (1 << 9), map=4)
+        self.start_match(h2, g2)
+        self.to_fight(1, h2, g2)  # (to_fight waits for the load STATE itself)
+        seen = {h2.states[-1]["map"]}
+        g2.ctrl("dead", round=1, by=0)
+        seen.add(h2.wait_phase("load")["map"])
+        self.assertTrue(seen <= {"2", "9"}, seen)
+        h3, g3, _ = self.room2(map=4)
+        self.start_match(h3, g3)
+        self.assertEqual(h3.wait_phase("load")["map"], "4")  # maps=0 -> map
+
+    def test_kill_start_value(self):
+        h, g, _ = self.room2(mode="kill", time=0, kills=0)
+        self.assertTrue(g.ctrl("set", ready=1)[0])
+        self.assertEqual(h.ctrl("start")[1]["reason"], "value")
+        self.assertTrue(h.ctrl("conf", kills=1)[0])
+        self.assertTrue(h.ctrl("start")[0])
+
+    def test_kill_scoring_respawn_end(self):
+        cs = self.room(3, mode="kill", kills=2, time=0, respawn=1, rounds=5)
+        h, g, x = cs
+        self.assertTrue(h.ctrl("start")[0])
+        self.to_fight(1, h, g, x)
+        self.assertEqual([mf(h.states[-1], i)[8:] for i in range(3)], [["0", "0"]] * 3)
+        self.assertTrue(g.ctrl("dead", round=1, by=0, life=0)[0])
+        self.assertTrue(x.ctrl("dead", round=1, by=2)[0])   # suicide: no score
+        self.assertTrue(g.ctrl("dead", round=1, by=0, life=0)[0])  # duplicate
+        h.pump(0.1)
+        st = h.states[-1]
+        self.assertEqual(st["phase"], "fight")  # one alive does not end a kill round
+        self.assertEqual([mf(st, i)[3:5] for i in range(3)], [["1", "1"], ["0", "0"], ["0", "0"]])
+        self.assertEqual([mf(st, i)[8:] for i in range(3)], [["0", "0"], ["0", "1"], ["0", "1"]])
+        st = self.wait_member(h, 1, lambda f: f[4] == "1")  # respawn after 1 s
+        self.assertEqual(mf(st, 1)[8:], ["1", "1"])
+        self.wait_member(h, 2, lambda f: f[4] == "1")
+        self.assertTrue(g.ctrl("dead", round=1, by=0, life=0)[0])  # a death from the old life
+        h.pump(0.1)
+        self.assertEqual(mf(h.states[-1], 1)[4], "1")
+        self.assertEqual(mf(h.states[-1], 0)[3], "1")
+        self.assertEqual(g.ctrl("dead", round=1, by=0, life=10000)[1]["reason"], "bad")
+        self.assertTrue(g.ctrl("dead", round=1, by=0, life=1)[0])
+        st = h.wait_phase("end")
+        self.assertEqual((st["winner"], mf(st, 0)[3], mf(st, 1)[9]), ("0", "2", "2"))  # no extra round point
+        st = h.wait_phase("over")
+        self.assertEqual((st["winner"], st["round"], mf(st, 0)[3]), ("0", "1", "2"))
+        st = h.wait_phase("lobby")
+        for c in (g, x):
+            self.assertTrue(c.ctrl("set", ready=1)[0])
+        self.assertTrue(h.ctrl("start")[0])
+        st = h.wait_phase("load")
+        self.assertEqual([mf(st, i)[3] for i in range(3)] + [mf(st, i)[9] for i in range(3)], ["0"] * 6)
+
+    def test_kill_time_up(self):
+        h, g, _ = self.room2(mode="kill", time=30, kills=0)
+        self.start_match(h, g)
+        self.to_fight(1, h, g)
+        self.expire_timer()
+        st = h.wait_phase("end")
+        self.assertEqual(st["winner"], "-1")  # 0:0 draw
+        self.assertEqual(h.wait_phase("over")["winner"], "-1")
+        h.wait_phase("lobby")
+        self.start_match(h, g)
+        self.to_fight(1, h, g)
+        h.ctrl("dead", round=1, by=1)
+        h.ctrl("hp", round=1, pct=1000)
+        g.ctrl("hp", round=1, pct=10)  # hp does not matter in kill mode
+        h.pump(0.1)
+        self.expire_timer()
+        self.assertEqual(h.wait_phase("end")["winner"], "1")
+        self.assertEqual(h.wait_phase("over")["winner"], "1")
+
+
 class TestDisconnect(Base):
     def test_conn_and_remove_and_host_migration(self):
         self.server.t.conn_lost, self.server.t.remove = 1.0, 2.0
