@@ -3,7 +3,7 @@
   --full  also packs the sniper mod with its local assets (mods/sniper/assets/cache, not in
           the repo, never published) into dist/pbz_mods_full-v<ver>.zip, for local testing.
 Layout (unzip into <game>/platform/steam/), one folder per mod under pbzmp/:
-  version.dll  Mod管理器.exe  README.txt
+  version.dll  Mod管理器.exe  README.txt  更新日志.txt (from CHANGELOG.md)
   pbzmp/  autorun.txt
   pbzmp/mp/  mp.dll  mp.txt  maps/*.png
   pbzmp/sniper/  sniper.dll  sniper.txt  cache/   (--full only)
@@ -88,6 +88,10 @@ def plain(md_path, cut=None):
         md = f.read()
     if cut:
         md = md.split(cut)[0]
+    return plain_text(md)
+
+
+def plain_text(md):
     out = []
     for l in md.splitlines():
         if l.startswith("![") or re.match(r"^\|?\s*-{3,}", l):
@@ -120,6 +124,13 @@ if FULL:
     readme += "\n" + "=" * 40 + "\n\n" + plain("mods/sniper/README.md", "## 资源")
     readme += "\n启用: 打开 Mod管理器.exe，勾选「CS 步枪」，保存，重启游戏。进联机房间时它会自动卸载，离开房间后自动恢复。\n"
 text("README.txt", "﻿" + readme)  # BOM: old Notepad reads it as UTF-8
+# 更新日志.txt from CHANGELOG.md, newest first; every release needs its own section there
+with open(os.path.join(R, "CHANGELOG.md"), encoding="utf-8") as f:
+    log = f.read()
+if not re.search(rf"(?m)^## v{re.escape(VER)}（", log):
+    sys.exit(f"CHANGELOG.md: no '## v{VER}（date）' section, write the release notes first")
+log = "# 更新日志\n\n" + log[log.index("\n## "):].lstrip("\n")  # without the note for maintainers
+text("更新日志.txt", "﻿" + plain_text(log))
 
 z = os.path.join(R, "dist", name + ".zip")
 with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
