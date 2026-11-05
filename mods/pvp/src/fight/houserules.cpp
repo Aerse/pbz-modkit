@@ -5,4 +5,5 @@ void Begin(const rules::Rules&, ue::UObject*) {}
 void Tick(const rules::Rules&, ue::UObject*, float) {}
 void End(ue::UObject*) {}
 float OutgoingScale(ue::UObject*) { return 1.f; }
+std::wstring Violation(const rules::Rules&, ue::UObject*) { return L""; }
 }
