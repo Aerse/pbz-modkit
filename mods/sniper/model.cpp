@@ -69,7 +69,7 @@ static bool LoadMesh(int i) {
     m.tried = true;
     std::wstring path = g_cacheDir + g_wpn[i].id + L".bin";
     FILE* f = _wfopen(path.c_str(), L"rb");
-    if (!f) { uex::Log(L"sniper: no %s", path.c_str()); return false; }
+    if (!f) { uex::Log(L"no %s", path.c_str()); return false; }
     char tag[4]; uint32_t nv = 0, ni = 0;
     fread(tag, 1, 4, f); fread(&nv, 4, 1, f); fread(&ni, 4, 1, f);
     if (memcmp(tag, "AWPM", 4) || nv > 2000000 || ni > 6000000 || ni % 3) { fclose(f); return false; }
@@ -88,7 +88,7 @@ static bool LoadMesh(int i) {
     for (size_t k = 0; k + 2 < ni; k += 3) {  // the x / y swap flips handedness: reverse the winding
         m.tri[k] = int32_t(idx[k]); m.tri[k + 1] = int32_t(idx[k + 2]); m.tri[k + 2] = int32_t(idx[k + 1]);
     }
-    uex::Log(L"sniper: %s mesh %u verts %u tris", g_wpn[i].id, nv, ni / 3);
+    uex::Log(L"%s mesh %u verts %u tris", g_wpn[i].id, nv, ni / 3);
     return true;
 }
 // a material the game renders (the wooden pole's), with the weapon's albedo / normal / ORM textures
@@ -100,7 +100,7 @@ static UObject* MakeMaterial(UObject* owner, int i) {
     }
     auto lib = uex::Lib(L"KismetMaterialLibrary /Script/Engine.Default__KismetMaterialLibrary");
     auto rl = uex::Lib(L"KismetRenderingLibrary /Script/Engine.Default__KismetRenderingLibrary");
-    if (!base || !lib) { uex::Log(L"sniper: no base material"); return nullptr; }
+    if (!base || !lib) { uex::Log(L"no base material"); return nullptr; }
     ue::Params p(uex::Fn(lib, L"CreateDynamicMaterialInstance"));
     p.Set(L"WorldContextObject", owner); p.Set(L"Parent", base); p.Call(lib);
     auto mat = p.Get<UObject*>(L"ReturnValue");
@@ -112,7 +112,7 @@ static UObject* MakeMaterial(UObject* owner, int i) {
         struct FS { const wchar_t* d; int32_t n, m; } fs{path.c_str(), int32_t(path.size() + 1), int32_t(path.size() + 1)};
         ue::Params q(uex::Fn(rl, L"ImportFileAsTexture2D")); q.Set(L"WorldContextObject", owner); q.Set(L"Filename", fs); q.Call(rl);
         auto tx = q.Get<UObject*>(L"ReturnValue");
-        if (!tx) { uex::Log(L"sniper: texture %s failed", path.c_str()); continue; }
+        if (!tx) { uex::Log(L"texture %s failed", path.c_str()); continue; }
         ue::Params c(uex::Fn(mat, L"SetTextureParameterValue")); c.Set(L"ParameterName", uex::Name(t[0])); c.Set(L"Value", tx); c.Call(mat);
     }
     return mat;
@@ -130,7 +130,7 @@ static void SetCompHidden(UObject* c, bool h) {
 static bool MakeActor(UObject* me) {
     auto cls = uex::Class(L"Class /Script/Engine.StaticMeshActor"); auto mesh = MeshOf(me);
     if (!cls || !mesh) return false;
-    auto a = uex::Spawn(cls, uex::Loc(me), 0, me); if (!a) { uex::Log(L"sniper: model spawn failed"); return false; }
+    auto a = uex::Spawn(cls, uex::Loc(me), 0, me); if (!a) { uex::Log(L"model spawn failed"); return false; }
     { ue::Params q(uex::Fn(a, L"SetMobility")); q.Set<uint8_t>(L"InMobility", 2); q.Call(a); }
     { ue::Params q(uex::Fn(a, L"SetActorEnableCollision")); q.Set<bool>(L"bNewActorEnableCollision", false); q.Call(a); }
     ue::Params t(uex::Fn(a, L"K2_AttachToComponent"));
@@ -145,7 +145,7 @@ static UObject* MakeComp(int i) {
     auto cls = uex::Class(L"Class /Script/ProceduralMeshComponent.ProceduralMeshComponent"); if (!cls) return nullptr;
     ue::Params ac(uex::Fn(g_model, L"AddComponentByClass"));
     ac.Set(L"Class", cls); ac.Set<bool>(L"bManualAttachment", false); ac.Set<bool>(L"bDeferredFinish", false); ac.Call(g_model);
-    auto pm = ac.Get<UObject*>(L"ReturnValue"); if (!pm) { uex::Log(L"sniper: AddComponentByClass failed"); return nullptr; }
+    auto pm = ac.Get<UObject*>(L"ReturnValue"); if (!pm) { uex::Log(L"AddComponentByClass failed"); return nullptr; }
     // RelativeTransform left zeroed above means scale 0: set it
     { ue::Params q(uex::Fn(pm, L"SetRelativeScale3D")); q.Set(L"NewScale3D", uex::Vec{1, 1, 1}); q.Call(pm); }
     auto& m = g_md[i];
@@ -156,7 +156,7 @@ static UObject* MakeComp(int i) {
     if (auto mat = MakeMaterial(g_model, i)) { ue::Params s(uex::Fn(pm, L"SetMaterial")); s.Set<int32_t>(L"ElementIndex", 0); s.Set(L"Material", mat); s.Call(pm); }
     { ue::Params q(uex::Fn(pm, L"SetCollisionEnabled")); q.Set<uint8_t>(L"NewType", 0); q.Call(pm); }
     if (auto f = uex::Fn(pm, L"UpdateBounds")) { ue::Params q(f); q.Call(pm); }
-    uex::Log(L"sniper: %s model built", g_wpn[i].id);
+    uex::Log(L"%s model built", g_wpn[i].id);
     return pm;
 }
 bool ModelShow(UObject* me, int wpn) {
@@ -166,7 +166,7 @@ bool ModelShow(UObject* me, int wpn) {
         for (int i = 0; i < kWpnN; ++i) if (g_comp[i]) SetCompHidden(g_comp[i], i != wpn || g_modelHidden);
         g_cur = wpn;
         return g_comp[wpn] != nullptr;
-    } catch (...) { uex::Log(L"sniper: model show crashed"); return false; }
+    } catch (...) { uex::Log(L"model show crashed"); return false; }
 }
 void ModelDrop() {
     if (Live(g_model)) uex::Destroy(g_model);
@@ -216,7 +216,7 @@ static void PoseKeep(UObject* me, float dt) {
     auto ai = AnimOf(me); if (!ai) return;
     if (!g_poseSeq && !g_poseSeqTried) { g_poseSeqTried = true; g_poseSeq = uex::LoadAsset(kPoseSeq); }
     if (!g_poseMont && !g_poseSeq) g_poseMont = FindMont(L"AM_Hun_UnnamedBow_Charge");  // fallback
-    if (!g_poseMont && !g_poseSeq) { static bool told; if (!told) { told = true; uex::Log(L"sniper: no hold pose montage"); } return; }
+    if (!g_poseMont && !g_poseSeq) { static bool told; if (!told) { told = true; uex::Log(L"no hold pose montage"); } return; }
     if (!g_posing || !Live(g_poseMont) || !MontBool(ai, L"Montage_IsActive")) {
         if (g_poseSeq) {
             ue::Params p(uex::Fn(ai, L"PlaySlotAnimationAsDynamicMontage"));
@@ -224,12 +224,12 @@ static void PoseKeep(UObject* me, float dt) {
             p.Set<float>(L"BlendInTime", .2f); p.Set<float>(L"BlendOutTime", .2f); p.Set<float>(L"InPlayRate", g_poseRate);
             p.Set<int32_t>(L"LoopCount", 100000); p.Set<float>(L"BlendOutTriggerTime", -1.f); p.Set<float>(L"InTimeToStartMontageAt", 0.f);
             p.Call(ai); g_poseMont = p.Get<UObject*>(L"ReturnValue");
-            if (!g_poseMont) { uex::Log(L"sniper: hold pose sequence won't play, using the bow draw"); g_poseSeq = nullptr; g_poseRate = 1.5f; g_poseAt = .675; g_poseSlot = L"DefaultSlot"; return; }
+            if (!g_poseMont) { uex::Log(L"hold pose sequence won't play, using the bow draw"); g_poseSeq = nullptr; g_poseRate = 1.5f; g_poseAt = .675; g_poseSlot = L"DefaultSlot"; return; }
         } else {
             ue::Params p(uex::Fn(ai, L"Montage_Play")); p.Set(L"MontageToPlay", g_poseMont); p.Set<float>(L"InPlayRate", g_poseRate);
             p.Set<uint8_t>(L"ReturnValueType", 0); p.Set<float>(L"InTimeToStartMontageAt", 0.f); p.Set<bool>(L"bStopAllMontages", true); p.Call(ai);
         }
-        if (g_posing) uex::Log(L"sniper: hold pose interrupted, raising again");
+        if (g_posing) uex::Log(L"hold pose interrupted, raising again");
         g_posing = true; g_frozen = false; g_frozenFor = 0;
         return;
     }
@@ -239,7 +239,7 @@ static void PoseKeep(UObject* me, float dt) {
     if ((!g_frozen && pos >= g_poseAt) || (g_frozen && (playing || fabs(pos - g_poseAt) > .02))) {
         { ue::Params q(uex::Fn(ai, L"Montage_SetPosition")); q.Set(L"Montage", g_poseMont); q.Set<float>(L"NewPosition", float(g_poseAt)); q.Call(ai); }
         { ue::Params q(uex::Fn(ai, L"Montage_Pause")); q.Set(L"Montage", g_poseMont); q.Call(ai); }
-        if (g_frozen) uex::Log(L"sniper: hold pose re-frozen (pos %.2f playing %d)", pos, playing);
+        if (g_frozen) uex::Log(L"hold pose re-frozen (pos %.2f playing %d)", pos, playing);
         g_frozen = true;
     }
     if (g_frozen) g_frozenFor += dt;
@@ -267,7 +267,7 @@ uint8_t* BoolAt(UObject* o, const wchar_t* name, uint8_t* mask) {
 struct SavedBool { UObject* o; uint8_t* b; uint8_t m; bool v; };
 static std::vector<SavedBool> g_flags;
 static void SetFlag(UObject* o, const wchar_t* name, bool v) {
-    uint8_t m = 0; auto b = BoolAt(o, name, &m); if (!b || !m) { uex::Log(L"sniper: no flag %s", name); return; }
+    uint8_t m = 0; auto b = BoolAt(o, name, &m); if (!b || !m) { uex::Log(L"no flag %s", name); return; }
     g_flags.push_back({o, b, m, (*b & m) != 0});
     *b = v ? uint8_t(*b | m) : uint8_t(*b & ~m);
 }
@@ -293,7 +293,7 @@ static void AimPitchStep(UObject* me, ik::V barrelAt, ik::V barrelDir, float dt)
     g_aimPitch += std::clamp(want - have, -20.0, 20.0) * std::min(1.0, dt * 12.0);
     g_aimPitch = std::clamp(g_aimPitch, -75.0, 75.0);
     AimPitchSet(me, g_aimPitch, 1.f); g_aimOn = true;
-    if (g_dbg) { static double t; if ((t += dt) > 1) { t = 0; uex::Log(L"sniper: aim pitch cam %.1f want %.1f barrel %.1f offset %.1f", cam.pitch, want, have, g_aimPitch); } }
+    if (g_dbg) { static double t; if ((t += dt) > 1) { t = 0; uex::Log(L"aim pitch cam %.1f want %.1f barrel %.1f offset %.1f", cam.pitch, want, have, g_aimPitch); } }
 }
 
 // every frame while equipped: keep the pose; turn the body so the barrel points along the camera's yaw
@@ -323,7 +323,7 @@ void Hold(UObject* me, float dt, const Wpn& w) {
         if (Busy(me)) {  // climbing / mantling / another montage: let the game move the body, rifle stays on hand_r
             if (g_posing) {
                 if (auto ai = AnimOf(me); ai && Live(g_poseMont)) { ue::Params p(uex::Fn(ai, L"Montage_Stop")); p.Set<float>(L"InBlendOutTime", .1f); p.Set(L"Montage", g_poseMont); p.Call(ai); }
-                g_posing = false; g_frozen = false; g_frozenFor = 0; if (g_aimOn) AimPitchSet(me, 0, 0.f); g_aimOn = false; g_aimPitch = 0; uex::Log(L"sniper: hold paused (busy)"); }
+                g_posing = false; g_frozen = false; g_frozenFor = 0; if (g_aimOn) AimPitchSet(me, 0, 0.f); g_aimOn = false; g_aimPitch = 0; uex::Log(L"hold paused (busy)"); }
             return;
         }
         if (!(g_test.skip & 32)) PoseKeep(me, dt);
@@ -337,7 +337,7 @@ void Hold(UObject* me, float dt, const Wpn& w) {
         double span = Len(hl - hr);
         if (g_frozen && g_frozenFor < .4) g_spanRef = span;  // the frozen pose's hand span
         bool odd = span < 8 || span > 95 || (g_spanRef > 0 && g_frozenFor >= .4 && fabs(span - g_spanRef) > 10);
-        if (g_dbg) { static double t; if ((t += dt) > 1) { t = 0; uex::Log(L"sniper: hold span %.0f ref %.0f frozen %d odd %d stance %.1f", span, g_spanRef, g_frozen, odd, g_yawOff); } }
+        if (g_dbg) { static double t; if ((t += dt) > 1) { t = 0; uex::Log(L"hold span %.0f ref %.0f frozen %d odd %d stance %.1f", span, g_spanRef, g_frozen, odd, g_yawOff); } }
         if (odd && g_placed) return;  // a hit reaction / dodge in between: the rifle stays on hand_r (attached)
         uex::Rot r0 = RotOf(hl - hr); r0.roll = 0;
         V f, rt, up; Axes(r0, f, rt, up);
@@ -354,9 +354,9 @@ void Hold(UObject* me, float dt, const Wpn& w) {
         if (g_frozen) AimPitchStep(me, gr, bf, dt);
         if (g_frozen && g_frozenFor > .25 && !g_yawOffOk && !g_noFace) {
             g_yawOff = Wrap(atan2(bf.y, bf.x) / 0.0174532925 - body);
-            g_yawOffOk = true; uex::Log(L"sniper: hold stance: barrel %.1f deg off the body, span %.0f", g_yawOff, span);
+            g_yawOffOk = true; uex::Log(L"hold stance: barrel %.1f deg off the body, span %.0f", g_yawOff, span);
         }
-    } catch (...) { uex::Log(L"sniper: hold crashed"); }
+    } catch (...) { uex::Log(L"hold crashed"); }
 }
 void HoldOff(UObject* me) {
     try {
@@ -395,14 +395,14 @@ void HideWeapons(UObject* me, bool hide) {
             if (!a || a == g_model || std::find(g_hidden.begin(), g_hidden.end(), a) != g_hidden.end()) continue;
             if (kHidden.Bit(a)) continue;  // already hidden by the game
             ue::Params q(uex::Fn(a, L"SetActorHiddenInGame")); q.Set<bool>(L"bNewHidden", true); q.Call(a);
-            g_hidden.push_back(a); uex::Log(L"sniper: hide %s", ue::NameOf(a).c_str());
+            g_hidden.push_back(a); uex::Log(L"hide %s", ue::NameOf(a).c_str());
         }
-    } catch (...) { uex::Log(L"sniper: hide weapons crashed"); }
+    } catch (...) { uex::Log(L"hide weapons crashed"); }
 }
 // test: where the current weapon mesh is and whether it renders
 void ModelDebug() {
     auto comp = g_cur >= 0 ? g_comp[g_cur] : nullptr;
-    uex::Log(L"sniper: mdbg model %p live %d cur %d comp %p live %d hidden %d", g_model, Live(g_model), g_cur, comp, Live(comp), g_modelHidden);
+    uex::Log(L"mdbg model %p live %d cur %d comp %p live %d hidden %d", g_model, Live(g_model), g_cur, comp, Live(comp), g_modelHidden);
     if (!Live(comp)) return;
     ik::V loc; { ue::Params q(uex::Fn(comp, L"K2_GetComponentLocation")); q.Call(comp); loc = ik::FromU(q.Get<uex::Vec>(L"ReturnValue")); }
     uex::Vec sc; { ue::Params q(uex::Fn(comp, L"K2_GetComponentScale")); q.Call(comp); sc = q.Get<uex::Vec>(L"ReturnValue"); }
@@ -410,6 +410,6 @@ void ModelDebug() {
     int ns = -1; { ue::Params q(uex::Fn(comp, L"GetNumSections")); q.Call(comp); ns = q.Get<int32_t>(L"ReturnValue"); }
     UObject* par = nullptr; { ue::Params q(uex::Fn(comp, L"GetAttachParent")); q.Call(comp); par = q.Get<UObject*>(L"ReturnValue"); }
     auto me = uex::Me(); ik::V pl = me ? ik::FromU(uex::Loc(me)) : ik::V{};
-    uex::Log(L"sniper: mdbg at %.0f %.0f %.0f (player %.0f %.0f %.0f) scale %.2f vis %d sections %d parent %s actorHidden %d",
+    uex::Log(L"mdbg at %.0f %.0f %.0f (player %.0f %.0f %.0f) scale %.2f vis %d sections %d parent %s actorHidden %d",
         loc.x, loc.y, loc.z, pl.x, pl.y, pl.z, sc.x, vis, ns, par ? ue::NameOf(par).c_str() : L"-", kHidden.Bit(g_model));
 }

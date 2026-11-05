@@ -40,9 +40,9 @@ bool Init() {
     if (g_tried) return g_xa != nullptr;
     g_tried = true;
     // XAudio2 2.9 (Windows 10+) needs no CoInitializeEx: leave the game thread's COM apartment alone
-    if (FAILED(XAudio2Create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) { g_xa = nullptr; uex::Log(L"sniper: audio: XAudio2Create failed"); return false; }
+    if (FAILED(XAudio2Create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) { g_xa = nullptr; uex::Log(L"audio: XAudio2Create failed"); return false; }
     if (FAILED(g_xa->CreateMasteringVoice(&g_master, 2, 44100))) {
-        g_xa->Release(); g_xa = nullptr; uex::Log(L"sniper: audio: no mastering voice"); return false;
+        g_xa->Release(); g_xa = nullptr; uex::Log(L"audio: no mastering voice"); return false;
     }
     std::wstring dir = g_cacheDir + L"snd\\";
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW((dir + L"*.wav").c_str(), &fd);
@@ -51,11 +51,11 @@ bool Init() {
         do {
             Clip c; std::wstring nm(fd.cFileName); nm.resize(nm.size() - 4);
             if (LoadWav(dir + fd.cFileName, c)) { bytes += c.data.size(); g_clips.emplace(nm, std::move(c)); }
-            else uex::Log(L"sniper: audio: bad wav %s", fd.cFileName);
+            else uex::Log(L"audio: bad wav %s", fd.cFileName);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    uex::Log(L"sniper: audio: %zu sounds, %zu KB", g_clips.size(), bytes / 1024);
+    uex::Log(L"audio: %zu sounds, %zu KB", g_clips.size(), bytes / 1024);
     return true;
 }
 
@@ -79,7 +79,7 @@ static IXAudio2SourceVoice* GetVoice(const WAVEFORMATEX& fmt) {
 static void Start(const wchar_t* name, float vol, float pan) {
     if (!Init() || !name) return;
     auto it = g_clips.find(name);
-    if (it == g_clips.end()) { uex::Log(L"sniper: audio: no sound %s", name); return; }
+    if (it == g_clips.end()) { uex::Log(L"audio: no sound %s", name); return; }
     auto& c = it->second;
     auto v = GetVoice(c.fmt); if (!v) return;
     v->Stop(); v->FlushSourceBuffers();

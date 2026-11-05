@@ -66,9 +66,15 @@ bool Trace(UObject* ctx, Vec a, Vec b, Vec* hit);     // Visibility line trace, 
 //   static uex::Prop kPawn{L"Class /Script/Engine.Controller", L"Pawn", 0x2f0};
 //   UObject* pawn = kPawn.Of<UObject*>(pc);
 // BoolProperty: give the fallback mask (4th value); Mask() then is the field's bit.
+// Every Prop is also checked once right after the mod loads (on the first engine tick after
+// SetHost); loader.log then has one line: "fields <mod>: 120 checked, 0 moved, 0 missing".
 struct Prop {
-    const wchar_t* owner; const wchar_t* name; int fallback; uint8_t fallbackMask = 0;
-    int off = -1; uint8_t mask = 0; bool done = false; uint64_t retryAt = 0;
+    enum State : uint8_t { kUnchecked, kOk, kMoved, kMissing, kNoClass };
+    const wchar_t* owner; const wchar_t* name; int fallback; uint8_t fallbackMask;
+    int off = -1; uint8_t mask = 0; bool done = false; State state = kUnchecked; uint64_t retryAt = 0;
+    Prop(const wchar_t* owner, const wchar_t* name, int fallback, uint8_t fallbackMask = 0);
+    Prop(const Prop&) = delete;
+    Prop& operator=(const Prop&) = delete;
     int Resolve();
     operator int() { return done ? off : Resolve(); }
     uint8_t Mask() { if (!done) Resolve(); return mask; }
@@ -79,6 +85,10 @@ struct Prop {
     void SetBit(void* o, bool v) { int k = *this; auto& b = static_cast<uint8_t*>(o)[k]; b = v ? (b | mask) : (b & ~mask); }
 };
 int StructSize(const wchar_t* owner, int fallback);  // PropertiesSize of a native struct, cached
+// Resolves every Prop of this mod made so far (those at namespace scope, and function-local
+// statics already reached). Runs by itself after SetHost; call it again to re-check.
+struct FieldStats { int checked, moved, missing, noClass; };
+FieldStats CheckFields(bool log = true);
 // any object's field by name (its own class, up the Super chain), cached per class; -1 / null if none
 int OffsetOf(UObject* cls, const wchar_t* prop);
 template <class T> T* Field(UObject* o, const wchar_t* prop) {

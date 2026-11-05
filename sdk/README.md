@@ -8,6 +8,7 @@
 - `framework/`：UE 反射框架（`uex.h`）。按名字找对象、字段、函数，不写内存地址
 - `hello/`：用框架写的示例，Ctrl+F10 把血量、架势、位置写进日志（推荐从这里开始）
 - `example/`：只用 `pbz_host.h` 的最小示例，每帧回调、快捷键、函数钩子、卸载
+- `clsprops/`：字段查看器，把类的字段名、偏移、类型导出到文本，还生成可以直接粘贴的 `uex::Prop` 行（见下文）
 
 ## 游戏更新后不用改代码
 
@@ -21,6 +22,14 @@
 | 函数参数 | 框架 | 按参数名读写（`ue::Params`） |
 
 `uex::Prop` 里写的数字只是兜底：字段被改名或删了才用它，并在日志里写一行 `field X.Y not found`；字段只是挪了位置会写 `field X.Y moved: 0x.. (was 0x..)`，Mod 照常工作。更新后看一眼 `loader.log` 就知道有没有要处理的。
+
+不用等用到某个字段才发现问题：Mod 加载后框架会把它声明的所有 `uex::Prop` 检查一遍，在日志里写一行汇总：
+
+```
+hello: fields: 12 checked, 0 moved, 0 missing
+```
+
+`moved` 不用管；`missing` 不为 0 时，上面会有对应的 `field X.Y not found` 行。类所在的资源还没加载时记为 `not loaded yet`，等用到时再查。
 
 只有 UE 引擎升级（例如 5.7 到 5.8）才可能需要更新 `framework/ue.h` 里的结构布局，这由框架维护，Mod 不用管。
 
@@ -108,7 +117,25 @@ float* walk = uex::Field<float>(cm, L"MaxWalkSpeed");       // 任意对象的�
 | 界面 | `CreateWidget`、`AddToViewport`、`SetText`、`SetVisible`、`UiMode`、`GameMode` |
 | 其他 | `LoadAsset`、`Console`、`Log`、`SehScope`（把访问冲突变成可捕获的异常） |
 
-完整说明见 `framework/uex.h` 的注释。类名、字段名可以用 UE4SS 之类的工具导出 SDK 后查看。
+完整说明见 `framework/uex.h` 的注释。类名、字段名用 `clsprops` 查（见下一节）。
+
+## 查类和字段：clsprops
+
+1. 把 `clsprops\` 文件夹复制到 `pbzmp\clsprops\`，在 Mod管理器里勾选。
+2. 编辑 `pbzmp\clsprops\classes.txt`，每行一个类：全名（`Class /Script/Engine.Character`）、短名（`Character`）或名字的一部分都行，`#` 开头是注释。结构体（`HitResult`）也可以。
+3. 进游戏按 Ctrl+F11，结果写进同一文件夹的 `fields.txt`。改了 `classes.txt` 再按一次就行，不用重启。
+
+输出示例：
+
+```
+== Class /Script/Engine.Character  size 0x650
+ [Class /Script/Engine.Character]
+  0x330      8  ObjectProperty<SkeletalMeshComponent>    Mesh
+          uex::Prop kMesh{L"Class /Script/Engine.Character", L"Mesh", 0x330};
+  ...
+```
+
+`[...]` 是字段所属的类（自己或父类）。每个字段一行：偏移、大小、类型、名字，布尔位字段带掩码。原生类（`/Script/` 下的）会多一行 `uex::Prop`，复制到代码里就能用。父类的字段也会列出，到 `Actor`、`ActorComponent`、`UserWidget` 这些通用基类为止（要看它们自己的字段就把它们写进 `classes.txt`）。蓝图类要等它的资源加载后才找得到。
 
 注意：不要每帧调用返回 FString 的 UE 函数（返回值不会释放，会一直涨内存）。
 

@@ -29,7 +29,7 @@ void BlockKeys(bool on) {
             act = b.action;
             if (touched.empty() || touched.back() != b.imc) touched.push_back(b.imc);
         }
-        if (!g_blocked.empty()) uex::Log(L"sniper: game keys restored (%d)", int(g_blocked.size()));
+        if (!g_blocked.empty()) uex::Log(L"game keys restored (%d)", int(g_blocked.size()));
         g_blocked.clear(); g_blockScan = 0;
         for (auto imc : touched) uex::RebuildMappings(imc);
         return;
@@ -45,7 +45,7 @@ void BlockKeys(bool on) {
         for (int i = 0, n = uex::KeyMappingCount(o); i < n && i < 512; ++i) {
             auto& act = uex::KeyMappingAction(o, i); auto key = uex::KeyMappingKey(o, i);
             if (!act || !OurKey(key)) continue;
-            uex::Log(L"sniper: block %s -> %s in %s", ue::NameOf(key).c_str(),
+            uex::Log(L"block %s -> %s in %s", ue::NameOf(key).c_str(),
                 ue::NameOf(act).c_str(), ue::NameOf(o).c_str());
             g_blocked.push_back({o, i, act}); act = nullptr; changed = true;
         }

@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cmath>
+#include <algorithm>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -13,7 +14,11 @@ using namespace ue;
 
 namespace uex {
 static const PbzHost* g_host;
-void SetHost(const PbzHost* h) { g_host = h; }
+static void CheckJob(void*) { try { CheckFields(true); } catch (...) { Log(L"fields: check crashed"); } }
+void SetHost(const PbzHost* h) {
+    g_host = h;
+    if (h && h->post) h->post(CheckJob, nullptr);  // game thread, after the next engine tick
+}
 const PbzHost* Host() { return g_host; }
 
 static wchar_t g_logName[32] = L"mp: ";
@@ -38,6 +43,13 @@ static UObject* TextLib() { return FindObject(L"KismetTextLibrary /Script/Engine
 static std::wstring Short(const wchar_t* owner) {  // "Class /Script/Engine.Controller" -> "Controller"
     std::wstring s = owner; auto k = s.find_last_of(L"."); return k == std::wstring::npos ? s : s.substr(k + 1);
 }
+// every Prop of this module, for CheckFields (constructed before PbzInit or on first use; never freed
+// before the module, so the pointers stay valid)
+static std::vector<Prop*>& AllProps() { static std::vector<Prop*> v; return v; }
+static bool g_quietMissing;  // CheckFields logs its own summary of the classes that aren't loaded yet
+Prop::Prop(const wchar_t* o, const wchar_t* n, int fb, uint8_t fbMask) : owner(o), name(n), fallback(fb), fallbackMask(fbMask) {
+    AllProps().push_back(this);
+}
 int Prop::Resolve() {
     if (retryAt && GetTickCount64() < retryAt) return off;  // class not loaded yet: fallback, look again later
     auto cls = FindObject(owner);
@@ -45,9 +57,12 @@ int Prop::Resolve() {
     if (!p) {
         static std::map<std::wstring, bool> told;
         auto key = Short(owner) + L"." + name;
-        if (!told[key]) { told[key] = true; Log(L"field %s not found%s, using 0x%x", key.c_str(), cls ? L"" : L" (no class yet)", fallback); }
+        if (!told[key] && !(g_quietMissing && !cls)) {
+            told[key] = true; Log(L"field %s not found%s, using 0x%x", key.c_str(), cls ? L"" : L" (no class yet)", fallback);
+        }
         off = fallback; mask = fallbackMask;
         done = cls != nullptr;
+        state = cls ? kMissing : kNoClass;
         if (!done) retryAt = GetTickCount64() + 2000;  // the class may load later
         return off;
     }
@@ -59,8 +74,33 @@ int Prop::Resolve() {
     if (off != fallback || mask != fallbackMask)
         Log(fallbackMask ? L"field %s.%s moved: 0x%x mask 0x%x (was 0x%x mask 0x%x)" : L"field %s.%s moved: 0x%x (was 0x%x)",
             Short(owner).c_str(), name, off, fallbackMask ? mask : fallback, fallback, fallbackMask);
+    state = off != fallback || mask != fallbackMask ? kMoved : kOk;
     done = true;
     return off;
+}
+FieldStats CheckFields(bool log) {
+    FieldStats st{};
+    std::vector<std::wstring> later;  // owners not loaded yet (blueprint / plugin classes load with their level)
+    g_quietMissing = true;
+    for (auto p : AllProps()) {
+        if (!p->done) { p->retryAt = 0; p->Resolve(); }
+        ++st.checked;
+        if (p->state == Prop::kMoved) ++st.moved;
+        else if (p->state == Prop::kMissing) ++st.missing;
+        else if (p->state == Prop::kNoClass) {
+            ++st.noClass;
+            auto s = Short(p->owner);
+            if (std::find(later.begin(), later.end(), s) == later.end()) later.push_back(s);
+        }
+    }
+    g_quietMissing = false;
+    if (log) {
+        std::wstring tail;
+        for (size_t i = 0; i < later.size() && i < 6; ++i) tail += (i ? L", " : L" (") + later[i];
+        if (!later.empty()) tail += later.size() > 6 ? L", ...)" : L")";
+        Log(L"fields: %d checked, %d moved, %d missing, %d not loaded yet%s", st.checked, st.moved, st.missing, st.noClass, tail.c_str());
+    }
+    return st;
 }
 int StructSize(const wchar_t* owner, int fallback) {
     static std::map<std::wstring, int> cache;

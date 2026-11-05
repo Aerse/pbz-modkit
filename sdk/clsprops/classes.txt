@@ -1,0 +1,4 @@
+# one class or struct per line: a full name, a short name, or part of a name. Lines with # are skipped.
+Class /Script/Engine.Character
+ScriptStruct /Script/Engine.HitResult
+Class /Script/CharacterBasics.BasicAttributeSet

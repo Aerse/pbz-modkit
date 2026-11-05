@@ -399,10 +399,39 @@ static std::vector<std::wstring> ReadLines(const std::wstring& path, bool remove
     return out;
 }
 
+// Copies left by earlier runs (_loaded_<name>N.dll): modules that stay loaded (PbzKeep, or that left
+// callbacks) can't be deleted while the game runs, so they are cleared at the next start, before any
+// module loads. A copy still mapped by another game process fails to delete and is left alone.
+static int DeleteStaleCopies(const std::wstring& dir) {
+    int n = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"_loaded_*.dll").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && DeleteFileW((dir + fd.cFileName).c_str())) ++n;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return n;
+}
+static void CleanStaleCopies() {
+    int n = DeleteStaleCopies(g_dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((g_dir + L"*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.')
+                n += DeleteStaleCopies(g_dir + fd.cFileName + L"\\");
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (n) LogLine(L"removed " + std::to_wstring(n) + L" old module copies");
+}
+
 static DWORD WINAPI Worker(LPVOID) {
     CreateDirectoryW(g_dir.c_str(), nullptr);
     g_host.dir = g_dir.c_str();
     LogLine(L"loader started");
+    CleanStaleCopies();
     MH_Initialize();
     // Another mod that also ships a version.dll proxy: rename theirs to version_chain.dll next to
     // ours and it is loaded here (its own exports are not used; ours forward to System32).

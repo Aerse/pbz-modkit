@@ -2,6 +2,7 @@
 // aim helper that turns the camera onto an enemy. Weapon state commands go to MainCmd (sniper.cpp) first.
 #include "common.h"
 #include "overlay.h"
+#include <cstdarg>
 
 TestState g_test;
 
@@ -15,7 +16,7 @@ static UObject* FindMontage(const std::wstring& nm) {
 // ---- reflection probes (posture break research): a property's type and value, read from memory ----
 static std::wstring PType(const uint8_t* p) {
     auto fc = ue::At<const uint8_t*>(p, ue::kFField_Class);
-    std::wstring t = ue::NameOf(*reinterpret_cast<const ue::FName*>(fc + 0x30));  // FFieldClass name
+    std::wstring t = ue::NameOf(*reinterpret_cast<const ue::FName*>(fc + ue::kFFieldClass_Name));
     if (t == L"ObjectProperty" || t == L"ClassProperty" || t == L"StructProperty" || t == L"SoftClassProperty" ||
         t == L"SoftObjectProperty" || t == L"InterfaceProperty" || t == L"WeakObjectProperty")
         if (auto x = ue::At<UObject*>(p, ue::kProp_Extra)) t += L"<" + ue::NameOf(x) + L">";
@@ -82,8 +83,8 @@ static UObject* FindByName(const std::wstring& key) {
 }
 // all properties of an object (up its class chain, to UObject), optionally only those whose name has `filter`
 static void DumpProps(UObject* o, const std::wstring& filter) {
-    if (!o) { uex::Log(L"sniper: oprops: none"); return; }
-    uex::Log(L"sniper: oprops %s (%s) #%d outer %s", ue::NameOf(o).c_str(), ue::NameOf(o->cls).c_str(), o->index, o->outer ? ue::NameOf(o->outer).c_str() : L"-");
+    if (!o) { uex::Log(L"oprops: none"); return; }
+    uex::Log(L"oprops %s (%s) #%d outer %s", ue::NameOf(o).c_str(), ue::NameOf(o->cls).c_str(), o->index, o->outer ? ue::NameOf(o->outer).c_str() : L"-");
     for (auto c = o->cls; c; c = ue::At<UObject*>(c, ue::kUStruct_Super)) {
         if (ue::NameOf(c) == L"Object") break;
         for (auto p = ue::At<const uint8_t*>(c, ue::kUStruct_ChildProps); p; p = ue::At<const uint8_t*>(p, ue::kFField_Next)) {
@@ -91,7 +92,7 @@ static void DumpProps(UObject* o, const std::wstring& filter) {
             int off = ue::At<int32_t>(p, ue::kProp_Offset); std::wstring val;
             try { val = PVal(p, reinterpret_cast<const uint8_t*>(o) + off); } catch (...) { val = L"?"; }
             auto line = L"+" + std::to_wstring(off) + L" " + PType(p) + L" " + nm + L" = " + val;
-            for (size_t q = 0; q < line.size(); q += 500) uex::Log(L"sniper:  %s%s", q ? L"   " : L"", line.substr(q, 500).c_str());
+            for (size_t q = 0; q < line.size(); q += 500) uex::Log(L" %s%s", q ? L"   " : L"", line.substr(q, 500).c_str());
         }
     }
 }
@@ -118,8 +119,142 @@ static void StillTick() {
         ++i;
     }
 }
+// stand cm from e, facing it; turn: degrees around e from the side we are on
+static void StandOff(UObject* me, UObject* e, double cm, double turn = 0) {
+    if (!e) return;
+    ik::V p = ik::FromU(uex::Loc(me)), q = ik::FromU(uex::Loc(e)), d = ik::Norm(ik::V{p.x - q.x, p.y - q.y, 0});
+    if (ik::Len(d) < .5) d = {1, 0, 0};
+    if (turn) { double a = turn * 0.0174532925, c = cos(a), s = sin(a); d = ik::V{d.x * c - d.y * s, d.x * s + d.y * c, 0}; }
+    ik::V t = q + d * cm; t.z = q.z + 5;
+    double yaw = atan2(-d.y, -d.x) / 0.0174532925;
+    uex::Teleport(me, ik::ToU(t), yaw);
+    auto r = CtrlRot(); r.yaw = yaw; r.pitch = 0; SetCtrlRot(r);
+}
+
+// ---- selftest: every weapon against one still enemy; damage and posture against the formulas, then the
+// posture break through GE_GrabHit and through the ChangeHitState fallback. Results: the log ("selftest PASS
+// ..." / "selftest FAIL ...") and <mod>selftest.txt. The target gets 9000 Health meanwhile, put back after.
+struct StCase { const wchar_t* name; int wpn; bool head; int brk; };  // brk: 1 posture break, 2 ChangeHitState only
+static const StCase kStCases[] = {{L"awp body", 0, false, 0}, {L"awp head", 0, true, 0}, {L"ak47 body", 1, false, 0},
+                                  {L"m4a4 body", 2, false, 0}, {L"break", 0, false, 1}, {L"break direct", 0, false, 2}};
+constexpr int kStN = int(sizeof(kStCases) / sizeof(kStCases[0]));
+constexpr double kStDist = 800;  // cm
+enum { kStPrep, kStAim, kStFire };
+struct SelfTest {
+    bool on = false, fired = false, dbg0 = false; int i = 0, phase = 0, tries = 0, pass = 0, fail = 0, n0 = 0;
+    ULONGLONG until = 0, wait = 0, fireBy = 0, brkSince = 0; UObject* t = nullptr; float hp0 = 0, hpMax0 = 0, sc0 = 0, hp0x = 0; std::wstring out;
+};
+static SelfTest g_st;
+static void StLine(int ok, const wchar_t* fmt, ...) {  // ok: 1 PASS, 0 FAIL, -1 plain line
+    wchar_t b[512]; va_list a; va_start(a, fmt); _vsnwprintf_s(b, 512, _TRUNCATE, fmt, a); va_end(a);
+    std::wstring s = std::wstring(ok > 0 ? L"selftest PASS " : ok == 0 ? L"selftest FAIL " : L"selftest: ") + b;
+    uex::Log(L"%s", s.c_str()); g_st.out += s + L"\n";
+}
+static void StWrite() {
+    std::wstring p = g_modDir + L"selftest.txt";
+    if (FILE* f = _wfopen(p.c_str(), L"w, ccs=UTF-8")) { fputws(g_st.out.c_str(), f); fclose(f); }
+}
+void SelfTestStart(UObject* me) {
+    if (g_st.on) { uex::Log(L"selftest: already running"); return; }
+    g_st = SelfTest{}; _wremove((g_modDir + L"selftest.txt").c_str());
+    auto e = NearestEnemy(me);
+    if (!e) { StLine(0, L"no enemy nearby"); StLine(-1, L"0 passed, 1 failed"); StWrite(); return; }
+    g_st.on = true; g_st.t = e; g_st.dbg0 = g_dbg; g_dbg = true;
+    g_st.hp0 = uex::Attr(e, uex::attr::Health); g_st.hpMax0 = uex::Attr(e, uex::attr::HealthMax);
+    g_still.push_back({e, GetTickCount64()});
+    if (CurWpn() < 0) MainCmd(me, L"equip 0");
+    StLine(-1, L"target %s hp %.0f/%.0f shachi max %.0f", ue::NameOf(e).c_str(), g_st.hp0, g_st.hpMax0, uex::Attr(e, uex::attr::ShachiMax));
+}
+static void StEnd() {
+    auto e = g_st.t;
+    if (Live(e)) {
+        uex::SetAttr(e, uex::attr::HealthMax, g_st.hpMax0); uex::SetAttr(e, uex::attr::Health, g_st.hp0);
+        if (InBreakOf(e)) SetHitState(e, L"None");  // the direct break has no animation to end it
+    }
+    g_breakDirect = false; g_test.aimSteps = 0; g_test.fire = false; g_dbg = g_st.dbg0;
+    MainCmd(uex::Me(), L"zoom 0");
+    StLine(-1, L"%d passed, %d failed", g_st.pass, g_st.fail); StWrite();
+    g_st.on = false;
+}
+static void StNext(bool ok) { (ok ? g_st.pass : g_st.fail)++; ++g_st.i; g_st.phase = kStPrep; g_st.tries = 0; g_st.wait = GetTickCount64() + 400; }
+// the shot just fired: damage and posture against the formulas
+static void StCheck(UObject* me, const StCase& k) {
+    auto e = g_st.t; const Wpn& w = g_wpn[k.wpn]; auto r = g_lastShot;
+    if (r.victim != e || (k.head && r.kind != 1 && r.kind != 3) || (!k.head && !k.brk && r.kind == 1)) {  // a break case takes any hit
+        { ik::V eye; uex::Rot cr; CamView(&eye, &cr);
+          StLine(-1, L"%s: try %d hit %s kind %d at %.1f m (target %.1f m)", k.name, g_st.tries, r.victim ? ue::NameOf(r.victim).c_str() : L"nothing", r.kind,
+                 ik::Len(r.end - eye) / 100, ik::Len(ik::FromU(uex::Loc(e)) - eye) / 100); }
+        if (++g_st.tries >= 3) { StLine(0, L"%s: no %s hit in 3 shots", k.name, k.head ? L"head" : L"body"); StNext(false); }
+        else { g_st.phase = kStPrep; g_st.wait = GetTickCount64() + 1600; }
+        return;
+    }
+    float hp = uex::Attr(e, uex::attr::Health), sc = uex::Attr(e, uex::attr::Shachi);
+    float smin = uex::Attr(e, uex::attr::ShachiMin), smx = uex::Attr(e, uex::attr::ShachiMax);
+    ik::V eye; uex::Rot cr; CamView(&eye, &cr);
+    double units = ik::Len(r.end - eye) / 2.54;
+    double want = w.damage * kDmgScale * pow(w.rangeMod, units / 500) * (r.kind == 1 || r.kind == 3 ? w.head : 1);
+    bool okDmg = fabs(r.dmg - want) <= want * .03 + 1 && fabs((g_st.hp0x - hp) - r.dmg) <= 1.5;
+    if (!k.brk) {
+        double drop = std::min(double(w.posture * (k.head ? kPostureHead : 1) * smx), double(g_st.sc0 - smin));
+        bool okPos = fabs((g_st.sc0 - sc) - drop) <= smx * .02 + 1;
+        StLine(okDmg && okPos, L"%s: %.0f m dmg %d (want %.0f), hp %.0f -> %.0f, posture %.0f -> %.0f (want -%.0f)", k.name,
+               units * 2.54 / 100, r.dmg, want, g_st.hp0x, hp, g_st.sc0, sc, drop);
+        StNext(okDmg && okPos);
+        return;
+    }
+    bool brk = InBreakOf(e), path = k.brk == 2 ? g_lastBreak == 2 : g_lastBreak != 0;
+    StLine(okDmg && brk && path && sc <= smin + .5f, L"%s: dmg %d (want %.0f), posture %.0f -> %.0f (min %.0f), in break %d via %s", k.name,
+           r.dmg, want, g_st.sc0, sc, smin, brk, g_lastBreak == 1 ? L"GE_GrabHit" : g_lastBreak == 2 ? L"ChangeHitState" : L"-");
+    StNext(okDmg && brk && path && sc <= smin + .5f);
+}
+static void SelfTestTick(UObject* me) {
+    if (!g_st.on) return;
+    ULONGLONG now = GetTickCount64();
+    if (!g_st.until) g_st.until = now + 120000;
+    if (!Live(g_st.t) || uex::Attr(g_st.t, uex::attr::Health) <= 0) { StLine(0, L"target gone"); g_st.fail += kStN - g_st.i - 1; StEnd(); return; }
+    if (now > g_st.until) { StLine(0, L"timeout at %s", g_st.i < kStN ? kStCases[g_st.i].name : L"end"); StEnd(); return; }
+    if (g_st.i >= kStN) { StEnd(); return; }
+    if (now < g_st.wait) return;
+    auto& k = kStCases[g_st.i]; auto e = g_st.t;
+    switch (g_st.phase) {
+    case kStPrep: {
+        if (k.brk && InBreakOf(e)) {  // the last break has to wear off first; one set directly never does (forced out after 3 s)
+            if (!g_st.brkSince) g_st.brkSince = now;
+            if (now - g_st.brkSince > 3000) SetHitState(e, L"None");
+            g_st.wait = now + 500; return;
+        }
+        g_st.brkSince = 0;
+        if (CurWpn() != k.wpn) { MainCmd(me, std::wstring(L"wpn ") + std::to_wstring(k.wpn)); g_st.wait = now + 600; return; }
+        MainCmd(me, g_wpn[k.wpn].zoomLevels ? L"zoom 1" : L"zoom 0");
+        StandOff(me, e, kStDist, g_st.tries * 90);  // a miss: something in the way, try another side
+        MainCmd(me, L"ammo " + std::to_wstring(g_wpn[k.wpn].clip));  // never an automatic reload mid-test
+        uex::SetAttr(me, uex::attr::Health, uex::Attr(me, uex::attr::HealthMax));
+        uex::SetAttr(e, uex::attr::HealthMax, 9000); uex::SetAttr(e, uex::attr::Health, 9000);
+        float smin = uex::Attr(e, uex::attr::ShachiMin), smx = uex::Attr(e, uex::attr::ShachiMax);
+        uex::SetAttr(e, uex::attr::Shachi, k.brk ? smin + .1f * smx : smx);  // a break case: one shot empties the bar
+        g_breakDirect = k.brk == 2; g_lastBreak = 0;
+        g_test.aimAt = e; g_test.aimHead = k.head; g_test.aimOff = 30; g_test.aimSteps = 40;
+        g_st.phase = kStAim; g_st.wait = now + 300; g_st.fireBy = now + 5000;
+        return;
+    }
+    case kStAim:
+        if (g_test.aimSteps > 0) return;
+        if (!WpnSteady()) {  // still landing from the teleport, or the bolt is not home yet: aim again
+            if (now > g_st.fireBy) { StLine(0, L"%s: never steady to fire", k.name); StNext(false); return; }
+            g_test.aimSteps = 10; return;
+        }
+        g_st.hp0x = uex::Attr(e, uex::attr::Health); g_st.sc0 = uex::Attr(e, uex::attr::Shachi);
+        g_st.n0 = g_shotN; g_test.fire = true; g_st.phase = kStFire; g_st.wait = 0; g_st.fireBy = now + 3000;
+        return;
+    case kStFire:
+        if (g_shotN != g_st.n0) { g_breakDirect = false; StCheck(me, k); return; }
+        if (now > g_st.fireBy) { StLine(0, L"%s: the weapon did not fire", k.name); g_test.fire = false; StNext(false); }
+        return;
+    }
+}
 void TestCmds(UObject* me) {
     StillTick();
+    SelfTestTick(me);
     std::wstring path = g_modDir + L"sniper.cmd";
     FILE* f = _wfopen(path.c_str(), L"r, ccs=UTF-8"); if (!f) return;
     wchar_t line[256]; std::vector<std::wstring> cmds;
@@ -130,7 +265,7 @@ void TestCmds(UObject* me) {
     }
     fclose(f); _wremove(path.c_str());
     for (auto& c : cmds) {
-        uex::Log(L"sniper: test %s", c.c_str());
+        uex::Log(L"test %s", c.c_str());
         auto starts = [&](const wchar_t* p) { return c.rfind(p, 0) == 0; };
         auto arg = [&](size_t n) { return c.size() > n ? c.c_str() + n : L""; };
         double v[4]{};
@@ -142,10 +277,10 @@ void TestCmds(UObject* me) {
         else if (starts(L"icheck")) {  // the player's interact component: why the prompt is off
             auto off = ue::FindProp(me->cls, L"PBZInteract").offset; auto ic = off >= 0 ? ue::At<UObject*>(me, off) : nullptr;
             if (!ic) for (int k = 0, N = ue::NumObjects(); k < N && !ic; ++k) { auto o = ue::ObjectAt(k); if (o && o->outer == me && ue::NameOf(o->cls) == L"PBZInteractComponent") ic = o; }
-            if (!ic) { uex::Log(L"sniper: icheck: no component"); continue; }
+            if (!ic) { uex::Log(L"icheck: no component"); continue; }
             if (c == L"icheck search") {  // SearchActors / InteractActors (TMap<AActor*, ...>): the actors
                 for (auto pn : {L"SearchActors", L"InteractActors"}) {
-                    auto mp = ue::FindPropPtr(ic->cls, pn); if (!mp) { uex::Log(L"sniper: iset %s not found", pn); continue; }
+                    auto mp = ue::FindPropPtr(ic->cls, pn); if (!mp) { uex::Log(L"iset %s not found", pn); continue; }
                     // FMapProperty: KeyProp, ValueProp; element = key, value, two hash links
                     auto kp = ue::At<const uint8_t*>(mp, ue::kProp_Extra), vp = ue::At<const uint8_t*>(mp, ue::kProp_Extra + 8);
                     if (!kp || !vp) continue;
@@ -155,18 +290,18 @@ void TestCmds(UObject* me) {
                     bool inKey = PType(kp).find(L"ObjectProperty") != std::wstring::npos;
                     const uint8_t* ap = inKey ? kp : vp; int aoff = inKey ? 0 : (ue::At<int32_t>(kp, ue::kProp_ElemSize) + 7) & ~7;
                     bool weak = PType(ap).rfind(L"WeakObjectProperty", 0) == 0;
-                    uex::Log(L"sniper: iset %s +%x n %d key %s value %s stride 0x%x", pn, off, n, PType(kp).c_str(), PType(vp).c_str(), stride);
+                    uex::Log(L"iset %s +%x n %d key %s value %s stride 0x%x", pn, off, n, PType(kp).c_str(), PType(vp).c_str(), stride);
                     uex::EachSetElem(base, stride, [&](uint8_t* e) {
                         // a weak key is {object index, serial}: the object at that index
                         UObject* a = weak ? ue::ObjectAt(ue::At<int32_t>(e, aoff)) : ue::At<UObject*>(e, aoff);
-                        if (i < 32) uex::Log(L"sniper: iset  %d %p %s", i, a, a && Live(a) ? ue::NameOf(a).c_str() : L"?"); ++i; });
+                        if (i < 32) uex::Log(L"iset  %d %p %s", i, a, a && Live(a) ? ue::NameOf(a).c_str() : L"?"); ++i; });
                 }
                 continue;
             }
             if (c == L"icheck tags") {  // the player's owned gameplay tags
                 auto tc = uex::OwnedTags(me);
-                for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"sniper: itag %s", ue::NameOf(tc.d[i]).c_str());
-                uex::Log(L"sniper: itags %d", tc.n);
+                for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"itag %s", ue::NameOf(tc.d[i]).c_str());
+                uex::Log(L"itags %d", tc.n);
                 continue;
             }
             if (c == L"icheck props") {
@@ -176,7 +311,7 @@ void TestCmds(UObject* me) {
                         int o = ue::At<int32_t>(p, ue::kProp_Offset), sz = ue::At<int32_t>(p, ue::kProp_ElemSize);
                         auto base = reinterpret_cast<const uint8_t*>(ic) + o; uint64_t v = 0; memcpy(&v, base, sz < 8 ? sz : 8);
                         int n = sz == 16 ? *reinterpret_cast<const int32_t*>(base + 8) : -1;
-                        uex::Log(L"sniper: iprop %s +%x sz %d = %llx n %d", ue::NameOf(*reinterpret_cast<const ue::FName*>(p + ue::kFField_Name)).c_str(), o, sz, v, n);
+                        uex::Log(L"iprop %s +%x sz %d = %llx n %d", ue::NameOf(*reinterpret_cast<const ue::FName*>(p + ue::kFField_Name)).c_str(), o, sz, v, n);
                     }
                 }
                 continue;
@@ -191,8 +326,8 @@ void TestCmds(UObject* me) {
                 bool doCall = wcsncmp(fnn, L"Set", 3) && wcsncmp(fnn, L"Check", 5) && wcsncmp(fnn, L"Do", 2) && wcsncmp(fnn, L"Start", 5) && wcsncmp(fnn, L"Open", 4);
                 if (doCall || (c.size() > 7 && c.substr(7) == fnn)) q.Call(ic);
                 if (!wcscmp(fnn, L"IsValidInteract"))
-                    uex::Log(L"sniper: icheck actor %s tags block %d sprint %d air %d", ia ? ue::NameOf(ia).c_str() : L"-", q.Get<bool>(L"bHasBlockTag"), q.Get<bool>(L"bHasSprintTag"), q.Get<bool>(L"bHasAirTag"));
-                uex::Log(L"sniper: icheck %s(%s) -> u8 %d ptr %s", fnn, ps.c_str(), q.Get<uint8_t>(L"ReturnValue"), q.Get<UObject*>(L"ReturnValue") && (wcsncmp(fnn, L"GetInteract", 11) == 0) ? ue::NameOf(q.Get<UObject*>(L"ReturnValue")).c_str() : L"");
+                    uex::Log(L"icheck actor %s tags block %d sprint %d air %d", ia ? ue::NameOf(ia).c_str() : L"-", q.Get<bool>(L"bHasBlockTag"), q.Get<bool>(L"bHasSprintTag"), q.Get<bool>(L"bHasAirTag"));
+                uex::Log(L"icheck %s(%s) -> u8 %d ptr %s", fnn, ps.c_str(), q.Get<uint8_t>(L"ReturnValue"), q.Get<UObject*>(L"ReturnValue") && (wcsncmp(fnn, L"GetInteract", 11) == 0) ? ue::NameOf(q.Get<UObject*>(L"ReturnValue")).c_str() : L"");
             }
         }
         else if (starts(L"ofind ")) {  // ofind <substr>: live objects whose class name has it, with their functions
@@ -205,8 +340,8 @@ void TestCmds(UObject* me) {
                     auto nm = ue::NameOf(cc); if (nm == L"Object" || nm == L"ActorComponent" || nm == L"SceneComponent") break;
                     for (auto f = ue::At<UObject*>(cc, ue::kUStruct_Children); f; f = ue::At<UObject*>(f, ue::kUField_Next)) fns += ue::NameOf(f) + L" ";
                 }
-                uex::Log(L"sniper: ofind %s (%s) outer %s", ue::NameOf(o).c_str(), cn.c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
-                for (size_t q = 0; q < fns.size(); q += 400) uex::Log(L"sniper:   %s", fns.substr(q, 400).c_str());
+                uex::Log(L"ofind %s (%s) outer %s", ue::NameOf(o).c_str(), cn.c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
+                for (size_t q = 0; q < fns.size(); q += 400) uex::Log(L"  %s", fns.substr(q, 400).c_str());
             }
         }
         else if (starts(L"oprops ")) {  // oprops <object name|#index> [property name part]
@@ -224,12 +359,12 @@ void TestCmds(UObject* me) {
             wchar_t cn[160]{}; float pre = -1; swscanf(arg(6), L"%159s %f", cn, &pre);
             auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); auto ge = FindByName(cn);
             auto src = uex::ASC(me), dst = e ? uex::ASC(e) : nullptr;
-            if (!e || !ge || !src || !dst) { uex::Log(L"sniper: gehit: missing %d %d %d %d", !!e, !!ge, !!src, !!dst); continue; }
+            if (!e || !ge || !src || !dst) { uex::Log(L"gehit: missing %d %d %d %d", !!e, !!ge, !!src, !!dst); continue; }
             if (pre >= 0) uex::SetAttr(e, uex::attr::Shachi, pre);
             float hp = uex::Attr(e, uex::attr::Health), sc = uex::Attr(e, uex::attr::Shachi);
             ue::Params p(uex::Fn(src, L"BP_ApplyGameplayEffectToTarget"));  // an empty context: the ASC makes one (source: the player)
             p.Set(L"GameplayEffectClass", ge); p.Set(L"Target", dst); p.Set<float>(L"Level", 1.f); p.Call(src);
-            uex::Log(L"sniper: gehit %s -> %s hp %.0f -> %.0f shachi %.0f -> %.0f", cn, ue::NameOf(e).c_str(), hp, uex::Attr(e, uex::attr::Health), sc, uex::Attr(e, uex::attr::Shachi));
+            uex::Log(L"gehit %s -> %s hp %.0f -> %.0f shachi %.0f -> %.0f", cn, ue::NameOf(e).c_str(), hp, uex::Attr(e, uex::attr::Health), sc, uex::Attr(e, uex::attr::Shachi));
             BreakInfo(e);
         }
         else if (c == L"break" || starts(L"break ")) BreakInfo(g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me));
@@ -243,13 +378,19 @@ void TestCmds(UObject* me) {
                 if (ue::NameOf(o->cls).find(key) != std::wstring::npos) DumpProps(o, filt);
             }
         }
+        else if (starts(L"hitstate")) {  // hitstate [tag]: the aimed (or nearest) enemy's hit state, set to tag if given ("none": empty)
+            auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); if (!e) continue;
+            std::wstring t = c.size() > 9 ? c.substr(9) : L""; bool ok = false;
+            if (!t.empty()) ok = SetHitState(e, t == L"none" ? L"None" : t.c_str());
+            uex::Log(L"hitstate %s %s%s", ue::NameOf(e).c_str(), HitStateOf(e).c_str(), t.empty() ? L"" : ok ? L" (set)" : L" (refused)");
+        }
         else if (starts(L"fnsig ")) {  // fnsig <object name|#index> <function>: its parameters
             auto rest = c.substr(6); auto sp = rest.find(L' '); if (sp == std::wstring::npos) continue;
             auto o = FindByName(rest.substr(0, sp)); auto fn = o ? uex::Fn(o, rest.substr(sp + 1).c_str()) : nullptr;
             std::wstring s;
             for (auto p = fn ? ue::At<const uint8_t*>(fn, ue::kUStruct_ChildProps) : nullptr; p; p = ue::At<const uint8_t*>(p, ue::kFField_Next))
                 s += PType(p) + L" " + PName(p) + L", ";
-            uex::Log(L"sniper: fnsig %s.%s (%s)", o ? ue::NameOf(o->cls).c_str() : L"-", rest.substr(sp + 1).c_str(), fn ? s.c_str() : L"not found");
+            uex::Log(L"fnsig %s.%s (%s)", o ? ue::NameOf(o->cls).c_str() : L"-", rest.substr(sp + 1).c_str(), fn ? s.c_str() : L"not found");
         }
         else if (starts(L"oname ")) {  // oname <part> [class part]: live objects (classes, assets, instances) whose name has it
             auto rest = c.substr(6); auto sp = rest.find(L' '); auto key = rest.substr(0, sp);
@@ -258,7 +399,7 @@ void TestCmds(UObject* me) {
                 auto o = ue::ObjectAt(k); if (!o || (o->flags & 0x10)) continue;
                 auto nm = ue::NameOf(o); if (nm.find(key) == std::wstring::npos || nm.rfind(L"Default__", 0) == 0) continue;
                 if (!ck.empty() && ue::NameOf(o->cls).find(ck) == std::wstring::npos) continue;
-                ++n; uex::Log(L"sniper: oname #%d %s (%s) outer %s", k, nm.c_str(), ue::NameOf(o->cls).c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
+                ++n; uex::Log(L"oname #%d %s (%s) outer %s", k, nm.c_str(), ue::NameOf(o->cls).c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
             }
         }
         else if (starts(L"ocls ")) {  // ocls <class part> <property> <value part>: objects of that class whose property's value has it
@@ -270,10 +411,10 @@ void TestCmds(UObject* me) {
                         if (PName(p) != pp) continue;
                         std::wstring v; try { v = PVal(p, reinterpret_cast<const uint8_t*>(o) + ue::At<int32_t>(p, ue::kProp_Offset)); } catch (...) {}
                         if (v.find(vp) == std::wstring::npos) continue;
-                        ++n; uex::Log(L"sniper: ocls #%d %s outer %s %s = %s", k, ue::NameOf(o).c_str(), o->outer ? ue::PathOf(o->outer).c_str() : L"-", pp, v.substr(0, 300).c_str());
+                        ++n; uex::Log(L"ocls #%d %s outer %s %s = %s", k, ue::NameOf(o).c_str(), o->outer ? ue::PathOf(o->outer).c_str() : L"-", pp, v.substr(0, 300).c_str());
                     }
             }
-            uex::Log(L"sniper: ocls %d", n);
+            uex::Log(L"ocls %d", n);
         }
         else if (starts(L"burst ")) g_test.burst = _wtoi(arg(6));
         else if (c == L"hold") g_test.hold = !g_test.hold;
@@ -295,9 +436,9 @@ void TestCmds(UObject* me) {
         else if (starts(L"margin ")) g_bodyMargin = _wtof(arg(7));
         else if (c == L"snap" || starts(L"snap ")) {
             std::wstring fn = g_modDir + (c.size() > 5 ? c.substr(5) : std::wstring(L"hud.bmp"));
-            uex::Log(L"sniper: test: snap %s %d", fn.c_str(), overlay::Snap(fn.c_str()));
+            uex::Log(L"test: snap %s %d", fn.c_str(), overlay::Snap(fn.c_str()));
         }
-        else if (c == L"dbg") { g_dbg = !g_dbg; uex::Log(L"sniper: dbg %d", g_dbg); }
+        else if (c == L"dbg") { g_dbg = !g_dbg; uex::Log(L"dbg %d", g_dbg); }
         else if (starts(L"camyaw ") || starts(L"campitch ")) {
             auto r = CtrlRot(); bool y = starts(L"camyaw ");
             (y ? r.yaw : r.pitch) += _wtof(arg(y ? 7 : 9)); SetCtrlRot(r);
@@ -305,9 +446,9 @@ void TestCmds(UObject* me) {
         else if (c == L"aim" || c == L"aim head" || starts(L"aim ")) {
             g_test.aimAt = NearestEnemy(me); g_test.aimHead = c == L"aim head"; g_test.aimSteps = 40;
             g_test.aimOff = (starts(L"aim ") && !g_test.aimHead) ? _wtof(arg(4)) : 30;
-            if (g_test.aimAt) uex::Log(L"sniper: test: aim at %s hp %.0f, %.0f m", ue::NameOf(g_test.aimAt).c_str(),
+            if (g_test.aimAt) uex::Log(L"test: aim at %s hp %.0f, %.0f m", ue::NameOf(g_test.aimAt).c_str(),
                 uex::Attr(g_test.aimAt, uex::attr::Health), ik::Len(ik::FromU(uex::Loc(g_test.aimAt)) - ik::FromU(uex::Loc(me))) / 100);
-            else uex::Log(L"sniper: test: no enemy");
+            else uex::Log(L"test: no enemy");
         }
         else if (starts(L"aimn ")) {  // aimn <name part>: the camera onto that character, dead or alive
             auto key = c.substr(5); auto chCls = uex::Class(L"Class /Script/ProjectPBZ.PBZCharacter"); g_test.aimAt = nullptr;
@@ -319,45 +460,38 @@ void TestCmds(UObject* me) {
             auto m = g_test.aimAt ? MeshOf(g_test.aimAt) : nullptr; bool phys = false, vis = false;
             if (m) { { ue::Params q(uex::Fn(m, L"IsSimulatingPhysics")); q.Call(m); phys = q.Get<bool>(L"ReturnValue"); }
                      { ue::Params q(uex::Fn(m, L"IsVisible")); q.Call(m); vis = q.Get<bool>(L"ReturnValue"); } }
-            uex::Log(L"sniper: aimn %s mesh visible %d physics %d", g_test.aimAt ? ue::NameOf(g_test.aimAt).c_str() : L"-", vis, phys);
+            uex::Log(L"aimn %s mesh visible %d physics %d", g_test.aimAt ? ue::NameOf(g_test.aimAt).c_str() : L"-", vis, phys);
         }
-        else if (starts(L"goto ")) {  // stand d cm from the nearest enemy, facing it
-            auto e = NearestEnemy(me);
-            if (e) {
-                ik::V p = ik::FromU(uex::Loc(me)), q = ik::FromU(uex::Loc(e)), d = ik::Norm(ik::V{p.x - q.x, p.y - q.y, 0});
-                ik::V t = q + d * _wtof(arg(5)); t.z = q.z + 5;
-                uex::Teleport(me, ik::ToU(t), atan2(-d.y, -d.x) / 0.0174532925);
-                auto r = CtrlRot(); r.yaw = atan2(-d.y, -d.x) / 0.0174532925; r.pitch = 0; SetCtrlRot(r);
-            }
-        }
+        else if (starts(L"goto ")) StandOff(me, NearestEnemy(me), _wtof(arg(5)));  // stand d cm from the nearest enemy, facing it
+        else if (c == L"selftest") SelfTestStart(me);
         else if (c == L"heal") uex::SetAttr(me, uex::attr::Health, uex::Attr(me, uex::attr::HealthMax));
         else if (c == L"posture") PostureInfo(g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me));  // the aimed (or nearest) enemy
         else if (c == L"codex" || starts(L"codex ")) {  // codex [bosses|<part>]: enemy codex rows (DT_CodexEnemyDataTable): class path, boss flag
             auto key = c.size() > 6 ? c.substr(6) : std::wstring(); bool bosses = key == L"bosses";
             auto dt = uex::LoadAsset(L"/Game/PBZContent/DataTable/DT_CodexEnemyDataTable.DT_CodexEnemyDataTable");
-            if (!dt) { uex::Log(L"sniper: codex: no table"); continue; }
+            if (!dt) { uex::Log(L"codex: no table"); continue; }
             static uex::Prop kBoss{L"ScriptStruct /Script/ProjectPBZ.CodexEnemyRow", L"bIsBoss", 0xb1, 0xff},
                 kEnemyClass{L"ScriptStruct /Script/ProjectPBZ.CodexEnemyRow", L"EnemyClass", 0x8};
             int n = 0, shown = 0;
             uex::EachRow(dt, [&](const ue::FName& k, uint8_t* r) {
                 ++n; bool boss = kBoss.Bit(r); auto nm = ue::NameOf(k);
                 if (shown >= 120 || (bosses ? !boss : (!key.empty() && nm.find(key) == std::wstring::npos))) return;
-                uex::Log(L"sniper: codex %s boss %d %s", nm.c_str(), boss, uex::SoftPath(r + kEnemyClass).c_str()); ++shown;
+                uex::Log(L"codex %s boss %d %s", nm.c_str(), boss, uex::SoftPath(r + kEnemyClass).c_str()); ++shown;
             });
-            uex::Log(L"sniper: codex %d rows", n);
+            uex::Log(L"codex %d rows", n);
         }
         else if (c == L"posture tags") {  // the aimed (or nearest) enemy's owned gameplay tags
             auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); if (!e) continue;
             auto tc = uex::OwnedTags(e);
-            for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"sniper: etag %s", ue::NameOf(tc.d[i]).c_str());
-            uex::Log(L"sniper: etags %s %d", ue::NameOf(e).c_str(), tc.n);
+            for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"etag %s", ue::NameOf(tc.d[i]).c_str());
+            uex::Log(L"etags %s %d", ue::NameOf(e).c_str(), tc.n);
         }
         else if (starts(L"estat ")) {  // estat <hp> <shachi>: set the nearest enemy's Health and Shachi (negative = keep)
             auto e = NearestEnemy(me); float h = -1, sh = -1; swscanf(arg(6), L"%f %f", &h, &sh); if (!e) continue;
             if (h >= 0) uex::SetAttr(e, uex::attr::Health, h); if (sh >= 0) uex::SetAttr(e, uex::attr::Shachi, sh); PostureInfo(e);
         }
         else if (c == L"posture full") { auto e = NearestEnemy(me); if (e) uex::SetAttr(e, uex::attr::Shachi, uex::Attr(e, uex::attr::ShachiMax)); PostureInfo(e); }
-        else if (c == L"pos") { auto l = uex::Loc(me); uex::Log(L"sniper: pos %.0f %.0f %.0f yaw %.1f", l.x, l.y, l.z, uex::GetRot(me).yaw); }
+        else if (c == L"pos") { auto l = uex::Loc(me); uex::Log(L"pos %.0f %.0f %.0f yaw %.1f", l.x, l.y, l.z, uex::GetRot(me).yaw); }
         else if (starts(L"tp ")) { swscanf(arg(3), L"%lf %lf %lf", v, v + 1, v + 2); uex::Teleport(me, {v[0], v[1], v[2]}, uex::GetRot(me).yaw); }
         else if (c == L"spawners" || starts(L"spawners ")) {  // NPC spawners: object index, class, distance, spawned actor
             auto key = c.size() > 9 ? c.substr(9) : std::wstring(); auto sc = uex::Class(L"Class /Script/ProjectPBZ.NPCSpawner"); int n = 0;
@@ -368,13 +502,13 @@ void TestCmds(UObject* me) {
                 auto nm = ue::NameOf(o->cls) + L" " + ue::NameOf(o) + L" " + (a ? ue::NameOf(a) : std::wstring(L"-"));
                 if (!key.empty() && nm.find(key) == std::wstring::npos) continue;
                 auto l = uex::Loc(o); double d = ik::Len(ik::FromU(l) - pl) / 100;
-                uex::Log(L"sniper: spawner #%d %s at %.0f %.0f %.0f (%.0f m) hp %.0f", k, nm.c_str(), l.x, l.y, l.z, d, a && uex::AttrSet(a) ? uex::Attr(a, uex::attr::Health) : -1.f);
+                uex::Log(L"spawner #%d %s at %.0f %.0f %.0f (%.0f m) hp %.0f", k, nm.c_str(), l.x, l.y, l.z, d, a && uex::AttrSet(a) ? uex::Attr(a, uex::attr::Health) : -1.f);
                 ++n;
             }
         }
         else if (starts(L"spawn ")) {  // spawn <object index>: that spawner, forced
             auto o = ue::ObjectAt(_wtoi(arg(6)));
-            if (o) { ue::Params q(uex::Fn(o, L"Spawn")); q.Set<bool>(L"IsForce", true); q.Call(o); uex::Log(L"sniper: spawn %s", ue::NameOf(o).c_str()); }
+            if (o) { ue::Params q(uex::Fn(o, L"Spawn")); q.Set<bool>(L"IsForce", true); q.Call(o); uex::Log(L"spawn %s", ue::NameOf(o).c_str()); }
         }
         else if (starts(L"mspawn ")) {  // mspawn <class name> [cm ahead]: a loaded character class next to the player
             wchar_t cn[200]{}; double d = 400, side = 0; int still = 0; swscanf(arg(7), L"%199s %lf %lf %d", cn, &d, &side, &still);
@@ -398,12 +532,12 @@ void TestCmds(UObject* me) {
             auto a = cls ? uex::Spawn(cls, ik::ToU(at), r.yaw + 180) : nullptr;
             if (a) { ue::Params q(uex::Fn(a, L"SpawnDefaultController")); q.Call(a); }
             if (a && still) g_still.push_back({a, GetTickCount64() + 800});  // stand still: stop the AI's brain once it's up
-            uex::Log(L"sniper: mspawn %s -> %s", cn, a ? ue::NameOf(a).c_str() : L"-");
+            uex::Log(L"mspawn %s -> %s", cn, a ? ue::NameOf(a).c_str() : L"-");
         }
         else if (starts(L"kill ")) {  // kill <mode>: the nearest enemy, one death path (shoot.cpp KillTest)
             auto e = NearestEnemy(me);
             if (e) KillTest(e, _wtoi(arg(5)), ik::Norm(ik::FromU(uex::Loc(e)) - ik::FromU(uex::Loc(me))));
-            else uex::Log(L"sniper: kill: no enemy");
+            else uex::Log(L"kill: no enemy");
         }
         else if (starts(L"find ")) {
             auto key = c.substr(5); auto chCls = uex::Class(L"Class /Script/ProjectPBZ.PBZCharacter");
@@ -415,7 +549,7 @@ void TestCmds(UObject* me) {
                     ue::Params q(uex::Fn(lib, L"IsDead")); q.Set(L"Pawn", o); q.Call(lib); dead = q.Get<bool>(L"ReturnValue"); }
                 auto ai = (o->flags & 0x10) ? nullptr : AnimOf(o); UObject* mt = nullptr;
                 if (ai) { ue::Params q(uex::Fn(ai, L"GetCurrentActiveMontage")); q.Call(ai); mt = q.Get<UObject*>(L"ReturnValue"); }
-                uex::Log(L"sniper: find %s flags %x hp %.0f alive %d dead %d at %.0f %.0f %.0f mont %s", ue::NameOf(o).c_str(), o->flags,
+                uex::Log(L"find %s flags %x hp %.0f alive %d dead %d at %.0f %.0f %.0f mont %s", ue::NameOf(o).c_str(), o->flags,
                     uex::AttrSet(o) ? uex::Attr(o, uex::attr::Health) : -1.f, uex::Alive(o), dead, l.x, l.y, l.z, mt ? ue::NameOf(mt).c_str() : L"-");
             }
         }
@@ -423,7 +557,7 @@ void TestCmds(UObject* me) {
             auto key = c.substr(7); auto mcls = uex::Class(L"Class /Script/Engine.AnimMontage"); int n = 0;
             for (int k = 0, N = ue::NumObjects(); mcls && k < N && n < 80; ++k) {
                 auto o = ue::ObjectAt(k);
-                if (o && o->cls == mcls && ue::NameOf(o).find(key) != std::wstring::npos) { uex::Log(L"sniper: mont %s", ue::NameOf(o).c_str()); ++n; }
+                if (o && o->cls == mcls && ue::NameOf(o).find(key) != std::wstring::npos) { uex::Log(L"mont %s", ue::NameOf(o).c_str()); ++n; }
             }
         }
         else if (starts(L"pmont ")) {  // pmont <montage> [rate]: play on the player
@@ -434,13 +568,13 @@ void TestCmds(UObject* me) {
                 p.Set<uint8_t>(L"ReturnValueType", 0); p.Set<float>(L"InTimeToStartMontageAt", 0.f); p.Set<bool>(L"bStopAllMontages", true);
                 p.Call(ai); len = p.Get<float>(L"ReturnValue");
             }
-            uex::Log(L"sniper: pmont %p len %.2f", m, len);
+            uex::Log(L"pmont %p len %.2f", m, len);
         }
         else if (starts(L"pseq ")) {  // pseq <asset path> [rate] [freeze at s, <0 plays] [slot]: hold with another animation
             wchar_t pth[400]{}, slot[64]{}; double rate = 1, at = -1;
             swscanf(arg(5), L"%399s %lf %lf %63s", pth, &rate, &at, slot);
             auto a = uex::LoadAsset(pth);
-            uex::Log(L"sniper: pseq %s -> %p %s", pth, a, a ? ue::FullName(a->cls).c_str() : L"-");
+            uex::Log(L"pseq %s -> %p %s", pth, a, a ? ue::FullName(a->cls).c_str() : L"-");
             if (a) PoseUse(me, a, rate, at, slot);
         }
         else if (c == L"pbow") PoseUse(me, nullptr, 1.5, .675, L"DefaultSlot");
@@ -449,7 +583,7 @@ void TestCmds(UObject* me) {
             auto a = uex::LoadAsset(arg(5)); auto m = MeshOf(me);
             auto pi = ue::FindProp(m ? m->cls : nullptr, L"SkeletalMeshAsset"); UObject* sm = pi.offset >= 0 ? ue::At<UObject*>(m, pi.offset) : nullptr;
             auto s1 = skelOf(a), s2 = skelOf(sm);
-            uex::Log(L"sniper: skel asset %s: %s / player mesh %s: %s", a ? ue::NameOf(a).c_str() : L"-", s1 ? ue::PathOf(s1).c_str() : L"-",
+            uex::Log(L"skel asset %s: %s / player mesh %s: %s", a ? ue::NameOf(a).c_str() : L"-", s1 ? ue::PathOf(s1).c_str() : L"-",
                 sm ? ue::NameOf(sm).c_str() : L"-", s2 ? ue::PathOf(s2).c_str() : L"-");
         }
         else if (c == L"mhide" || c == L"mshow") ModelHide(c == L"mhide");
@@ -459,17 +593,17 @@ void TestCmds(UObject* me) {
             ik::V o = ik::FromU(uex::Loc(me));
             for (auto bn : {L"head", L"neck_01", L"clavicle_r", L"upperarm_r", L"lowerarm_r", L"hand_r", L"clavicle_l", L"lowerarm_l", L"hand_l", L"spine_03", L"pelvis"}) {
                 ue::Params q(uex::Fn(m, L"GetBoneIndex")); q.Set(L"BoneName", uex::Name(bn)); q.Call(m);
-                if (q.Get<int32_t>(L"ReturnValue") < 0) { uex::Log(L"sniper: bone %s missing", bn); continue; }
+                if (q.Get<int32_t>(L"ReturnValue") < 0) { uex::Log(L"bone %s missing", bn); continue; }
                 ik::V d = Sock(m, bn) - o;
-                uex::Log(L"sniper: bone %-10s %6.1f %6.1f %6.1f", bn, ik::Dot(d, f), ik::Dot(d, rt), ik::Dot(d, up));
+                uex::Log(L"bone %-10s %6.1f %6.1f %6.1f", bn, ik::Dot(d, f), ik::Dot(d, rt), ik::Dot(d, up));
             }
         }
         else if (starts(L"mslot ")) {  // mslot <montage path>: its slot names and length
-            auto a = uex::LoadAsset(arg(6)); if (!a) { uex::Log(L"sniper: mslot no asset"); continue; }
+            auto a = uex::LoadAsset(arg(6)); if (!a) { uex::Log(L"mslot no asset"); continue; }
             auto pi = ue::FindProp(a->cls, L"SlotAnimTracks");
             if (pi.offset >= 0) { auto t = ue::At<TA>(a, pi.offset); auto stride = 0x18;
-                for (int i = 0; i < t.n; ++i) uex::Log(L"sniper: mslot %s slot %d %s", ue::NameOf(a).c_str(), i, ue::NameOf(*reinterpret_cast<ue::FName*>(static_cast<uint8_t*>(t.d) + i * stride)).c_str()); }
-            ue::Params q(uex::Fn(a, L"GetPlayLength")); q.Call(a); uex::Log(L"sniper: mslot len %.2f", q.Get<float>(L"ReturnValue"));
+                for (int i = 0; i < t.n; ++i) uex::Log(L"mslot %s slot %d %s", ue::NameOf(a).c_str(), i, ue::NameOf(*reinterpret_cast<ue::FName*>(static_cast<uint8_t*>(t.d) + i * stride)).c_str()); }
+            ue::Params q(uex::Fn(a, L"GetPlayLength")); q.Call(a); uex::Log(L"mslot len %.2f", q.Get<float>(L"ReturnValue"));
         }
         else if (starts(L"aimp ")) {  // aimp <pitch> <alpha>: the anim instance's combat aim offset (CombatAimAnimInterface)
             swscanf(arg(5), L"%lf %lf", v, v + 1); auto ai = AnimOf(me);
@@ -477,7 +611,7 @@ void TestCmds(UObject* me) {
             if (fa) { ue::Params q(fa); q.Set<float>(L"Alpha", float(v[1])); q.Call(ai); }
             if (fp) { ue::Params q(fp); q.Set<float>(L"PitchOffset", float(v[0])); q.Call(ai); }
             float got = -999; if (auto fg = ai ? uex::Fn(ai, L"GetCombatAimPitchOffset") : nullptr) { ue::Params q(fg); q.Call(ai); got = q.Get<float>(L"ReturnValue"); }
-            uex::Log(L"sniper: aimp anim %s fn %p %p pitch now %.1f", ai ? ue::NameOf(ai->cls).c_str() : L"-", fp, fa, got);
+            uex::Log(L"aimp anim %s fn %p %p pitch now %.1f", ai ? ue::NameOf(ai->cls).c_str() : L"-", fp, fa, got);
         }
         else if (c == L"shot") uex::Console(L"HighResShot 1");
         else if (c == L"mdbg") ModelDebug();
@@ -485,7 +619,7 @@ void TestCmds(UObject* me) {
         else if (c == L"crouch" || c == L"uncrouch") { ue::Params q(uex::Fn(me, c == L"crouch" ? L"Crouch" : L"UnCrouch")); q.Set<bool>(L"bClientSimulation", false); q.Call(me); }
         else if (c == L"jump") { ue::Params q(uex::Fn(me, L"Jump")); q.Call(me); }
         else if (c == L"fxlist" || c == L"fxkill") FxList(me, c == L"fxkill");
-        else uex::Log(L"sniper: test: unknown command");
+        else uex::Log(L"test: unknown command");
     }
 }
 
@@ -503,7 +637,7 @@ void AimStep() {
     double ep = Wrap(want.pitch - cam.pitch), ey = Wrap(want.yaw - cam.yaw);
     auto r = CtrlRot(); r.pitch += ep; r.yaw += ey; SetCtrlRot(r);
     if (g_test.aimSteps == 0 || (fabs(ep) < .03 && fabs(ey) < .03)) {
-        uex::Log(L"sniper: test: aim error %.3f %.3f deg, %.1f m", ep, ey, ik::Len(p - eye) / 100);
+        uex::Log(L"test: aim error %.3f %.3f deg, %.1f m", ep, ey, ik::Len(p - eye) / 100);
         g_test.aimSteps = 0;
     }
 }

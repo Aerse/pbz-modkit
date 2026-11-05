@@ -41,7 +41,7 @@ constexpr int kUStruct_PropsSize    = 0xA8;  // int32
 constexpr int kUStruct_MinAlign     = 0xAC;  // int16
 
 // FField / FProperty
-constexpr int kFField_Class  = 0x08;  // FFieldClass*
+constexpr int kFField_Class  = 0x08;  // FFieldClass* (its FName at +kFFieldClass_Name: "IntProperty", ...)
 constexpr int kFField_Next   = 0x10;
 constexpr int kFField_Owner  = 0x18;  // tagged pointer (bit0 = UObject owner)
 constexpr int kFField_Name   = 0x20;
@@ -51,6 +51,7 @@ constexpr int kProp_ElemSize = 0x34;
 constexpr int kProp_Flags    = 0x38;  // uint64
 constexpr int kProp_Offset   = 0x44;  // int32
 constexpr int kProp_Extra    = 0x70;  // first subclass field (PropertyClass / Struct / Inner / bool masks)
+constexpr int kFFieldClass_Name = 0x30;
 
 template <class T> inline T At(const void* p, int off) {
     return *reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(p) + off);

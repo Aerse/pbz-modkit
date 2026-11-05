@@ -1,0 +1,6 @@
+name=字段查看器
+version=1.0
+author=Seed
+desc=开发工具：把 classes.txt 里列的类的字段（偏移、大小、类型、bool 位）写进 fields.txt，原生类的字段附带可直接粘贴的 uex::Prop 行。游戏里 Ctrl+F11 重新生成
+api=3
+mp=allow

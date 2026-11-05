@@ -8,7 +8,7 @@ Layout (unzip into <game>/platform/steam/), one folder per mod under pbzmp/:
   pbzmp/mp/  mp.dll  mp.txt  maps/*.png
   pbzmp/sniper/  sniper.dll  sniper.txt  cache/   (--full only)
   server/ rsrv.exe  pbzmp_server.py  开服务器.bat
-  sdk/    README.md  pbz_host.h  framework/  example/  hello/
+  sdk/    README.md  pbz_host.h  framework/  example/  hello/  clsprops/
 """
 import os, re, shutil, sys, zipfile
 
@@ -43,7 +43,7 @@ def text(dst, s):
         f.write(s.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
 
 
-for f in ("out/version.dll", "out/modman.exe", "out/mp.dll", "out/rsrv.exe") + (("out/sniper.dll",) if FULL else ()):
+for f in ("out/version.dll", "out/modman.exe", "out/mp.dll", "out/rsrv.exe", "out/clsprops.dll") + (("out/sniper.dll",) if FULL else ()):
     if not os.path.isfile(os.path.join(R, f)):
         sys.exit(f"missing {f}: run build.bat first")
 shutil.rmtree(D, ignore_errors=True)
@@ -68,6 +68,9 @@ with open(os.path.join(D, "sdk/example/example.cpp"), "wb") as f:
     f.write(src)
 for f in ("hello.cpp", "hello.txt", "build.bat"):
     cp("sdk/hello/" + f, "sdk/hello/" + f)
+for f in ("clsprops.cpp", "clsprops.txt", "classes.txt", "build.bat"):
+    cp("sdk/clsprops/" + f, "sdk/clsprops/" + f)
+cp("out/clsprops.dll", "sdk/clsprops/clsprops.dll")  # ready to use without a compiler
 # the framework the mods here are built on; in the sdk folder it finds pbz_host.h one level up
 for f in ("ue.h", "ue.cpp", "ue_call.h", "uex.h", "uex.cpp"):
     with open(os.path.join(R, "framework", f), "rb") as fh:

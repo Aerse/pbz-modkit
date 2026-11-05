@@ -1,5 +1,5 @@
 @echo off
-rem Builds everything into out\ : version.dll (loader), modman.exe, mp.dll (pvp mod), sniper.dll, nettest.exe, rsrv.exe, example.dll, hello.dll (SDK samples)
+rem Builds everything into out\ : version.dll (loader), modman.exe, mp.dll (pvp mod), sniper.dll, nettest.exe, rsrv.exe, example.dll, hello.dll (SDK samples), clsprops.dll (SDK field lister)
 setlocal
 set VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 if not defined VSCMD_VER call "%VCVARS%" >nul 2>nul
@@ -18,5 +18,6 @@ set S=mods\sniper
 cl %CF% /LD /Iframework %S%\sniper.cpp %S%\tests.cpp %S%\wpn.cpp %S%\audio.cpp %S%\model.cpp %S%\shoot.cpp %S%\input.cpp %S%\overlay.cpp framework\uex.cpp framework\ue.cpp winmm.lib user32.lib gdi32.lib /Fe:out\sniper.dll || exit /b 1
 cl %CF% /LD sdk\example\example.cpp /Fe:out\example.dll /link user32.lib || exit /b 1
 cl %CF% /LD /Iframework sdk\hello\hello.cpp framework\uex.cpp framework\ue.cpp /Fe:out\hello.dll /link user32.lib || exit /b 1
+cl %CF% /LD /Iframework sdk\clsprops\clsprops.cpp framework\uex.cpp framework\ue.cpp /Fe:out\clsprops.dll /link user32.lib || exit /b 1
 del out\*.exp out\*.lib 2>nul
 echo BUILD OK

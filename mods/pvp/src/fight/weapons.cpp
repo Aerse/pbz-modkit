@@ -71,7 +71,9 @@ uex::Prop kEdgeName{kEdgeRow, L"WeaponName", 0x30}, kEdgeIcon{kEdgeRow, L"Icon",
     kEdgeRender{kEdgeRow, L"RenderIcon", 0x128}, kEdgeConfig{kEdgeRow, L"WeaponConfig", 0x5f8};
 uex::Prop kValueCache{L"ScriptStruct /Script/ProjectPBZ.FlowLocText", L"ValueCache", 0x20};
 uex::Prop kEdgeRedPoint{L"Class /Script/ProjectPBZ.ShaqiWeaponInfo", L"bHasUIRedPoint", 0x49, 0xff};
-constexpr int kMainRedPoint = 0x49;      // MainWeaponInfo: no reflected red point field, the same byte as ShaqiWeaponInfo's
+// MainWeaponInfo has no reflected red point field (clsprops lists none), so this byte can't go through
+// uex::Prop; it is the same byte as ShaqiWeaponInfo's bHasUIRedPoint, so follow kEdgeRedPoint if that moves
+constexpr int kMainRedPoint = 0x49;
 // engine / native layouts (not reflected: change only with the engine version); containers: uex::layout
 using namespace uex::layout;
 constexpr int kMapValue = 0x8;           // TMap element: 8-byte key (FName, GameplayTag), then the value
@@ -79,7 +81,9 @@ int TagMapStride() { return uex::MapStride(8, uex::StructSize(L"ScriptStruct /Sc
 constexpr int kInfoData = 0x28;          // *WeaponInfo: everything after the UObject header (no pointers)
 constexpr int kInfoMax = 0x40;           // room for it (0x28 bytes in this build)
 int InfoLen(UObject* o) { int n = At<int32_t>(o->cls, kUStruct_PropsSize) - kInfoData; return n > 0 && n <= kInfoMax ? n : 0; }
-constexpr int kConfigIface = 0x30;       // PBZ_WeaponConfigBase: native interface pointer (before its first property)
+// PBZ_WeaponConfigBase: the C++ interface's vtable pointer, in the 8-byte gap before its first property.
+// Not a property, so reflection has no name for it (the first property's offset, from clsprops, shows the gap)
+constexpr int kConfigIface = 0x30;
 
 bool g_saved;                      // backpack snapshot taken (first Equip of a match)
 std::vector<FName> g_origSlots;    // PBZBackPackSubsystem::MainWeapons

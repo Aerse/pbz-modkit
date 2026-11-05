@@ -62,6 +62,7 @@ struct Wpn {
 constexpr int kWpnN = 3;
 extern Wpn g_wpn[kWpnN];
 constexpr float kDmgScale = 5.5f;  // CS hp 100 ~ a PBZ thug's 552
+constexpr float kPostureHead = 1.5f;  // posture multiplier on a headshot
 void WpnInit();
 
 struct Acc { double penalty = 0, index = 0, punch[2] = {0, 0}, lastShot = -9; };  // punch: up, right (deg)
@@ -119,6 +120,7 @@ void CharsRefresh(UObject* me);  // live characters near the player, every ~0.5 
 UObject* NearestEnemy(UObject* me);
 struct ShotRes { int kind; int dmg; UObject* victim; ik::V end; };  // kind: -1 miss, 0 body, 1 head, 2 kill, 3 headshot kill
 ShotRes Shoot(UObject* me, const Wpn& w, ik::V eye, ik::V dir, ik::V muzzle, bool tracer);
+extern ShotRes g_lastShot; extern int g_shotN;  // the last bullet fired and how many so far (selftest)
 void Fx(const wchar_t* path, ik::V at, uex::Rot rot = {}, double scale = 1);
 void Tracer(ik::V a, ik::V b, bool strong);
 void FxTick(double dt);  // tracers in flight, every tick
@@ -132,6 +134,11 @@ void DeathTick();                                     // holds the death poses w
 void Aggro(UObject* victim, UObject* me, float dmg, ik::V at);
 void PostureInfo(UObject* victim);  // test: log Health and Shachi (posture) with their limits
 void BreakInfo(UObject* victim);    // test: hit state, montage and break tags
+bool InBreakOf(UObject* ch);
+bool SetHitState(UObject* ch, const wchar_t* tag);
+std::wstring HitStateOf(UObject* ch);        // its hit state is a Break one
+extern bool g_breakDirect;          // test: posture breaks skip GE_GrabHit (exercises the ChangeHitState fallback)
+extern int g_lastBreak;             // last posture break: 1 through the effect, 2 ChangeHitState
 bool HeadPos(UObject* victim, ik::V* out);  // head bone
 extern double g_fxK[4];                     // effect scale: impact, spark, blood, tracer
 extern double g_headR, g_bodyMargin;        // hit test: head sphere radius, capsule margin (cm)
@@ -145,10 +152,11 @@ void BlockKeys(bool on);
 // ---- tests (tests.cpp): <mod dir>sniper.cmd, one command per line, read every tick ----
 struct TestState { int skip = 0; bool interact = false, equip = false, fire = false, hold = false, aimHead = false, ads = false; int burst = 0, aimSteps = 0; UObject* aimAt = nullptr; double aimOff = 30; double walkT = 0, walkF = 0, walkR = 0; };
 extern TestState g_test;
-void TestCmds(UObject* me);
+void TestCmds(UObject* me);  // also runs the selftest (command "selftest"), a step per tick
 void AimStep();  // turns the camera onto g_test.aimAt, a step per tick
 void WalkStep(UObject* me, double dt);  // test: movement input relative to the camera
 
 // ---- main loop (sniper.cpp) ----
 int CurWpn();
+bool WpnSteady();
 bool MainCmd(UObject* me, const std::wstring& c);  // test commands about the weapon state; true if handled

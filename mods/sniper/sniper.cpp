@@ -66,6 +66,11 @@ static float CamFov() {
     return v > 1 && v < 170 ? v : 90;
 }
 
+// the next shot would be a clean one: no bolt / reload, cycle done, standing still on the ground (selftest)
+bool WpnSteady() {
+    if (!g_on || !g_me || g_act != kIdle || g_now < g_nextShot) return false;
+    MoveSt m = Move(g_me); return m.grounded && m.speed < 5;
+}
 static void SetZoom(int level, bool sound) {
     const Wpn& w = g_wpn[g_cur];
     if (level > w.zoomLevels) level = 0;
@@ -80,11 +85,11 @@ static void Select(UObject* me, int i) {
     SetZoom(0, false); g_rezoom = false;
     if (g_ads > 0) { g_ads = 0; SetFov(0); }
     g_cur = i;
-    if (!ModelShow(me, i)) uex::Log(L"sniper: %s model missing", g_wpn[i].id);
+    if (!ModelShow(me, i)) uex::Log(L"%s model missing", g_wpn[i].id);
     StartAct(kDeploy, std::min(g_wpn[i].deploy, .25f));  // quick swap
     g_slot[i].acc = Acc{};
     audio::Play(g_wpn[i].draw, .8f);
-    uex::Log(L"sniper: draw %s (%d / %d)", g_wpn[i].id, g_slot[i].ammo, g_slot[i].reserve);
+    uex::Log(L"draw %s (%d / %d)", g_wpn[i].id, g_slot[i].ammo, g_slot[i].reserve);
 }
 static void Equip(UObject* me, int i) {
     if (!g_on) {
@@ -112,7 +117,7 @@ static void Unequip() {
     ModelDrop(); HideWeapons(nullptr, false); BlockKeys(false);
     overlay::Set(overlay::HudState{});
     g_on = false; g_act = kIdle; g_rezoom = false; g_test = TestState{};
-    uex::Log(L"sniper: put away");
+    uex::Log(L"put away");
     (void)me;
 }
 static void StartReload() {
@@ -120,12 +125,13 @@ static void StartReload() {
     if (s.ammo >= w.clip || s.reserve <= 0) return;
     SetZoom(0, false); g_rezoom = false;
     StartAct(kReload, w.reload);
-    uex::Log(L"sniper: reload %s %d + %d", w.id, s.ammo, s.reserve);
+    uex::Log(L"reload %s %d + %d", w.id, s.ammo, s.reserve);
 }
 
 // one bullet: CS eye angles = the camera without the punch we added; bullet = eye + 2 x punch, then the
 // inaccuracy + spread cone. Effects from the muzzle (none through the scope), feedback from the result.
 static int g_rezoomLevel; static double g_unzoomAt;
+ShotRes g_lastShot{-1, 0, nullptr, {}}; int g_shotN;
 static void Fire(UObject* me) {
     const Wpn& w = g_wpn[g_cur]; Slot& s = g_slot[g_cur];
     int alt = g_zoom > 0 ? 1 : 0;
@@ -140,6 +146,7 @@ static void Fire(UObject* me) {
     audio::Play(w.shot[int(Rand() * w.nShot) % w.nShot], w.shotVol);
     if (hasMz && !alt) MuzzleFx(w, mz, dir);
     ShotRes res = Shoot(me, w, eye, dir, mz, tracer);
+    g_lastShot = res; ++g_shotN;
     if (res.kind >= 0) overlay::Hit(res.kind, res.dmg);
     --s.ammo;
     g_nextShot = g_now - g_nextShot < .05 ? g_nextShot + w.cycle : g_now + w.cycle;  // keeps the cyclic rate exact
@@ -147,7 +154,7 @@ static void Fire(UObject* me) {
         StartAct(kBolt, w.cycle);
         if (g_zoom) { g_rezoomLevel = g_zoom; g_rezoom = true; g_unzoomAt = g_now + .12; }
     } else if (g_zoom && s.ammo == 0) g_unzoomAt = g_now + .12;
-    if (g_dbg) uex::Log(L"sniper: shot %s inacc %.4f punch %.2f %.2f -> %.2f %.2f kind %d dmg %d ammo %d", w.id, inacc,
+    if (g_dbg) uex::Log(L"shot %s inacc %.4f punch %.2f %.2f -> %.2f %.2f kind %d dmg %d ammo %d", w.id, inacc,
         before[0], before[1], s.acc.punch[0], s.acc.punch[1], res.kind, res.dmg, s.ammo);
 }
 
@@ -165,7 +172,7 @@ static void Acts(double dt) {
     if (g_act == kReload) {
         int take = std::min(w.clip - s.ammo, s.reserve);
         s.ammo += take;  // reserve is unlimited
-        uex::Log(L"sniper: reloaded %s %d / %d", w.id, s.ammo, s.reserve);
+        uex::Log(L"reloaded %s %d / %d", w.id, s.ammo, s.reserve);
     }
     if (g_act == kBolt && g_rezoom) { g_rezoom = false; if (g_zoom == 0) SetZoom(g_rezoomLevel, false); }
     g_act = kIdle;
@@ -234,7 +241,7 @@ static bool NearInteract(UObject* me, UObject* ic) {
             ue::Params t(uex::Fn(ic, L"CanTriggerInteract")); t.Set(L"Actor", o); t.Call(ic);
             if (t.Get<bool>(L"ReturnValue")) cands.push_back(o);
         }
-        if (g_dbg) for (auto c : cands) uex::Log(L"sniper:   cand %s", ue::NameOf(c).c_str());
+        if (g_dbg) for (auto c : cands) uex::Log(L"  cand %s", ue::NameOf(c).c_str());
     }
     if (g_now < checkAt) return isNear;
     checkAt = g_now + .2; isNear = false;
@@ -252,7 +259,7 @@ static bool NearInteract(UObject* me, UObject* ic) {
 static bool InteractStep(UObject* me) {  // true: leave the body to the game this frame
     auto ic = InteractComp(me); if (!ic) return false;
     bool on = NearInteract(me, ic) || IcGet(ic, L"GetInteractingActor");
-    static bool was; if (on != was) { was = on; uex::Log(L"sniper: interactable %s", on ? L"near: rifle down" : L"gone"); if (on) HoldOff(me); }
+    static bool was; if (on != was) { was = on; uex::Log(L"interactable %s", on ? L"near: rifle down" : L"gone"); if (on) HoldOff(me); }
     return on;
 }
 static void Tick(void*, float dtf) {
@@ -272,7 +279,7 @@ static void Tick(void*, float dtf) {
     if (!g_on) return;
     if (me != g_me) {  // pawn changed (travel / respawn): rebuild on the new one
         g_me = me; HideWeapons(nullptr, false); g_hideAt = 0;
-        if (!ModelShow(me, g_cur)) uex::Log(L"sniper: model lost");
+        if (!ModelShow(me, g_cur)) uex::Log(L"model lost");
     }
     const Wpn& w = g_wpn[g_cur]; Slot& s = g_slot[g_cur];
     if (g_zoom || g_ads > 0) ZoomSens(); else g_baseFov = CamFov();
@@ -330,9 +337,9 @@ bool MainCmd(UObject* me, const std::wstring& c) {
     else if (cmd == L"zoom") { if (g_on) SetZoom(arg.empty() ? (g_zoom + 1) % (g_wpn[g_cur].zoomLevels + 1) : _wtoi(arg.c_str()), true); }
     else if (cmd == L"ammo") { if (g_on) g_slot[g_cur].ammo = _wtoi(arg.c_str()); }
     else if (cmd == L"info") {
-        if (!g_on) { uex::Log(L"sniper: info: off"); return true; }
+        if (!g_on) { uex::Log(L"info: off"); return true; }
         auto& s = g_slot[g_cur]; auto mv = Move(me); auto r = CtrlRot();
-        uex::Log(L"sniper: info %s ammo %d/%d act %d %.2f/%.2f zoom %d punch %.2f %.2f idx %.1f pen %.4f inacc %.4f speed %.0f ground %d crouch %d fov %.0f ctrl %.1f %.1f cam %.2f %.2f",
+        uex::Log(L"info %s ammo %d/%d act %d %.2f/%.2f zoom %d punch %.2f %.2f idx %.1f pen %.4f inacc %.4f speed %.0f ground %d crouch %d fov %.0f ctrl %.1f %.1f cam %.2f %.2f",
             g_wpn[g_cur].id, s.ammo, s.reserve, g_act, g_actT, g_actLen, g_zoom, s.acc.punch[0], s.acc.punch[1], s.acc.index, s.acc.penalty,
             AccInacc(g_wpn[g_cur], g_zoom ? 1 : 0, s.acc, mv), mv.speed, mv.grounded, mv.crouch, CamFov(), r.pitch, r.yaw, g_camApplied[0], g_camApplied[1]);
     }
@@ -340,7 +347,7 @@ bool MainCmd(UObject* me, const std::wstring& c) {
     return true;
 }
 
-extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) { g_h = h; uex::SetHost(h); }
+extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) { g_h = h; uex::SetLogName(L"sniper"); uex::SetHost(h); }
 static bool IsDir(const std::wstring& p) {
     DWORD a = GetFileAttributesW(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
@@ -353,11 +360,11 @@ extern "C" __declspec(dllexport) void PbzRun(const wchar_t* dir) {
     g_cacheDir = g_modDir + L"cache\\";
     for (auto& c : {g_modDir + L"cache\\", g_modDir + L"sniper_cache\\", root + L"sniper_cache\\"})
         if (IsDir(c)) { g_cacheDir = c; break; }
-    uex::Log(L"sniper: assets in %s", g_cacheDir.c_str());
+    uex::Log(L"assets in %s", g_cacheDir.c_str());
     WpnInit();
     overlay::Start();
     g_tick = g_h->addTick(Tick, nullptr);
-    uex::Log(L"sniper: loaded (F6 draw / put away, 1 AWP 2 AK-47 3 M4A4, LMB fire, RMB zoom (AWP) / hold to aim (rifles), R reload)");
+    uex::Log(L"loaded (F6 draw / put away, 1 AWP 2 AK-47 3 M4A4, LMB fire, RMB zoom (AWP) / hold to aim (rifles), R reload)");
 }
 extern "C" __declspec(dllexport) void PbzUnload() {
     if (g_tick > 0) g_h->removeTick(g_tick);

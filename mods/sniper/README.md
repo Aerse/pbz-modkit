@@ -54,4 +54,6 @@ pbzmp\sniper\
 | `input.cpp` | 键鼠状态（仅在游戏窗口在前台时），屏蔽游戏自己的绑定 |
 | `tests.cpp` | 开发用：从 `pbzmp\sniper\sniper.cmd` 读测试命令（每帧读取后删除），以及转向敌人的瞄准辅助 |
 
+自测：往 `sniper.cmd` 写 `equip`（未拿枪时）和 `selftest`，模组会对最近的敌人依次测 AWP 身体 / 爆头、AK-47、M4A4 的伤害和架势削减（与公式对比），再测架势破防的两条路径（GE_GrabHit 和 ChangeHitState 兜底）。结果写进日志（`selftest PASS/FAIL ...`）和 `sniper\selftest.txt`，测试期间目标血量临时设为 9000，结束后还原。
+
 构建：在仓库根目录运行 `build.bat`，产物是 `out\sniper.dll`。
