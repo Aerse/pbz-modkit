@@ -173,29 +173,33 @@ void DeathTick() {
         ++i;
     }
 }
-// Health through the attribute system (its change callbacks run, unlike a direct write)
-static bool GasAddHealth(UObject* victim, float delta) {
+// an attribute through the attribute system (its change callbacks run, unlike a direct write): the
+// game's UI reacts (the health / posture bar)
+static bool GasAdd(UObject* victim, const wchar_t* name, float delta) {
     static UObject *ulib, *blib, *setCls;
     if (!ulib) ulib = uex::Lib(L"AttributeUtils /Script/SGameAttributes.Default__AttributeUtils");
     if (!blib) blib = uex::Lib(L"PBZBlueprintFunctionLibrary /Script/ProjectPBZ.Default__PBZBlueprintFunctionLibrary");
     if (!setCls) setCls = uex::Class(L"Class /Script/CharacterBasics.BasicAttributeSet");
     if (!ulib || !blib || !setCls) { uex::Log(L"sniper: attribute libs missing %p %p %p", ulib, blib, setCls); return false; }
     struct GA { uint8_t b[0x38]; };
-    static GA attr; static bool have;
-    if (!have) {
-        struct FS { const wchar_t* d; int32_t n, m; } nm{L"Health", 7, 7};
+    static std::map<std::wstring, GA> attrs;  // FGameplayAttribute per name, made once
+    auto it = attrs.find(name);
+    if (it == attrs.end()) {
+        int32_t n = int32_t(wcslen(name)) + 1;
+        struct FS { const wchar_t* d; int32_t n, m; } nm{name, n, n};
         ue::Params q(uex::Fn(blib, L"MakeAttribute")); q.Set(L"AttributeName", nm); q.Set(L"Set", setCls); q.Call(blib);
-        attr = q.Get<GA>(L"ReturnValue");
-        have = *reinterpret_cast<void**>(attr.b + 0x30) != nullptr || *reinterpret_cast<void**>(attr.b + 0x10) != nullptr;
-        if (!have) { uex::Log(L"sniper: MakeAttribute Health failed"); return false; }
+        GA a = q.Get<GA>(L"ReturnValue");
+        if (!*reinterpret_cast<void**>(a.b + 0x30) && !*reinterpret_cast<void**>(a.b + 0x10)) { uex::Log(L"sniper: MakeAttribute %s failed", name); return false; }
+        it = attrs.emplace(name, a).first;
     }
     ue::Params p(uex::Fn(ulib, L"ModifyCharacterAttributeValue"));
-    p.Set(L"Character", victim); p.Set(L"Attribute", attr); p.Set<uint8_t>(L"ModiferOp", 0); p.Set<float>(L"Value", delta); p.Call(ulib);
+    p.Set(L"Character", victim); p.Set(L"Attribute", it->second); p.Set<uint8_t>(L"ModiferOp", 0); p.Set<float>(L"Value", delta); p.Call(ulib);
     return true;
 }
+static bool GasAddHealth(UObject* victim, float delta) { return GasAdd(victim, L"Health", delta); }
 static bool ApplyKillEffect(UObject* victim) {
     auto ge = uex::LoadAsset(L"/Game/PBZContent/Blueprint/Ability/GameplayEffects/GE_Kill.GE_Kill_C");
-    auto asc = ue::At<UObject*>(victim, 0x750); if (!ge || !asc) return false;
+    auto asc = uex::ASC(victim); if (!ge || !asc) return false;
     ue::Params p(uex::Fn(asc, L"BP_ApplyGameplayEffectToSelf")); p.Set(L"GameplayEffectClass", ge); p.Set<float>(L"Level", 1.f); p.Call(asc);
     return true;
 }
@@ -259,12 +263,81 @@ static int Damage(UObject* victim, float dmg, ik::V dir, bool* killed) {
     return int(hp - nh + .5f);
 }
 
+// posture (杀气, Shachi): full at Shachi_Max, a hit lowers it towards Shachi_Min (the bar empties). The
+// drop is a fraction of the victim's Shachi_Max, so bosses and thugs react alike.
+// Writing Shachi does not break by itself: the game breaks a character (HitreactComponent hit state
+// CharacterState.HitReact.State.Break.Normal, tag CharacterState.Stand.Break, the NBreak montage) when a hit
+// with AngerDamage arrives through its damage path while Shachi is at the minimum. So the shot that empties the
+// bar also applies such a hit effect (GE_GrabHit) from the player's ASC; the Health that effect would take is
+// held by Health_Min and put back, the shot already did its damage.
+static const int kShachiMin = uex::attr::Shachi + 0x10;  // Shachi_Min (BasicAttributeSet +0x648)
+constexpr float kPostureHead = 1.5f;                  // posture multiplier on a headshot
+static UObject* HitreactOf(UObject* ch) {
+    static UObject* cls; if (!cls) cls = uex::Class(L"Class /Script/SGameCombatSystem.HitreactComponent");
+    return cls ? uex::Comp(ch, cls) : nullptr;
+}
+static std::wstring HitState(UObject* ch) {
+    auto h = HitreactOf(ch); if (!h) return L"-";
+    ue::Params q(uex::Fn(h, L"GetCurrentHitState")); q.Call(h); return ue::NameOf(q.Get<ue::FName>(L"ReturnValue"));
+}
+static bool InBreak(UObject* ch) { return HitState(ch).find(L"Break") != std::wstring::npos; }
+static void PostureBreak(UObject* victim, UObject* me) {
+    static UObject* ge; if (!ge) ge = uex::LoadAsset(L"/PBZCombatAsset/Prototypes/GameplayEffects/Inflictions/GE_GrabHit.GE_GrabHit_C");
+    auto src = uex::ASC(me), dst = uex::ASC(victim);
+    if (!ge || !src || !dst) { uex::Log(L"sniper: posture break: missing %d %d %d", !!ge, !!src, !!dst); return; }
+    float hp = uex::Attr(victim, uex::attr::Health), hmin = uex::Attr(victim, uex::attr::HealthMin);
+    uex::SetAttr(victim, uex::attr::HealthMin, hp);  // the effect's own damage can't go below what the shot left
+    ue::Params p(uex::Fn(src, L"BP_ApplyGameplayEffectToTarget"));  // empty context: the source ASC makes one
+    p.Set(L"GameplayEffectClass", ge); p.Set(L"Target", dst); p.Set<float>(L"Level", 1.f); p.Call(src);
+    uex::SetAttr(victim, uex::attr::HealthMin, hmin);
+    float after = uex::Attr(victim, uex::attr::Health);
+    if (after < hp - .5f && !GasAdd(victim, L"Health", hp - after)) uex::SetAttr(victim, uex::attr::Health, hp);
+    bool viaGe = InBreak(victim);
+    if (!viaGe) {  // the hit didn't take (an endure / a resisting boss): set the break state directly
+        auto h = HitreactOf(victim); auto f = h ? uex::Fn(h, L"ChangeHitState") : nullptr;
+        if (f) { ue::Params c(f); c.Set(L"NewHitState", uex::Name(L"CharacterState.HitReact.State.Break.Normal")); c.Set<bool>(L"EndStrengthAnimTask", true); c.Call(h); }
+    }
+    auto ai = AnimOf(victim); auto m = ai ? CurMont(ai) : nullptr;
+    if (g_dbg) uex::Log(L"sniper: posture break %s state %s%s mont %s hp %.0f -> %.0f -> %.0f", ue::NameOf(victim).c_str(), HitState(victim).c_str(),
+                        viaGe ? L"" : L" (direct)", m ? ue::NameOf(m).c_str() : L"-", hp, after, uex::Attr(victim, uex::attr::Health));
+}
+static void Posture(UObject* victim, UObject* me, float frac) {
+    float smx = uex::Attr(victim, uex::attr::ShachiMax); if (smx <= 0 || frac <= 0) return;
+    float sc = uex::Attr(victim, uex::attr::Shachi), smin = uex::Attr(victim, kShachiMin);
+    float want = std::max(smin, sc - frac * smx);
+    if (want >= sc) return;  // already at the minimum
+    bool gas = false;
+    try { gas = GasAdd(victim, L"Shachi", want - sc); } catch (...) { uex::Log(L"sniper: posture crashed (%s)", ue::NameOf(victim).c_str()); }
+    float got = uex::Attr(victim, uex::attr::Shachi);
+    if (!gas || got > sc - .5f * (sc - want)) { uex::SetAttr(victim, uex::attr::Shachi, want); got = want; }  // not taken: write it
+    if (g_dbg) uex::Log(L"sniper: posture %s %.0f -> %.0f (min %.0f max %.0f)%s", ue::NameOf(victim).c_str(), sc, got, smin, smx, gas ? L"" : L", direct");
+    if (got <= smin + .5f && !InBreak(victim))
+        try { PostureBreak(victim, me); } catch (...) { uex::Log(L"sniper: posture break crashed (%s)", ue::NameOf(victim).c_str()); }
+}
+// test: the hit state, montage and break-related tags of a character
+void BreakInfo(UObject* victim) {
+    if (!victim) { uex::Log(L"sniper: break: no enemy"); return; }
+    auto tc = uex::OwnedTags(victim);
+    std::wstring tags;
+    for (int i = 0; i < tc.n && i < 200; ++i) { auto t = ue::NameOf(tc.d[i]); if (t.find(L"Break") != std::wstring::npos || t.find(L"Hitreact") != std::wstring::npos || t.find(L"HitReact") != std::wstring::npos) tags += t + L" "; }
+    auto ai = AnimOf(victim); auto m = ai ? CurMont(ai) : nullptr;
+    uex::Log(L"sniper: break %s state %s mont %s shachi %.0f tags %s", ue::NameOf(victim).c_str(), HitState(victim).c_str(),
+             m ? ue::NameOf(m).c_str() : L"-", uex::Attr(victim, uex::attr::Shachi), tags.c_str());
+}
+void PostureInfo(UObject* victim) {
+    if (!victim) { uex::Log(L"sniper: posture: no enemy"); return; }
+    uex::Log(L"sniper: posture %s hp %.0f/%.0f (min %.0f) shachi %.0f min %.0f max %.0f regen %.1f cooldown %.1f", ue::NameOf(victim).c_str(),
+             uex::Attr(victim, uex::attr::Health), uex::Attr(victim, uex::attr::HealthMax), uex::Attr(victim, uex::attr::HealthMin),
+             uex::Attr(victim, uex::attr::Shachi), uex::Attr(victim, kShachiMin), uex::Attr(victim, uex::attr::ShachiMax),
+             uex::Attr(victim, uex::attr::Shachi + 0x40), uex::Attr(victim, uex::attr::Shachi + 0x50));  // ShachiRegen, ShachiRegenCooldown
+}
+
 // ---- characters near the player (refreshed every ~0.5 s, the object array is large) ----
 static std::vector<UObject*> g_chars;
 static double g_charsAt = -9;
 static UObject* g_charsMe;
 static bool LiveChar(UObject* o) {
-    return o && uex::Alive(o) && !(o->flags & 0x30) && ue::At<void*>(o, 0x758) && uex::Attr(o, uex::attr::Health) > 0;
+    return o && uex::Alive(o) && !(o->flags & 0x30) && uex::AttrSet(o) && uex::Attr(o, uex::attr::Health) > 0;
 }
 void CharsRefresh(UObject* me) {
     if (g_now - g_charsAt < .5 && g_charsMe == me) return;
@@ -294,7 +367,9 @@ struct HB { uint8_t b[0x100]; };
 static bool Invisible(UObject* comp, UObject* actor) {  // collision-only geometry (AI walls, volumes): bullets pass
     bool vis = true;
     if (auto f = uex::Fn(comp, L"IsVisible")) { ue::Params p(f); p.Call(comp); vis = p.Get<bool>(L"ReturnValue"); }
-    return !vis || (ue::At<uint8_t>(comp, 0x1a9) & 0x8) || (ue::At<uint8_t>(actor, 0x58) & 0x80);
+    static uex::Prop kHiddenInGame{L"Class /Script/Engine.SceneComponent", L"bHiddenInGame", 0x1a9, 0x8};
+    static uex::Prop kActorHidden{L"Class /Script/Engine.Actor", L"bHidden", 0x58, 0x80};
+    return !vis || kHiddenInGame.Bit(comp) || kActorHidden.Bit(actor);
 }
 bool HeadPos(UObject* victim, ik::V* out) {
     auto m = MeshOf(victim); if (!m) return false;
@@ -346,7 +421,8 @@ ShotRes Shoot(UObject* me, const Wpn& w, ik::V eye, ik::V dir, ik::V muzzle, boo
     for (auto o : g_chars) {
         if (!LiveChar(o)) continue;
         ik::V c = ik::FromU(uex::Loc(o)); double rad = 40, hh = 90;
-        if (auto cap = ue::At<UObject*>(o, 0x340)) {
+        static uex::Prop kCapsule{L"Class /Script/Engine.Character", L"CapsuleComponent", 0x340};
+        if (auto cap = kCapsule.Of<UObject*>(o)) {
             { ue::Params q(uex::Fn(cap, L"GetScaledCapsuleRadius")); q.Call(cap); rad = q.Get<float>(L"ReturnValue"); }
             { ue::Params q(uex::Fn(cap, L"GetScaledCapsuleHalfHeight")); q.Call(cap); hh = q.Get<float>(L"ReturnValue"); }
         }
@@ -365,6 +441,10 @@ ShotRes Shoot(UObject* me, const Wpn& w, ik::V eye, ik::V dir, ik::V muzzle, boo
         if (tb > 0 && tb < best) { best = tb; victim = o; head = false; }
     }
     if (!victim) {
+        if (g_dbg) for (auto o : g_chars) {  // why nobody was hit: how far the ray passes each character
+            double off, tt = RayPt(eye, dir, ik::FromU(uex::Loc(o)), &off);
+            if (off < 300) uex::Log(L"sniper: miss %s at %.0fm, %.0fcm off the ray (wall %.0fm, live %d)", ue::NameOf(o).c_str(), tt / 100, off, wall / 100, LiveChar(o));
+        }
         res.end = hitWall ? wallAt : end;
         if (hitWall) ImpactFx(wallAt, wallN, dir);
         if (tracer) Tracer(muzzle, res.end, !w.autoFire);
@@ -376,6 +456,7 @@ ShotRes Shoot(UObject* me, const Wpn& w, ik::V eye, ik::V dir, ik::V muzzle, boo
     bool killed = false;
     Aggro(victim, me, dmg, at);
     res.dmg = Damage(victim, dmg, dir, &killed);
+    if (!killed) Posture(victim, me, w.posture * (head ? kPostureHead : 1));
     res.kind = killed ? (head ? 3 : 2) : (head ? 1 : 0);
     Fx(head ? kBloodHead : kBlood, at, ik::RotOf(dir * -1), g_fxK[2]);
     static const wchar_t* flesh[] = {L"flesh_impact_bullet1", L"flesh_impact_bullet2", L"flesh_impact_bullet3"};

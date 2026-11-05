@@ -3,7 +3,7 @@
 《影之刃零》（Phantom Blade Zero，PC / Steam 版）的非官方 Mod 平台：DLL 加载器、Mod管理器、开发 SDK，以及基于它做的几个 Mod（1v1 联机 PvP、CS 步枪）。
 
 > 非官方项目，与游戏开发商无关。仓库不含任何游戏文件或资源，不解锁付费 DLC。
-> 内存偏移和游戏版本绑定（当前适配 UE 5.7 的 PC 版），游戏更新后可能失效。使用 Mod 的风险自负，建议先备份存档。
+> 加载器每次启动自己找引擎地址，框架按名字读字段，普通的游戏更新不需要重新适配；只有 UE 引擎大版本升级才可能失效（当前是 UE 5.7）。使用 Mod 的风险自负，建议先备份存档。
 
 ▶ 联机 PvP 演示视频：[哔哩哔哩 BV1ERxQ6mEo1](https://www.bilibili.com/video/BV1ERxQ6mEo1/)
 
@@ -20,6 +20,7 @@
 - 在游戏主线程每帧回调 Mod，回调外面套了 SEH 保护：单个 Mod 出错只记日志，不会拖垮游戏。
 - 按 `pbzmp\autorun.txt` 加载 Mod，也支持在运行中通过 `pbzmp\cmd.txt` 执行 `run <id>` / `stop <id>`，做热加载和热卸载（加载的是 DLL 副本，可以边改边编）。
 - 统一接口：每帧 tick、下一帧执行（post）、日志、函数 Hook（MinHook，同一个目标只允许一个 Mod 挂，冲突时记日志）、全局热键（只在游戏窗口在前台时生效）。Mod 卸载时，它注册过的东西都会自动清理。
+- 每次启动扫描 `PBZ.exe` 找到对象数组、名字池、ProcessEvent 和引擎 Tick（结果写进 `loader.log`），游戏更新后不用改地址。
 - 能和别的 `version.dll` Mod 共存：把对方改名为 `version_chain.dll`，本加载器启动后会顺带加载它。
 
 **Mod管理器（`Mod管理器.exe`）**
@@ -30,6 +31,7 @@
 **Mod**
 - [`mods/pvp`](mods/pvp/README.md)：1v1 联机对战，支持 Steam P2P 或自建中转服务器。有房间大厅，可以选武器 / 杀器 / 外观，有 3 张擂台地图，比赛不读写存档，崩溃后可以重连。
 - [`mods/sniper`](mods/sniper/README.md)：AWP / AK-47 / M4A4，CS2 手感，只能单机用。需要自备资源。
+- [`sdk/hello`](sdk/README.md)：用框架写的示例，按名字读血量、架势、位置，没有一个内存地址。
 - [`sdk/example`](sdk/README.md)：最小示例，演示 tick、hook 和热键。
 
 ## 目录结构
@@ -41,10 +43,10 @@ pbz-modkit/
 ├─ loader/              加载器：main.cpp、host.h（Mod 接口）、proxy_exports.h
 ├─ modman/              Mod管理器
 ├─ framework/           UE 5.7 运行时访问，给 Mod 静态链接
-│   ├─ ue.cpp/.h          对象表、FName、反射（类 / 属性 / 函数）
+│   ├─ ue.cpp/.h          对象表、FName、反射（类 / 属性 / 函数），引擎地址来自加载器
 │   ├─ ue_call.h          ProcessEvent 的参数封装
-│   └─ uex.cpp/.h         查找对象、调用函数、读写属性、日志、存档保护开关
-├─ sdk/                 Mod 开发文档和示例
+│   └─ uex.cpp/.h         按名字找字段（Prop / Field）、属性、调用函数、界面、日志、存档保护开关
+├─ sdk/                 Mod 开发文档和示例（hello：框架示例，example：最小示例）
 ├─ mods/
 │   ├─ pvp/               联机 PvP：src/ server/ docs/ maps/
 │   └─ sniper/            CS 步枪
@@ -58,13 +60,14 @@ pbz-modkit/
 
 | 版本 | 适配游戏版本（PBZ.exe 文件版本） |
 |---|---|
+| v1.4 | 不再绑定具体版本：加载器启动时自己找地址，字段按名字查（测试于 `CL-302256_JKS-17280`，2026-11-04） |
 | v1.3 | `CL-302256_JKS-17280`，2026-11-04 更新后的版本（文件版本号没变，exe 修改日期为 11-04） |
 | v1.2 | `CL-302256_JKS-17280`，11-04 更新之前 |
 
-游戏更新后，Mod 依赖的内存偏移可能变化，需要发布对应的新版本。PBZ.exe 的文件版本可以在右键 → 属性 → 详细信息里查看。注意：版本号不变时也可能有更新（例如 11-04 那次），这时再看 exe 的修改日期。
+从 v1.4 起，游戏更新后一般不需要新版本。如果更新后 Mod 不工作，打开 `pbzmp\loader.log`：`engine:` 那行写着加载器找到的地址，`field ... not found` 表示游戏删掉或改名了某个字段，把日志发给作者即可。PBZ.exe 的文件版本可以在右键 → 属性 → 详细信息里查看。
 
 1. 在 Steam 里右键游戏，选「管理 → 浏览本地文件」，进入 `platform\steam\`（`PBZ.exe` 所在的文件夹）。
-2. 把发布包解压到这里，得到 `version.dll`、`Mod管理器.exe`、`pbzmp\`。
+2. 把发布包解压到这里，得到 `version.dll`、`Mod管理器.exe`、`pbzmp\`（每个 Mod 在里面有自己的文件夹，例如 `pbzmp\mp\`）。从旧版本升级时直接覆盖解压即可，原来的设置会被自动沿用。
 3. 用 Mod管理器勾选要启用的 Mod 并保存，然后正常启动游戏。
 
 卸载：删掉 `version.dll`、`Mod管理器.exe` 和 `pbzmp\` 即可。如果之前串联过别的 Mod，把 `version_chain.dll` 改回 `version.dll`。
@@ -86,7 +89,7 @@ python package.py --full   :: 本地自测包，额外带 CS 步枪和本地资�
 
 `build.bat` 会自动调用 VS 2022 Build Tools 的 `vcvars64.bat`。如果你装的是其他版本，先在「x64 Native Tools Command Prompt」里运行它，或者修改脚本开头的 `VCVARS`。
 
-开发时把 `out\` 里的 DLL 复制到游戏的 `platform\steam\pbzmp\`，再往 `pbzmp\cmd.txt` 写一行 `stop mp` / `run mp`，就能热重载，不用重启游戏。
+开发时把 `out\` 里的 DLL 复制到游戏的 `platform\steam\pbzmp\<id>\`（例如 `pbzmp\mp\mp.dll`），再往 `pbzmp\cmd.txt` 写一行 `stop mp` / `run mp`，就能热重载，不用重启游戏。
 
 ## 测试
 
@@ -101,19 +104,24 @@ python mods\pvp\server\test_server.py             :: 同一套测试，跑 C++ �
 
 ## 写一个 Mod
 
-Mod 就是一个 DLL，导出 `PbzInit(const PbzHost*)`（可选 `PbzUnload()` 支持热卸载）：
+Mod 就是一个 DLL，导出 `PbzInit(const PbzHost*)`（可选 `PbzUnload()` 支持热卸载）。链接 `framework/` 后，对象、字段、函数都按名字访问，不用写内存地址：
 
 ```cpp
-#include "pbz_host.h"
-static const PbzHost* g;
-static void Tick(void*, float dt) { /* 每帧在游戏线程执行 */ }
+#include "uex.h"
+static void OnKey(void*) {
+    if (auto me = uex::Me())  // 本地玩家
+        uex::Log(L"hp %.0f / %.0f", uex::Attr(me, uex::attr::Health), uex::Attr(me, uex::attr::HealthMax));
+}
 extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) {
-    g = h; h->addTick(Tick, nullptr); h->log(L"hello");
+    uex::SetHost(h); uex::SetLogName(L"hello");
+    h->addHotkey(VK_F10, kPbzHotCtrl, OnKey, nullptr);
 }
 extern "C" __declspec(dllexport) void PbzUnload() { /* 撤销自己生成的东西；tick/hook/热键由加载器清理 */ }
 ```
 
-把它放到 `pbzmp\<id>.dll` 或 `pbzmp\<id>\<id>.dll`，旁边放一个同名的 `<id>.txt`，描述名称、版本、前置、冲突、接口版本、能否联机。完整接口、信息文件格式和构建方法见 [sdk/README.md](sdk/README.md)。
+字段用 `uex::Prop{L"Class /Script/Engine.Character", L"Mesh", 0x330}` 声明：第一次用时按名字查，游戏更新挪了位置也能找到，数字只是找不到时的兜底，日志会提示。
+
+每个 Mod 一个文件夹：`pbzmp\<id>\<id>.dll`，旁边放一个同名的 `<id>.txt`，描述名称、版本、前置、冲突、接口版本、能否联机；Mod 自己的资源和设置也放在这个文件夹里（`PbzRun(dir)` 收到的就是它）。旧的平铺方式 `pbzmp\<id>.dll` 仍然能加载。完整接口、信息文件格式和构建方法见 [sdk/README.md](sdk/README.md)。
 
 ## 许可
 

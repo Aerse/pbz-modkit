@@ -6,7 +6,6 @@
 #include "ue.h"
 
 namespace ue {
-constexpr int kVT_ProcessEvent = 0x4c;        // vtable index (found by scanning for FUNC_Native test)
 constexpr int kUFunction_Flags = 0x100;
 
 using ProcessEventFn = void(__fastcall*)(UObject*, UObject*, void*);
@@ -27,12 +26,18 @@ inline UObject* FindFunction(const UObject* cls, const std::wstring& name) {
 
 struct PropInfo { int offset = -1; int size = 0; };
 
-inline PropInfo FindProp(const UObject* st, const std::wstring& name) {
+// the FProperty itself (walks Super), null if none
+inline const uint8_t* FindPropPtr(const UObject* st, const std::wstring& name) {
     for (auto c = st; c; c = At<UObject*>(c, kUStruct_Super))
         for (auto p = At<const uint8_t*>(c, kUStruct_ChildProps); p; p = At<const uint8_t*>(p, kFField_Next))
-            if (NameIs(*reinterpret_cast<const FName*>(p + kFField_Name), name))
-                return {At<int32_t>(p, kProp_Offset), At<int32_t>(p, kProp_ElemSize) * At<int32_t>(p, kProp_ArrayDim)};
-    return {};
+            if (NameIs(*reinterpret_cast<const FName*>(p + kFField_Name), name)) return p;
+    return nullptr;
+}
+
+inline PropInfo FindProp(const UObject* st, const std::wstring& name) {
+    auto p = FindPropPtr(st, name);
+    if (!p) return {};
+    return {At<int32_t>(p, kProp_Offset), At<int32_t>(p, kProp_ElemSize) * At<int32_t>(p, kProp_ArrayDim)};
 }
 
 // Parameter block sized from the function's own properties.
@@ -60,7 +65,7 @@ public:
     }
     void Call(UObject* self) {
         if (!fn_ || !self) return;  // missing function or object: nothing to call
-        auto pe = reinterpret_cast<ProcessEventFn>(self->vtable[kVT_ProcessEvent]);
+        auto pe = reinterpret_cast<ProcessEventFn>(self->vtable[globals.processEvent]);
         pe(self, fn_, buf_.data());
     }
     int Size() const { return int(buf_.size()); }

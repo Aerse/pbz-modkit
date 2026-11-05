@@ -1,6 +1,7 @@
 #include "ue.h"
 #include <windows.h>
 #include <unordered_map>
+#include "../loader/host.h"
 
 namespace ue {
 // Names are read straight from the game's FNamePool, so nothing is allocated in the game's heap.
@@ -8,10 +9,19 @@ namespace ue {
 // tens of MB per FindObject, about 220 GB in an hour of tests.)
 // Pool layout: +0x08 current block (u32), +0x10 block pointers. An entry is 2-byte aligned:
 // u16 header (length << 6 | wide flag in bit 0), then the characters.
-constexpr uintptr_t kNamePool = 0x14dd86ac0;
+Globals LoadGlobals() {
+    auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    Globals g{base + 0xde28c68, base + 0xde28c70, base + 0xdd86ac0, 0x4c, false};  // 2026-11-04 build
+    wchar_t b[32] = {};
+    if (!GetEnvironmentVariableW(L"PBZMP_HOST", b, 32)) return g;
+    auto h = reinterpret_cast<const PbzHost*>(wcstoull(b, nullptr, 16));
+    if (!h || h->version < 3 || !h->objects || !h->namePool || h->processEvent <= 0) return g;
+    auto o = reinterpret_cast<uintptr_t>(h->objects);
+    return {o, o + 8, reinterpret_cast<uintptr_t>(h->namePool), h->processEvent, true};
+}
 
 static const uint8_t* Entry(uint32_t id) {
-    auto pool = reinterpret_cast<const uint8_t*>(kNamePool);
+    auto pool = reinterpret_cast<const uint8_t*>(globals.namePool);
     uint32_t block = id >> 16;
     if (block > *reinterpret_cast<const uint32_t*>(pool + 8)) return nullptr;
     auto base = *reinterpret_cast<const uint8_t* const*>(pool + 0x10 + 8 * size_t(block));

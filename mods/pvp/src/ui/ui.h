@@ -5,4 +5,5 @@ namespace ui {
 void Tick(float dt);   // builds/updates widgets as needed (menu entry when on the start menu, lobby, HUD)
 void Shutdown();       // removes every widget, restores input mode
 bool InMenu();         // a mod panel currently owns the input
+void SetModDir(const wchar_t* dir);  // PbzRun's folder: maps, settings and session files live there
 }

@@ -6,7 +6,7 @@
 // uex::SetText (FText cached per string, skips unchanged). Edit boxes are only read on a click
 // (GetText/Conv_TextToString leak a little, never per frame).
 // Esc (our window in front, read with GetAsyncKeyState, never sent) closes the panel.
-// Test hook: <mod dir>\ui_cmd.txt lines "open" "close" "set <id> <text>" "click <id>" "dump";
+// Test hook: <loader root>\ui_cmd.txt lines "open" "close" "set <id> <text>" "click <id>" "dump";
 // results go to ui_test.txt. Checked every 30 ticks, file deleted after reading.
 #include "ui.h"
 #include <windows.h>
@@ -40,6 +40,62 @@ struct SlateColor { Color c; uint8_t rule = 0, pad[3]{}; };  // 0x14 in this bui
 constexpr uint8_t kVisible = 0, kCollapsed = 1, kHidden = 2, kHitTestInvisible = 3, kSelfHitTestInvisible = 4;
 constexpr int kMaxRows = 4;  // server max players
 
+// reflected fields (by name; the number is this build's offset, used only if the field is gone)
+constexpr const wchar_t* kWidget = L"Class /Script/UMG.Widget";
+uex::Prop kSlot{kWidget, L"Slot", 0x30}, kVis{kWidget, L"Visibility", 0xdd}, kEnabled{kWidget, L"bIsEnabled", 0xd9, 0x4},
+    kClip{kWidget, L"Clipping", 0xdc}, kOpacity{kWidget, L"RenderOpacity", 0xe0}, kXform{kWidget, L"RenderTransform", 0x90};
+uex::Prop kXfTrans{L"ScriptStruct /Script/UMG.WidgetTransform", L"Translation", 0},
+    kXfScale{L"ScriptStruct /Script/UMG.WidgetTransform", L"Scale", 0x10};
+uex::Prop kJustify{L"Class /Script/UMG.TextLayoutWidget", L"Justification", 0x17b};
+constexpr const wchar_t* kTb = L"Class /Script/UMG.TextBlock";
+uex::Prop kTbColor{kTb, L"ColorAndOpacity", 0x1b8}, kTbMinW{kTb, L"MinDesiredWidth", 0x1dc}, kTbFont{kTb, L"Font", 0x1e0},
+    kTbShadow{kTb, L"ShadowOffset", 0x2f0}, kTbShadowColor{kTb, L"ShadowColorAndOpacity", 0x300};
+uex::Prop kColorRule{L"ScriptStruct /Script/SlateCore.SlateColor", L"ColorUseRule", 0x10};
+constexpr const wchar_t* kFont = L"ScriptStruct /Script/SlateCore.SlateFontInfo";
+uex::Prop kFontOutline{kFont, L"OutlineSettings", 0x10}, kFontFace{kFont, L"TypefaceFontName", 0x40},
+    kFontSize{kFont, L"Size", 0x48}, kFontSpacing{kFont, L"LetterSpacing", 0x4c};
+uex::Prop kImgBrush{L"Class /Script/UMG.Image", L"Brush", 0x180}, kImgColor{L"Class /Script/UMG.Image", L"ColorAndOpacity", 0x240};
+constexpr const wchar_t* kBrush = L"ScriptStruct /Script/SlateCore.SlateBrush";
+uex::Prop kBrushTint{kBrush, L"TintColor", 0x8}, kBrushDrawAs{kBrush, L"DrawAs", 0x1c}, kBrushImgSize{kBrush, L"ImageSize", 0x20},
+    kBrushMargin{kBrush, L"Margin", 0x28};
+uex::Prop kBtnStyle{L"Class /Script/UMG.Button", L"WidgetStyle", 0x190}, kBtnBg{L"Class /Script/UMG.Button", L"BackgroundColor", 0x530};
+constexpr const wchar_t* kBs = L"ScriptStruct /Script/SlateCore.ButtonStyle";
+uex::Prop kBsNormal{kBs, L"Normal", 0x10}, kBsHovered{kBs, L"Hovered", 0xc0}, kBsPressed{kBs, L"Pressed", 0x170}, kBsDisabled{kBs, L"Disabled", 0x220};
+constexpr const wchar_t* kPb = L"Class /Script/UMG.ProgressBar";
+uex::Prop kBarStyle{kPb, L"WidgetStyle", 0x180}, kBarFill{kPb, L"BarFillType", 0x3b4}, kBarPad{kPb, L"BorderPadding", 0x3b8};
+uex::Prop kPbBack{L"ScriptStruct /Script/SlateCore.ProgressBarStyle", L"BackgroundImage", 0x10},
+    kPbFill{L"ScriptStruct /Script/SlateCore.ProgressBarStyle", L"FillImage", 0xc0};
+uex::Prop kWidgetTree{L"Class /Script/UMG.UserWidget", L"WidgetTree", 0x2c0}, kRootWidget{L"Class /Script/UMG.WidgetTree", L"RootWidget", 0x30};
+uex::Prop kEditStyle{L"Class /Script/UMG.EditableTextBox", L"WidgetStyle", 0x1a0},
+    kEditMinW{L"Class /Script/UMG.EditableTextBox", L"MinimumDesiredWidth", 0xe44};
+constexpr const wchar_t* kEs = L"ScriptStruct /Script/SlateCore.EditableTextBoxStyle";
+uex::Prop kEsNormal{kEs, L"BackgroundImageNormal", 0x10}, kEsHovered{kEs, L"BackgroundImageHovered", 0xc0},
+    kEsFocused{kEs, L"BackgroundImageFocused", 0x170}, kEsPadding{kEs, L"Padding", 0x2d0}, kEsText{kEs, L"Textstyle", 0x2e0},
+    kEsFg{kEs, L"ForegroundColor", 0x5c0}, kEsFocusFg{kEs, L"FocusedForegroundColor", 0x5fc};
+uex::Prop kTsFont{L"ScriptStruct /Script/SlateCore.TextBlockStyle", L"Font", 0x8};
+uex::Prop kBorderBg{L"Class /Script/UMG.Border", L"Background", 0x1d0};
+uex::Prop kSlotParent{L"Class /Script/UMG.PanelSlot", L"Parent", 0x28};
+constexpr const wchar_t* kVs = L"Class /Script/UMG.VerticalBoxSlot";
+uex::Prop kVsSize{kVs, L"Size", 0x38}, kVsPad{kVs, L"Padding", 0x40}, kVsH{kVs, L"HorizontalAlignment", 0x50}, kVsV{kVs, L"VerticalAlignment", 0x51};
+uex::Prop kBtnText{L"Class /Script/ProjectPBZ.PBZButtonBase", L"ButtonTextBlock", 0x1670};
+uex::Prop kCtStyle{L"Class /Script/CommonUI.CommonTextBlock", L"Style", 0x340};
+uex::Prop kLocDeco{L"Class /Script/ProjectPBZ.PBZCommonLocText", L"LanguageTextDecoratorClass", 0x3a0};
+uex::Prop kWidgetList{L"Class /Script/CommonUI.CommonActivatableWidgetContainerBase", L"WidgetList", 0x1a8};
+uex::Prop kPlayerInput{L"Class /Script/Engine.PlayerController", L"PlayerInput", 0x428};
+uex::Prop kActionMappings{L"Class /Script/EnhancedInput.EnhancedPlayerInput", L"EnhancedActionMappings", 0x628};
+constexpr const wchar_t* kMapping = L"ScriptStruct /Script/EnhancedInput.EnhancedActionKeyMapping";
+uex::Prop kMapAction{kMapping, L"Action", 0x20}, kMapKey{kMapping, L"Key", 0x28};
+int MappingSize() { return uex::StructSize(kMapping, 0x50); }
+// FSlateFontInfo: the CompositeFont shared pointer (native, not a property) sits between OutlineSettings and TypefaceFontName
+int FontShared() { return kFontOutline + uex::StructSize(L"ScriptStruct /Script/SlateCore.FontOutlineSettings", 0x20); }
+// fixed buffer sizes (FSlateFontInfo, FSlateBrush in this build): a runtime size cannot size an array
+constexpr int kFontInfoBytes = 0x60, kBrushBytes = 0xb0;
+constexpr int kArrNum = 0x8;  // TArray: data +0, num +8
+// Blueprint variables of WB_StartMenu_V2 / W_MenuButton_V2_C (not in the native dump; names from the designer)
+constexpr int kMenuGroup = 0x780, kMenuNewGame = 0x6c8;  // the menu's button group, the NewGame button
+constexpr int kMbDecoOnSelected = 0x1948, kMbSelOpacity = 0x1950, kMbUnselOpacity = 0x1958;
+constexpr int kMbDisabled = 0x1932;  // printed as "dis" by the mbtn hook (name unverified)
+
 const int kRounds[] = {1, 3, 5, 7, 9};
 const int kTimes[] = {0, 60, 90, 120, 180};
 const int kDmgs[] = {50, 75, 100, 150, 200};
@@ -61,7 +117,7 @@ struct G {
     std::map<UObject*, float> pct;    // last SetPercent
     std::map<UObject*, Color> color;  // last SetColorAndOpacity
     std::map<UObject*, uint8_t> vis;  // last SetVisibility
-    uint8_t font[0x60]{}; bool haveFont = false;
+    uint8_t font[kFontInfoBytes]{}; bool haveFont = false;
     bool open = false, uiMode = false, hudTest = false;
     bool steamMode = false;  // connect panel: Steam P2P instead of the relay server
     int weapon = 0, tick = 0; double weaponAt = -10; double modsAt = -10;  // last local weapon click (server echo may lag)
@@ -83,6 +139,20 @@ struct G {
     UObject *menuOff = nullptr, *lastEdit = nullptr; uint8_t menuVis = 0; int refocus = 0;
 } g;
 static double g_sessionAt = -100; static bool g_sessionFile;  // crash rejoin file (SessionTick); outlives Build
+
+// ---- files ----------------------------------------------------------------------------------
+// Mod-owned files (maps\, mp_settings.txt, mp_session.txt) live in the mod folder PbzRun got
+// (<root>\mp\, or the root itself for a flat install). Loader / test files (autorun.txt, cmd.txt,
+// ui_cmd.txt, ui_test.txt) stay in the root (host->dir).
+static std::wstring g_modDir;
+std::wstring RootDir() { auto h = uex::Host(); return h && h->dir ? h->dir : L""; }
+std::wstring ModDir() { return g_modDir.empty() ? RootDir() : g_modDir; }
+bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+// where to read a mod file from: the mod folder, else the root if an old flat install left it there
+std::wstring ModFileIn(const std::wstring& name) {
+    std::wstring p = ModDir() + name, old = RootDir() + name;
+    return Exists(p) || p == old || !Exists(old) ? p : old;
+}
 
 // ---- small UE call helpers --------------------------------------------------------------
 UObject* UmgClass(const wchar_t* n) { return uex::Class((std::wstring(L"Class /Script/UMG.") + n).c_str()); }
@@ -108,17 +178,17 @@ UObject* Add(UObject* panel, UObject* child, const wchar_t* fn = L"AddChild") {
 void Vis(UObject* w, uint8_t v) { Call1<uint8_t>(w, L"SetVisibility", L"InVisibility", v); }
 template <class T> void Put(UObject* o, int off, const T& v) { *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(o) + off) = v; }
 
-// copy the font (not the CompositeFont shared pointer at +0x30) of a live game TextBlock
+// copy the font (not the CompositeFont shared pointer after OutlineSettings) of a live game TextBlock
 void FindFont() {
     auto tb = UmgClass(L"TextBlock"); if (!tb) return;
     int n = NumObjects();
     for (int i = 0; i < n; ++i) {
         auto o = ObjectAt(i);
         if (!o || (o->flags & 0x10) || !IsA(o, tb)) continue;
-        auto f = At<UObject*>(o, 0x1e0);
+        auto f = kTbFont.Of<UObject*>(o);  // FontObject
         if (!f || NameOf(f).find(L"Roboto") != std::wstring::npos) continue;
-        memcpy(g.font, reinterpret_cast<uint8_t*>(o) + 0x1e0, 0x60);
-        memset(g.font + 0x30, 0, 0x10);
+        memcpy(g.font, reinterpret_cast<uint8_t*>(o) + kTbFont, kFontInfoBytes);
+        memset(g.font + FontShared(), 0, kFontFace - FontShared());
         g.haveFont = true;
         uex::Log(L"ui: font %s from %s", PathOf(f).c_str(), PathOf(o).c_str());
         return;
@@ -126,8 +196,8 @@ void FindFont() {
     uex::Log(L"ui: no game font found, using default");
 }
 void ApplyFont(uint8_t* fi, float size) {  // fi: an FSlateFontInfo inside a widget not built yet
-    if (g.haveFont) { memcpy(fi, g.font, 0x30); memcpy(fi + 0x40, g.font + 0x40, 0x20); }
-    *reinterpret_cast<float*>(fi + 0x48) = size;
+    if (g.haveFont) { memcpy(fi, g.font, FontShared()); memcpy(fi + kFontFace, g.font + kFontFace, kFontInfoBytes - kFontFace); }
+    *reinterpret_cast<float*>(fi + kFontSize) = size;
 }
 
 // ---- game look: the game's own textures / fonts / boss bar (all under /Game/PBZContent/UI) -
@@ -183,7 +253,7 @@ struct Cards {  // a lobby card row (weapons / Phantom Edges)
 };
 struct Skin {  // widgets of the new layout (reset on every Build)
     UObject *scratch = nullptr, *titleFont = nullptr, *plaque = nullptr;
-    uint8_t blank[0xb0]{};
+    uint8_t blank[kBrushBytes]{};
     Cards wc, ec, oc;                         // weapon cards, Phantom Edge cards, outfit cards
     int tab = 0, tabShown = -1;               // card row shown: 0 weapons, 1 Phantom Edges, 2 outfits
     std::vector<UObject*> mapSel, mapName;    // map cards: selection frame image, name text
@@ -194,24 +264,26 @@ int Pages(int n) { return n > 0 ? (n + kCardsPerPage - 1) / kCardsPerPage : 1; }
 // brush for a texture as the engine makes it (SetBrushFromTexture on a scratch Image), then our draw settings.
 // drawAs: 0 none, 1 box (9-slice by margin), 3 image (stretched). Build time only.
 void MakeBrushTex(uint8_t* out, UObject* t, uint8_t drawAs, Color tint, Margin m = {}, float w = 0, float h = 0) {
-    if (!k.scratch) { k.scratch = New(L"Image", g.tree); if (!k.scratch) return; memcpy(k.blank, reinterpret_cast<uint8_t*>(k.scratch) + 0x180, 0xb0); }
-    memcpy(reinterpret_cast<uint8_t*>(k.scratch) + 0x180, k.blank, 0xb0);
+    if (!k.scratch) { k.scratch = New(L"Image", g.tree); if (!k.scratch) return; memcpy(k.blank, reinterpret_cast<uint8_t*>(k.scratch) + kImgBrush, kBrushBytes); }
+    memcpy(reinterpret_cast<uint8_t*>(k.scratch) + kImgBrush, k.blank, kBrushBytes);
     if (t) {  // bMatchSize: ImageSize = texture size unless w/h given
         Params p(uex::Fn(k.scratch, L"SetBrushFromTexture")); p.Set(L"Texture", t); p.Set<bool>(L"bMatchSize", true); p.Call(k.scratch);
     }
-    memcpy(out, reinterpret_cast<uint8_t*>(k.scratch) + 0x180, 0xb0);
-    out[0x1c] = drawAs; *reinterpret_cast<Color*>(out + 0x8) = tint; out[0x18] = 0; *reinterpret_cast<Margin*>(out + 0x28) = m;
-    if (w > 0) { reinterpret_cast<float*>(out + 0x20)[0] = w; reinterpret_cast<float*>(out + 0x20)[1] = h; }
+    memcpy(out, reinterpret_cast<uint8_t*>(k.scratch) + kImgBrush, kBrushBytes);
+    out[kBrushDrawAs] = drawAs; *reinterpret_cast<Color*>(out + kBrushTint) = tint; out[kBrushTint + kColorRule] = 0;
+    *reinterpret_cast<Margin*>(out + kBrushMargin) = m;
+    if (w > 0) { reinterpret_cast<float*>(out + kBrushImgSize)[0] = w; reinterpret_cast<float*>(out + kBrushImgSize)[1] = h; }
 }
 void MakeBrush(uint8_t* out, const wchar_t* tex, uint8_t drawAs, Color tint, Margin m = {}, float w = 0, float h = 0) {
     auto t = tex ? uex::LoadAsset(tex) : nullptr;
     if (tex && !t) uex::Log(L"ui: no texture %s", tex);
     MakeBrushTex(out, t, drawAs, tint, m, w, h);
 }
-// a PNG shipped in the mod folder (<moddir>/maps/<file>) loaded as a transient texture; the brush keeps it referenced
+// a PNG shipped in the mod folder (<mod dir>maps\<file>, else <root>maps\<file> from an old flat
+// install) loaded as a transient texture; the brush keeps it referenced
 UObject* MkFileImg(const std::wstring& file, float w, float h) {
     struct FS { const wchar_t* d; int32_t n, m; };
-    std::wstring path = std::wstring(uex::Host()->dir) + L"maps/" + file;
+    std::wstring path = ModFileIn(L"maps\\" + file);
     UObject* t = nullptr;
     if (auto lib = uex::Lib(L"KismetRenderingLibrary /Script/Engine.Default__KismetRenderingLibrary")) {
         Params p(uex::Fn(lib, L"ImportFileAsTexture2D"));
@@ -221,8 +293,8 @@ UObject* MkFileImg(const std::wstring& file, float w, float h) {
     }
     if (!t) uex::Log(L"ui: no preview %s", path.c_str());
     auto i = New(L"Image", g.tree); if (!i) return nullptr;
-    MakeBrushTex(reinterpret_cast<uint8_t*>(i) + 0x180, t, 3, {1, 1, 1, 1}, {}, w, h);
-    Put(i, 0x240, Color{1, 1, 1, 1}); Put<uint8_t>(i, 0xdd, kHitTestInvisible);
+    MakeBrushTex(reinterpret_cast<uint8_t*>(i) + kImgBrush, t, 3, {1, 1, 1, 1}, {}, w, h);
+    Put(i, kImgColor, Color{1, 1, 1, 1}); Put<uint8_t>(i, kVis, kHitTestInvisible);
     return i;
 }
 // plain rectangular outline (Border draw, no texture): t px thick on a w x h box
@@ -231,19 +303,19 @@ UObject* MkRect(float w, float h, float t, Color c) {  // overlay of four solid 
     struct E { float w, h; uint8_t ha, va; } es[4] = {{w, t, 0, 1}, {w, t, 0, 3}, {t, h, 1, 0}, {t, h, 3, 0}};
     for (auto& e : es) {
         auto i = New(L"Image", g.tree); if (!i) continue;
-        MakeBrush(reinterpret_cast<uint8_t*>(i) + 0x180, L"/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture", 3, {1, 1, 1, 1}, {}, e.w, e.h);
-        Put(i, 0x240, c); Put<uint8_t>(i, 0xdd, kHitTestInvisible);
+        MakeBrush(reinterpret_cast<uint8_t*>(i) + kImgBrush, L"/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture", 3, {1, 1, 1, 1}, {}, e.w, e.h);
+        Put(i, kImgColor, c); Put<uint8_t>(i, kVis, kHitTestInvisible);
         auto s = Add(ov, i, L"AddChildToOverlay");
         Call1<uint8_t>(s, L"SetHorizontalAlignment", L"InHorizontalAlignment", e.ha);
         Call1<uint8_t>(s, L"SetVerticalAlignment", L"InVerticalAlignment", e.va);
     }
-    Put<uint8_t>(ov, 0xdd, kHitTestInvisible);
+    Put<uint8_t>(ov, kVis, kHitTestInvisible);
     return ov;
 }
 UObject* MkImg(const wchar_t* tex, float w, float h, Color tint = {1, 1, 1, 1}) {
     auto i = New(L"Image", g.tree); if (!i) return nullptr;
-    MakeBrush(reinterpret_cast<uint8_t*>(i) + 0x180, tex, 3, {1, 1, 1, 1}, {}, w, h);
-    Put(i, 0x240, tint); Put<uint8_t>(i, 0xdd, kHitTestInvisible);
+    MakeBrush(reinterpret_cast<uint8_t*>(i) + kImgBrush, tex, 3, {1, 1, 1, 1}, {}, w, h);
+    Put(i, kImgColor, tint); Put<uint8_t>(i, kVis, kHitTestInvisible);
     return i;
 }
 void TextColor(UObject* t, Color c) {  // runtime, cached
@@ -255,29 +327,29 @@ void TextColor(UObject* t, Color c) {  // runtime, cached
 // ---- widget builders (call before the widget is added to a live panel) -------------------
 UObject* MkText(const std::wstring& s, float size = 26, Color c = {0.92f, 0.9f, 0.85f, 1}) {
     auto t = New(L"TextBlock", g.tree); if (!t) return nullptr;
-    ApplyFont(reinterpret_cast<uint8_t*>(t) + 0x1e0, size);
-    Put(t, 0x1b8, c); Put<uint8_t>(t, 0x1c8, 0);
-    Put(t, 0x2f0, V2{1.5, 1.5}); Put(t, 0x300, Color{0, 0, 0, 0.85f});  // drop shadow, like the game's hud text
-    Put<uint8_t>(t, 0xdd, kHitTestInvisible);
+    ApplyFont(reinterpret_cast<uint8_t*>(t) + kTbFont, size);
+    Put(t, kTbColor, c); Put<uint8_t>(t, kTbColor + kColorRule, 0);
+    Put(t, kTbShadow, V2{1.5, 1.5}); Put(t, kTbShadowColor, Color{0, 0, 0, 0.85f});  // drop shadow, like the game's hud text
+    Put<uint8_t>(t, kVis, kHitTestInvisible);
     uex::SetText(t, s);
     return t;
 }
 UObject* Title(UObject* t, int spacing = 60) {  // the confirm dialog / button typeface
-    if (t && k.titleFont) { Put(t, 0x1e0, k.titleFont); Put<int32_t>(t, 0x1e0 + 0x4c, spacing); }
+    if (t && k.titleFont) { Put(t, kTbFont, k.titleFont); Put<int32_t>(t, kTbFont + kFontSpacing, spacing); }
     return t;
 }
-UObject* Center(UObject* t, float minW = 0) { if (t) { Put<uint8_t>(t, 0x17b, 1); if (minW > 0) Put<float>(t, 0x1dc, minW); } return t; }
+UObject* Center(UObject* t, float minW = 0) { if (t) { Put<uint8_t>(t, kJustify, 1); if (minW > 0) Put<float>(t, kTbMinW, minW); } return t; }
 UObject* MkText(const wchar_t* id, const std::wstring& s, float size, Color c = {0.92f, 0.9f, 0.85f, 1}) {
     auto t = MkText(s, size, c); g.text[id] = t; return t;
 }
-// Button skin: brushes Normal +0x1a0, Hovered +0x250, Pressed +0x300, Disabled +0x3b0; BackgroundColor +0x530
+// Button skin: WidgetStyle (ButtonStyle) brushes Normal, Hovered, Pressed, Disabled; BackgroundColor
 void SkinButton(UObject* b, const wchar_t* normal, const wchar_t* hover, Color nTint = {1, 1, 1, 1}, Color hTint = {1, 1, 1, 1}) {
-    auto p = reinterpret_cast<uint8_t*>(b);
-    MakeBrush(p + 0x1a0, normal, normal ? 3 : 0, nTint);
-    MakeBrush(p + 0x250, hover, 3, hTint);
-    MakeBrush(p + 0x300, hover, 3, {hTint.r * 0.8f, hTint.g * 0.8f, hTint.b * 0.8f, hTint.a});
-    MakeBrush(p + 0x3b0, normal, normal ? 3 : 0, {nTint.r, nTint.g, nTint.b, nTint.a * 0.45f});
-    Put(b, 0x530, Color{1, 1, 1, 1});
+    auto p = reinterpret_cast<uint8_t*>(b) + kBtnStyle;
+    MakeBrush(p + kBsNormal, normal, normal ? 3 : 0, nTint);
+    MakeBrush(p + kBsHovered, hover, 3, hTint);
+    MakeBrush(p + kBsPressed, hover, 3, {hTint.r * 0.8f, hTint.g * 0.8f, hTint.b * 0.8f, hTint.a});
+    MakeBrush(p + kBsDisabled, normal, normal ? 3 : 0, {nTint.r, nTint.g, nTint.b, nTint.a * 0.45f});
+    Put(b, kBtnBg, Color{1, 1, 1, 1});
 }
 // ink bar button of the game's confirm dialogs (T_NotSelected / T_Selected), confirm dialog typeface
 UObject* MkButton(const wchar_t* id, const std::wstring& label, float size = 26) {
@@ -290,16 +362,16 @@ UObject* MkButton(const wchar_t* id, const std::wstring& label, float size = 26)
 }
 UObject* MkEdit(const wchar_t* id, const std::wstring& init, float width = 360) {
     auto e = New(L"EditableTextBox", g.tree); if (!e) return nullptr;
-    ApplyFont(reinterpret_cast<uint8_t*>(e) + 0x1a0 + 0x2e0 + 0x8, 24);
-    Put<float>(e, 0xe44, width);
-    // EditableTextBoxStyle at +0x1a0: brushes Normal/Hovered/Focused +0x10/+0xc0/+0x170, Padding +0x2d0,
-    // ForegroundColor +0x5c0, FocusedForegroundColor +0x5fc (SlateColor)
-    auto p = reinterpret_cast<uint8_t*>(e);
-    MakeBrush(p + 0x1b0, art::kSoft, 1, {1, 1, 1, 0.9f}, {0.3f, 0.3f, 0.3f, 0.3f});
-    MakeBrush(p + 0x260, art::kSoft, 1, {1.15f, 1.1f, 1.f, 1}, {0.3f, 0.3f, 0.3f, 0.3f});
-    MakeBrush(p + 0x310, art::kSoft, 1, {1.3f, 1.2f, 1.05f, 1}, {0.3f, 0.3f, 0.3f, 0.3f});
-    Put(e, 0x1a0 + 0x2d0, Margin{14, 8, 14, 8});
-    for (int off : {0x5c0, 0x5fc}) { Put(e, 0x1a0 + off, kInk); Put<uint8_t>(e, 0x1a0 + off + 0x10, 0); }
+    // WidgetStyle (EditableTextBoxStyle): text style font, brushes Normal/Hovered/Focused, Padding,
+    // ForegroundColor, FocusedForegroundColor (SlateColor)
+    auto p = reinterpret_cast<uint8_t*>(e) + kEditStyle;
+    ApplyFont(p + kEsText + kTsFont, 24);
+    Put<float>(e, kEditMinW, width);
+    MakeBrush(p + kEsNormal, art::kSoft, 1, {1, 1, 1, 0.9f}, {0.3f, 0.3f, 0.3f, 0.3f});
+    MakeBrush(p + kEsHovered, art::kSoft, 1, {1.15f, 1.1f, 1.f, 1}, {0.3f, 0.3f, 0.3f, 0.3f});
+    MakeBrush(p + kEsFocused, art::kSoft, 1, {1.3f, 1.2f, 1.05f, 1}, {0.3f, 0.3f, 0.3f, 0.3f});
+    Put(e, kEditStyle + kEsPadding, Margin{14, 8, 14, 8});
+    for (int off : {int(kEsFg), int(kEsFocusFg)}) { Put(e, kEditStyle + off, kInk); Put<uint8_t>(e, kEditStyle + off + kColorRule, 0); }
     { Params p(uex::Fn(e, L"SetText")); p.Set(L"InText", uex::Text(init)); p.Call(e); }
     g.edit[id] = e;
     return e;
@@ -317,7 +389,7 @@ void HAdd(UObject* box, UObject* w, Margin pad = {0, 0, 10, 0}) {
     Call1<uint8_t>(s, L"SetVerticalAlignment", L"InVerticalAlignment", 2);
 }
 UObject* Row(const wchar_t* label, UObject* w) {
-    auto h = HBox(); auto l = MkText(label, 26, kDim); Put<float>(l, 0x1dc, 130);
+    auto h = HBox(); auto l = MkText(label, 26, kDim); Put<float>(l, kTbMinW, 130);
     HAdd(h, l, {0, 0, 16, 0}); HAdd(h, w); return h;
 }
 UObject* Line(float w = 640) { return MkImg(art::kLine, w, 10, {1, 0.9f, 0.75f, 0.7f}); }  // popup divider
@@ -331,7 +403,7 @@ UObject* Heading(const wchar_t* id, const std::wstring& s, float size = 40) {  /
 UObject* Frame(V2 anchor, V2 align, V2 pos, UObject** inner, Color bg = {0.03f, 0.03f, 0.04f, 0.88f}, UObject* parent = nullptr) {
     auto b = New(L"Border", g.tree); auto v = VBox();
     bool ink = bg.a > 0.6f;
-    if (b) MakeBrush(reinterpret_cast<uint8_t*>(b) + 0x1d0, ink ? art::kPanel : art::kSoft, ink ? 3 : 1, {1, 1, 1, 1},
+    if (b) MakeBrush(reinterpret_cast<uint8_t*>(b) + kBorderBg, ink ? art::kPanel : art::kSoft, ink ? 3 : 1, {1, 1, 1, 1},
                      ink ? Margin{} : Margin{0.3f, 0.3f, 0.3f, 0.3f});
     Call1(b, L"SetBrushColor", L"InBrushColor", ink ? Color{1, 1, 1, 0.97f} : Color{1, 1, 1, bg.a * 1.6f});
     Call1(b, L"SetPadding", L"InPadding", ink ? Margin{90, 50, 90, 50} : Margin{36, 18, 36, 18});
@@ -356,11 +428,13 @@ UObject* Canvas(UObject* parent, V2 amin, V2 amax, V2 align, Margin off, UObject
 }
 
 // connect settings remembered across runs: <mod dir>mp_settings.txt, UTF-8 "key=value" lines
-// (ip, port, name, pw, mode). Read when the panel is built, written on create/join.
+// (ip, port, name, pw, mode). Read when the panel is built (from the root if an old flat install
+// left it there), written on create/join (always to the mod folder).
 void WriteEdit(const wchar_t* id, const std::wstring& s);
-std::wstring SettingsPath() { auto h = uex::Host(); return h ? std::wstring(h->dir) + L"mp_settings.txt" : L""; }
+std::wstring SettingsPath() { auto d = ModDir(); return d.empty() ? L"" : d + L"mp_settings.txt"; }
 void LoadSettings() {
-    auto p = SettingsPath(); if (p.empty()) return;
+    if (SettingsPath().empty()) return;
+    auto p = ModFileIn(L"mp_settings.txt");
     FILE* f = _wfopen(p.c_str(), L"r, ccs=UTF-8"); if (!f) return;
     wchar_t line[512];
     while (fgetws(line, 512, f)) {
@@ -386,11 +460,11 @@ void Build() {
     auto cls = UmgClass(L"UserWidget");
     g.root = uex::CreateWidget(cls);
     if (!g.root) { uex::Log(L"ui: CreateWidget failed"); return; }
-    g.tree = At<UObject*>(g.root, 0x2c0);
-    if (!g.tree) { g.tree = New(L"WidgetTree", g.root); Put(g.root, 0x2c0, g.tree); }
+    g.tree = kWidgetTree.Of<UObject*>(g.root);
+    if (!g.tree) { g.tree = New(L"WidgetTree", g.root); Put(g.root, kWidgetTree, g.tree); }
     g.canvas = New(L"CanvasPanel", g.tree);
     if (!g.tree || !g.canvas) { uex::Log(L"ui: tree/canvas failed"); g.root = nullptr; return; }
-    Put(g.tree, 0x30, g.canvas);
+    Put(g.tree, kRootWidget, g.canvas);
     FindFont();
     k = Skin{}; k.titleFont = uex::LoadAsset(art::kTitleFont);
     if (!k.titleFont) uex::Log(L"ui: no title font, using the body font");
@@ -404,7 +478,7 @@ void Build() {
     g.connect = Frame({0.5, 0.5}, {0.5, 0.5}, {0, 0}, &v);
     VAdd(v, Heading(nullptr, L"多人游戏", 44), {0, 0, 0, 4}, 2);
     VAdd(v, Line(560), {0, 0, 0, 14}, 2);
-    { auto h = HBox(); auto l = MkText(L"连接方式", 26, kDim); Put<float>(l, 0x1dc, 130); HAdd(h, l, {0, 0, 16, 0});
+    { auto h = HBox(); auto l = MkText(L"连接方式", 26, kDim); Put<float>(l, kTbMinW, 130); HAdd(h, l, {0, 0, 16, 0});
       HAdd(h, MkButton(L"mode", L"中转服务器", 24)); VAdd(v, h); }
     VAdd(v, g.text[L"iprow"] = Row(L"服务器", MkEdit(L"ip", L"127.0.0.1")));
     VAdd(v, g.text[L"portrow"] = Row(L"端口", MkEdit(L"port", L"27777", 160)));
@@ -417,7 +491,7 @@ void Build() {
     }
     LoadSettings();
     VAdd(v, MkButton(L"create", L"创建房间"), {0, 16, 0, 8}, 2);
-    { auto h = HBox(); auto l = MkText(L"房间码", 26, kDim); Put<float>(l, 0x1dc, 130); HAdd(h, l, {0, 0, 16, 0});
+    { auto h = HBox(); auto l = MkText(L"房间码", 26, kDim); Put<float>(l, kTbMinW, 130); HAdd(h, l, {0, 0, 16, 0});
       HAdd(h, MkEdit(L"code", L"", 160), {0, 0, 16, 0}); HAdd(h, MkButton(L"join", L"加入房间")); VAdd(v, h); }
     VAdd(v, Center(MkText(L"cstatus", L"", 24, kWarn)), {0, 10, 0, 4}, 2);
     VAdd(v, Line(560), {0, 6, 0, 6}, 2);
@@ -469,7 +543,7 @@ void Build() {
             auto sc = New(L"ScaleBox", g.tree); Call1<uint8_t>(sc, L"SetStretch", L"InStretch", 2);  // ScaleToFit
             Add(sc, pic); layer(sc, 22);
             layer(MkImg(art::kCardFrame, 132, 132, {1, 1, 1, 0.8f}), 0);
-            auto sel = MkImg(art::kCardSel, 132, 132, {1, 0.92f, 0.75f, 1}); layer(sel, 0); Put<uint8_t>(sel, 0xdd, kCollapsed);
+            auto sel = MkImg(art::kCardSel, 132, 132, {1, 0.92f, 0.75f, 1}); layer(sel, 0); Put<uint8_t>(sel, kVis, kCollapsed);
             Add(sb, ov);
             VAdd(col, sb, {0, 0, 0, 0}, 2);
             auto name = Center(MkText(ws[i].label, 22, kDim), 132); VAdd(col, name, {0, 4, 0, 0}, 2);
@@ -486,8 +560,8 @@ void Build() {
     cardRow(L"w", fight::Weapons(), WeaponIcon, k.wc, L"wrow");
     cardRow(L"e", fight::Edges(), EdgeIcon, k.ec, L"erow");
     cardRow(L"o", fight::outfits::List(), OutfitIcon, k.oc, L"orow");
-    if (auto e = g.text[L"erow"]) Put<uint8_t>(e, 0xdd, kCollapsed);  // the weapon tab is shown first (UpdateLobby)
-    if (auto o = g.text[L"orow"]) Put<uint8_t>(o, 0xdd, kCollapsed);
+    if (auto e = g.text[L"erow"]) Put<uint8_t>(e, kVis, kCollapsed);  // the weapon tab is shown first (UpdateLobby)
+    if (auto o = g.text[L"orow"]) Put<uint8_t>(o, kVis, kCollapsed);
     {   // map cards (host picks, everyone sees the pick): preview image, name below, selection frame
         VAdd(v, Center(MkText(L"maptitle", L"地图", 26, kDim)), {0, 4, 0, 6}, 2);
         auto h = HBox();
@@ -507,7 +581,7 @@ void Build() {
             // rectangular card: preview fills it, thin dim outline; the pick gets a gold box selection frame
             layer(MkFileImg(m.preview, 248, 140), 4);
             layer(MkRect(256, 144, 1.5f, {0.75f, 0.7f, 0.6f, 0.55f}), 2);
-            auto sel = MkRect(256, 144, 3.f, {0.95f, 0.8f, 0.5f, 1}); layer(sel, 0); Put<uint8_t>(sel, 0xdd, kCollapsed);
+            auto sel = MkRect(256, 144, 3.f, {0.95f, 0.8f, 0.5f, 1}); layer(sel, 0); Put<uint8_t>(sel, kVis, kCollapsed);
             Add(sb, ov);
             VAdd(col, sb, {0, 0, 0, 0}, 2);
             auto name = Center(MkText(m.name, 24, kDim), 256); VAdd(col, name, {0, 4, 0, 0}, 2);
@@ -518,18 +592,18 @@ void Build() {
         }
         VAdd(v, h, {0, 0, 0, 8}, 2);
         // "map" / "map+" / "map-" step through the maps (test hook / e2e); the cards replace them on screen
-        for (auto id : {L"map", L"map+", L"map-"}) { auto w = MkButton(id, L"地图", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, 0xdd, kCollapsed); }
+        for (auto id : {L"map", L"map+", L"map-"}) { auto w = MkButton(id, L"地图", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, kVis, kCollapsed); }
     }
     // "weapon" / "edge" cycle to the next card (test hook / e2e); the cards replace them on screen
-    { auto w = MkButton(L"weapon", L"武器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, 0xdd, kCollapsed); }
-    { auto w = MkButton(L"edge", L"杀器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, 0xdd, kCollapsed); }
+    { auto w = MkButton(L"weapon", L"武器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, kVis, kCollapsed); }
+    { auto w = MkButton(L"edge", L"杀器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, kVis, kCollapsed); }
     {   // host settings: rows of the settings menu (T_SettingsDefaultBar) with the start menu arrows
         auto rows = VBox();
         auto opt = [&](const wchar_t* id, const wchar_t* label) {
             auto bar = New(L"Border", g.tree);
-            MakeBrush(reinterpret_cast<uint8_t*>(bar) + 0x1d0, art::kBar, 3, {1, 1, 1, 1});
+            MakeBrush(reinterpret_cast<uint8_t*>(bar) + kBorderBg, art::kBar, 3, {1, 1, 1, 1});
             Call1(bar, L"SetPadding", L"InPadding", Margin{40, 2, 40, 2});
-            auto h = HBox(); auto l = MkText(label, 26, kInk); Put<float>(l, 0x1dc, 300); HAdd(h, l, {0, 0, 20, 0});
+            auto h = HBox(); auto l = MkText(label, 26, kInk); Put<float>(l, kTbMinW, 300); HAdd(h, l, {0, 0, 20, 0});
             auto arrow = [&](const std::wstring& bid, const wchar_t* tex) {
                 auto b = New(L"Button", g.tree); SkinButton(b, nullptr, art::kBloom, {1, 1, 1, 1}, {1, 0.9f, 0.7f, 0.5f});
                 if (auto s = Add(b, MkImg(tex, 40, 40, kGold))) Call1(s, L"SetPadding", L"InPadding", Margin{6, 4, 6, 4});
@@ -569,11 +643,11 @@ void Build() {
         auto sb = New(L"SizeBox", g.tree); auto bar = New(L"ProgressBar", g.tree);
         Call1<float>(sb, L"SetWidthOverride", L"InWidthOverride", 640.f);
         Call1<float>(sb, L"SetHeightOverride", L"InHeightOverride", 26.f);
-        auto st = reinterpret_cast<uint8_t*>(bar) + 0x180;
-        MakeBrush(st + 0x10, art::kHpBack, 3, {0.25f, 0.22f, 0.2f, 0.85f});
-        MakeBrush(st + 0xc0, art::kHpFill, 3, {1, 1, 1, 1});
-        Put<uint8_t>(bar, 0x3b4, right ? 1 : 0);  // BarFillType: LeftToRight / RightToLeft
-        Put(bar, 0x3b8, V2{0, 0});
+        auto st = reinterpret_cast<uint8_t*>(bar) + kBarStyle;
+        MakeBrush(st + kPbBack, art::kHpBack, 3, {0.25f, 0.22f, 0.2f, 0.85f});
+        MakeBrush(st + kPbFill, art::kHpFill, 3, {1, 1, 1, 1});
+        Put<uint8_t>(bar, kBarFill, right ? 1 : 0);  // BarFillType: LeftToRight / RightToLeft
+        Put(bar, kBarPad, V2{0, 0});
         Call1(bar, L"SetFillColorAndOpacity", L"InColor", fill);
         Call1<float>(bar, L"SetPercent", L"InPercent", 1.f);
         Add(sb, bar); VAdd(col, sb, {0, 0, 0, 4}, right ? 3 : 1); *pb = bar;
@@ -592,7 +666,7 @@ void Build() {
         UObject* nv; auto nf = Frame({0.5, 0}, {0.5, 0}, {0, 150}, &nv, {0, 0, 0, 0.45f}, g.hud);
         Call1(nf, L"SetPadding", L"InPadding", Margin{20, 4, 20, 6});
         VAdd(nv, MkText(L"hudnote", L"", 22, kWarn), {0, 0, 0, 0}, 2);
-        g.text[L"hudnotebox"] = nf; Put<uint8_t>(nf, 0xdd, kCollapsed);
+        g.text[L"hudnotebox"] = nf; Put<uint8_t>(nf, kVis, kCollapsed);
     }
     g.result = Frame({0.5, 0.4}, {0.5, 0.5}, {0, 0}, &v, {0, 0, 0, 0.7f});
     VAdd(v, MkText(L"result", L"", 34, {1, 0.85f, 0.5f, 1}), {0, 0, 0, 0}, 2);
@@ -757,8 +831,7 @@ const std::string& LocalMods() {
     static std::string list; static bool done;
     if (done) return list;
     done = true;
-    auto h = uex::Host(); if (!h) return list;
-    std::wstring dir = h->dir;
+    std::wstring dir = RootDir(); if (dir.empty()) return list;
     FILE* f = _wfopen((dir + L"autorun.txt").c_str(), L"r, ccs=UTF-8"); if (!f) return list;
     wchar_t b[512];
     while (fgetws(b, 511, f)) {
@@ -766,8 +839,8 @@ const std::string& LocalMods() {
         while (!id.empty() && (id.back() == L'\n' || id.back() == L'\r' || id.back() == L' ' || id.back() == L'\t')) id.pop_back();
         while (!id.empty() && (id[0] == L' ' || id[0] == 0xfeff)) id.erase(0, 1);
         if (id.empty() || id[0] == L'#' || id == L"nosave") continue;  // nosave: test-instance helper
-        std::wstring info = dir + id + L".txt";
-        if (GetFileAttributesW(info.c_str()) == INVALID_FILE_ATTRIBUTES) info = dir + id + L"\\" + id + L".txt";
+        std::wstring info = dir + id + L"\\" + id + L".txt";  // <root>\<id>\<id>.txt, else legacy flat <root>\<id>.txt
+        if (!Exists(info)) info = dir + id + L".txt";
         if (InfoVal(info, L"mp") == L"block") { g_blockedMods.push_back(id); continue; }
         std::string e = uex::Utf8(id) + ":" + uex::Utf8(InfoVal(info, L"version")) + ":a";
         for (char& c : e) if (c == ';' || c == ' ') c = '_';
@@ -969,14 +1042,14 @@ void PollButtons() {
 // ---- test hook ----------------------------------------------------------------------------
 bool MenuEntryOk();
 void Dump(FILE* f) {
-    auto vis = [](UObject* w) { if (!w) return -1; return int(At<uint8_t>(w, 0xdd)); };
+    auto vis = [](UObject* w) { if (!w) return -1; return int(kVis.Of<uint8_t>(w)); };
     fwprintf(f, L"open=%d uiMode=%d root=%p inViewport=%d sections corner=%d connect=%d lobby=%d hud=%d result=%d\n",
              g.open, g.uiMode, g.root, g.root ? int(CallB(g.root, L"IsInViewport")) : 0,
              vis(g.corner), vis(g.connect), vis(g.lobby), vis(g.hud), vis(g.result));
     for (auto& [id, t] : g.text) {
         fwprintf(f, L"text %s vis=%d\n", id.c_str(), vis(t));
     }
-    for (auto& [id, b] : g.btn) fwprintf(f, L"button %s vis=%d enabled=%d\n", id.c_str(), vis(b.o), int(At<uint8_t>(b.o, 0xd9) & 4) ? 1 : 0);
+    for (auto& [id, b] : g.btn) fwprintf(f, L"button %s vis=%d enabled=%d\n", id.c_str(), vis(b.o), kEnabled.Bit(b.o) ? 1 : 0);
     for (auto& [id, e] : g.edit) fwprintf(f, L"edit %s = '%s'\n", id.c_str(), ReadEdit(id.c_str()).c_str());
     net::Room r;
     if (net::GetRoom(r)) {
@@ -1000,7 +1073,7 @@ UObject* FindUserWidget(const std::wstring& clsSub) {  // first live UserWidget 
     for (int i = 0; i < n; ++i) {
         auto o = ObjectAt(i);
         if (!o || (o->flags & 0x10) || !IsA(o, uw) || o == g.root) continue;
-        if (NameOf(o->cls).find(clsSub) != std::wstring::npos && At<UObject*>(o, 0x2c0)) return o;
+        if (NameOf(o->cls).find(clsSub) != std::wstring::npos && kWidgetTree.Of<UObject*>(o)) return o;
     }
     return nullptr;
 }
@@ -1010,19 +1083,19 @@ UObject* FindUserWidget(const std::wstring& clsSub) {  // first live UserWidget 
 // above 退出游戏: QuitGame is taken out and added back after ours, keeping its slot settings.
 struct ChildSize { float v; uint8_t rule, pad[3]; };
 struct VSlot { ChildSize size; Margin pad; uint8_t h, v; };
-VSlot ReadSlot(UObject* s) { return {At<ChildSize>(s, 0x38), At<Margin>(s, 0x40), At<uint8_t>(s, 0x50), At<uint8_t>(s, 0x51)}; }
+VSlot ReadSlot(UObject* s) { return {kVsSize.Of<ChildSize>(s), kVsPad.Of<Margin>(s), kVsH.Of<uint8_t>(s), kVsV.Of<uint8_t>(s)}; }
 void WriteSlot(UObject* s, const VSlot& r) {
     if (!s) return;
     Call1(s, L"SetSize", L"InSize", r.size); Call1(s, L"SetPadding", L"InPadding", r.pad);
     Call1<uint8_t>(s, L"SetHorizontalAlignment", L"InHorizontalAlignment", r.h);
     Call1<uint8_t>(s, L"SetVerticalAlignment", L"InVerticalAlignment", r.v);
 }
-bool MenuEntryOk() { return g.menuBtn && uex::Alive(g.menuBtn) && uex::Alive(g.menu) && At<UObject*>(g.menuBtn, 0x30); }
+bool MenuEntryOk() { return g.menuBtn && uex::Alive(g.menuBtn) && uex::Alive(g.menu) && kSlot.Of<UObject*>(g.menuBtn); }
 // The hidden input icon inside a menu button still takes width in its row. A button made at runtime
 // keeps the class default icon size (32 instead of the menu's 29), which pushes the label right by
 // the difference; RefreshSize recomputes it like the menu's own buttons.
 void RefreshActionIcon() {
-    auto tr = g.menuBtn ? At<UObject*>(g.menuBtn, 0x2c0) : nullptr;
+    auto tr = g.menuBtn ? kWidgetTree.Of<UObject*>(g.menuBtn) : nullptr;
     for (int i = 0, n = NumObjects(); tr && i < n; ++i) { auto x = ObjectAt(i);
         if (x && x->outer == tr && !(x->flags & 0x10) && NameOf(x) == L"InputActionWidget") { Params q(uex::Fn(x, L"RefreshSize")); q.Call(x); return; } }
 }
@@ -1030,7 +1103,7 @@ void MenuEntry() {
     if (MenuEntryOk() || g.tick % 30) return;
     g.menuBtn = nullptr;
     auto menu = FindUserWidget(L"WB_StartMenu_V2"); if (!menu) return;
-    auto tree = At<UObject*>(menu, 0x2c0); UObject *quit = nullptr, *ng = nullptr;
+    auto tree = kWidgetTree.Of<UObject*>(menu); UObject *quit = nullptr, *ng = nullptr;
     for (int i = 0, n = NumObjects(); i < n && !(quit && ng); ++i) {
         auto o = ObjectAt(i);
         if (!o || o->outer != tree || (o->flags & 0x10)) continue;
@@ -1038,23 +1111,23 @@ void MenuEntry() {
         if (nm == L"QuitGame") quit = o; else if (nm == L"NewGame") ng = o;
     }
     if (!quit || !ng) return;
-    auto qs = At<UObject*>(quit, 0x30), ns = At<UObject*>(ng, 0x30);
-    auto box = qs ? At<UObject*>(qs, 0x28) : nullptr;
-    if (!box || !ns || At<UObject*>(ns, 0x28) != box) return;
+    auto qs = kSlot.Of<UObject*>(quit), ns = kSlot.Of<UObject*>(ng);
+    auto box = qs ? kSlotParent.Of<UObject*>(qs) : nullptr;
+    if (!box || !ns || kSlotParent.Of<UObject*>(ns) != box) return;
     auto btn = uex::CreateWidget(quit->cls); if (!btn) return;
     { Params t(uex::Fn(btn, L"SetButtonText")); t.Set(L"InText", uex::Text(L"多人游戏")); t.Call(btn); }
     // the menu sets these on its own buttons in the designer; a fresh button has the class defaults
     // (UnselectedOpacity 0.6 = the grey text, no text decorator change on select)
-    Put<uint8_t>(btn, 0x1948, At<uint8_t>(ng, 0x1948));   // ChangeTextDecoratorOnSelected
-    Put<double>(btn, 0x1950, At<double>(ng, 0x1950));     // SelectedOpacity
-    Put<double>(btn, 0x1958, At<double>(ng, 0x1958));     // UnselectedOpacity
+    Put<uint8_t>(btn, kMbDecoOnSelected, At<uint8_t>(ng, kMbDecoOnSelected));   // ChangeTextDecoratorOnSelected
+    Put<double>(btn, kMbSelOpacity, At<double>(ng, kMbSelOpacity));              // SelectedOpacity
+    Put<double>(btn, kMbUnselOpacity, At<double>(ng, kMbUnselOpacity));          // UnselectedOpacity
     VSlot qv = ReadSlot(qs), nv = ReadSlot(ns);
     Call1(box, L"RemoveChild", L"Content", quit);
     WriteSlot(Add(box, btn, L"AddChildToVerticalBox"), nv);
     WriteSlot(Add(box, quit, L"AddChildToVerticalBox"), qv);
-    // join the menu's button group (+0x780) so selecting another button deselects ours
+    // join the menu's button group so selecting another button deselects ours
     g.menuInGroup = false;
-    if (auto grp = At<UObject*>(menu, 0x780)) { Call1(grp, L"AddWidget", L"InWidget", btn); g.menuInGroup = true; } else uex::Log(L"ui: start menu has no button group yet");
+    if (auto grp = At<UObject*>(menu, kMenuGroup)) { Call1(grp, L"AddWidget", L"InWidget", btn); g.menuInGroup = true; } else uex::Log(L"ui: start menu has no button group yet");
     g.menu = menu; g.menuBtn = btn; g.menuFont = nullptr; g.menuWas = false; g.menuFix = 0;
     RefreshActionIcon();
     uex::Log(L"ui: title menu entry added %s", NameOf(btn).c_str());
@@ -1063,19 +1136,19 @@ void PollMenuEntry() {
     if (!MenuEntryOk()) return;
     // a button made after the menu opened keeps the faded text of its intro animation: match the
     // others (text opacity 1); its deselect animation fades it again, so keep checking
-    { if (auto tb = At<UObject*>(g.menuBtn, 0x1670)) if (At<float>(tb, 0xe0) < 0.99f) Call1<float>(tb, L"SetRenderOpacity", L"InOpacity", 1.f); }
+    { if (auto tb = kBtnText.Of<UObject*>(g.menuBtn)) if (kOpacity.Of<float>(tb) < 0.99f) Call1<float>(tb, L"SetRenderOpacity", L"InOpacity", 1.f); }
     // the selected look switches the label to a subset of the same typeface that only has the glyphs
     // of the game's own menu ("多" is missing). Keep the full font (the unselected one), size untouched.
-    if (auto tb = At<UObject*>(g.menuBtn, 0x1670)) {
-        auto fo = At<UObject*>(tb, 0x1e0);
+    if (auto tb = kBtnText.Of<UObject*>(g.menuBtn)) {
+        auto fo = kTbFont.Of<UObject*>(tb);
         if (!g.menuFont && fo && !CallB(g.menuBtn, L"GetSelected")) g.menuFont = fo;
         if (g.menuFont && fo && fo != g.menuFont && uex::Alive(g.menuFont)) {
-            Params p(uex::Fn(tb, L"SetFont")); uint8_t fi[0x60]; std::memcpy(fi, reinterpret_cast<uint8_t*>(tb) + 0x1e0, sizeof fi);
+            Params p(uex::Fn(tb, L"SetFont")); uint8_t fi[kFontInfoBytes]; std::memcpy(fi, reinterpret_cast<uint8_t*>(tb) + kTbFont, sizeof fi);
             *reinterpret_cast<UObject**>(fi) = g.menuFont; p.Set(L"InFontInfo", fi); p.Call(tb);
         }
     }
     // the menu's button group may not exist yet when our button goes in: join it once it does
-    if (!g.menuInGroup) if (auto grp = At<UObject*>(g.menu, 0x780)) {
+    if (!g.menuInGroup) if (auto grp = At<UObject*>(g.menu, kMenuGroup)) {
         Call1(grp, L"AddWidget", L"InWidget", g.menuBtn); g.menuInGroup = true; uex::Log(L"ui: title entry joined the button group");
     }
     // stay lit only while hovered or focused (another button got the pick: the group may not tell us)
@@ -1106,9 +1179,9 @@ void DumpTree(FILE* f, UObject* w, int d) {
     if (!w || d > 14) return;
     auto uw = UmgClass(L"UserWidget"), panel = UmgClass(L"PanelWidget"), tb = UmgClass(L"TextBlock");
     std::wstring extra;
-    if (IsA(w, tb)) { auto t = At<uint8_t*>(w, 0x1a0) ; (void)t; extra = L" font=" + std::to_wstring(At<float>(w, 0x1e0 + 0x48)); }
-    fwprintf(f, L"%*s%s : %s vis=%d%s\n", d * 2, L"", NameOf(w).c_str(), NameOf(w->cls).c_str(), int(At<uint8_t>(w, 0xdd)), extra.c_str());
-    if (IsA(w, uw)) { if (auto t = At<UObject*>(w, 0x2c0)) DumpTree(f, At<UObject*>(t, 0x30), d + 1); return; }
+    if (IsA(w, tb)) { extra = L" font=" + std::to_wstring(At<float>(w, kTbFont + kFontSize)); }
+    fwprintf(f, L"%*s%s : %s vis=%d%s\n", d * 2, L"", NameOf(w).c_str(), NameOf(w->cls).c_str(), int(kVis.Of<uint8_t>(w)), extra.c_str());
+    if (IsA(w, uw)) { if (auto t = kWidgetTree.Of<UObject*>(w)) DumpTree(f, kRootWidget.Of<UObject*>(t), d + 1); return; }
     if (IsA(w, panel)) {
         Params c(uex::Fn(w, L"GetChildrenCount")); c.Call(w); int n = c.Get<int32_t>(L"ReturnValue");
         for (int i = 0; i < n; ++i) { Params p(uex::Fn(w, L"GetChildAt")); p.Set<int32_t>(L"Index", i); p.Call(w); DumpTree(f, p.Get<UObject*>(L"ReturnValue"), d + 1); }
@@ -1140,7 +1213,7 @@ void TestHook() {
                 for (auto p = At<const uint8_t*>(k->cls, kUStruct_ChildProps); p; p = At<const uint8_t*>(p, kFField_Next))
                     fwprintf(o, L" meta +%x %s\n", At<int32_t>(p, kProp_Offset), NameOf(*reinterpret_cast<const FName*>(p + kFField_Name)).c_str());
                 auto wt = FindProp(k->cls, L"WidgetTree");
-                if (wt.offset >= 0) if (auto t = At<UObject*>(k, wt.offset)) DumpTree(o, At<UObject*>(t, 0x30), 1);
+                if (wt.offset >= 0) if (auto t = At<UObject*>(k, wt.offset)) DumpTree(o, kRootWidget.Of<UObject*>(t), 1);
             }
         }
         else if (c == L"sig") {  // sig <full class name>|<fn>
@@ -1160,7 +1233,7 @@ void TestHook() {
             for (int i = 0; i < n; ++i) { auto x = ObjectAt(i);
                 if (!x || (x->flags & 0x10) || !IsA(x, uw) || x->cls == uw) continue;
                 if (a.empty() || NameOf(x->cls).find(a) != std::wstring::npos)
-                    fwprintf(o, L"  %s : %s vp=%d vis=%d\n", NameOf(x).c_str(), NameOf(x->cls).c_str(), int(CallB(x, L"IsInViewport")), int(At<uint8_t>(x, 0xdd))); }
+                    fwprintf(o, L"  %s : %s vp=%d vis=%d\n", NameOf(x).c_str(), NameOf(x->cls).c_str(), int(CallB(x, L"IsInViewport")), int(kVis.Of<uint8_t>(x))); }
         }
         else if (c == L"find") {  // find <class substr>|<path substr>
             auto p = a.find(L'|'); std::wstring cs = a.substr(0, p), ps = p == std::wstring::npos ? L"" : a.substr(p + 1);
@@ -1175,7 +1248,7 @@ void TestHook() {
             for (int i = 0; i < n; ++i) { auto x = ObjectAt(i);
                 if (!x || x->cls != sc || (x->flags & 0x10) || PathOf(x).find(L"Transient") == std::wstring::npos) continue;
                 Params p(uex::Fn(x, L"GetActiveWidget")); p.Call(x); auto w = p.Get<UObject*>(L"ReturnValue");
-                fwprintf(o, L"  %p %s list=%d active=%s\n", x, NameOf(x).c_str(), At<int32_t>(x, 0x1a8 + 8), w ? (NameOf(w) + L" : " + NameOf(w->cls)).c_str() : L"-"); }
+                fwprintf(o, L"  %p %s list=%d active=%s\n", x, NameOf(x).c_str(), At<int32_t>(x, kWidgetList + kArrNum), w ? (NameOf(w) + L" : " + NameOf(w->cls)).c_str() : L"-"); }
         }
         else if (c == L"fnfind") {  // fnfind <substr>: every UFunction whose name contains substr
             auto fc = uex::Class(L"Class /CoreUObject.Function"); int n = NumObjects(), k = 0;
@@ -1187,7 +1260,7 @@ void TestHook() {
         }
         else if (c == L"props") { if (auto w = FindUserWidget(a)) DumpProps(o, w->cls); else fwprintf(o, L"no widget %s\n", a.c_str()); }
         else if (c == L"rebuild") g.root = nullptr;
-        else if (c == L"grp") { auto m = FindUserWidget(L"WB_StartMenu_V2"); auto gr = m ? At<UObject*>(m, 0x780) : nullptr; int n = -1;
+        else if (c == L"grp") { auto m = FindUserWidget(L"WB_StartMenu_V2"); auto gr = m ? At<UObject*>(m, kMenuGroup) : nullptr; int n = -1;
             if (gr) { Params p(uex::Fn(gr, L"GetButtonCount")); p.Call(gr); n = p.Get<int32_t>(L"ReturnValue"); }
             int idx = -9;
             if (gr && g.menuBtn) { Params q(uex::Fn(gr, L"FindButtonIndex")); q.Set(L"ButtonToFind", g.menuBtn); q.Call(gr); idx = q.Get<int32_t>(L"ReturnValue"); }
@@ -1196,36 +1269,36 @@ void TestHook() {
                 Params s(uex::Fn(gr, L"SelectButtonAtIndex")); s.Set<int32_t>(L"ButtonIndex", _wtoi(a.c_str())); s.Call(gr);
                 fwprintf(o, L"selected %d, ours selected=%d\n", _wtoi(a.c_str()), int(CallB(g.menuBtn, L"GetSelected"))); } }
         else if (c == L"mdiff") {  // 4-byte words that differ between NewGame and our entry in 0x15c8..0x1960
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, 0x6c8) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
             if (ng && g.menuBtn) for (int off = 0x15c8; off < 0x1960; off += 4) {
                 uint32_t x = At<uint32_t>(ng, off), y = At<uint32_t>(g.menuBtn, off);
                 if (x != y) fwprintf(o, L"  +%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(ng, off), y, At<float>(g.menuBtn, off)); }
-            // the text blocks (+0x1670) and their slots: what lays out the label inside the button
-            UObject *ta = ng ? At<UObject*>(ng, 0x1670) : nullptr, *tb2 = g.menuBtn ? At<UObject*>(g.menuBtn, 0x1670) : nullptr;
+            // the text blocks (ButtonTextBlock) and their slots: what lays out the label inside the button
+            UObject *ta = ng ? kBtnText.Of<UObject*>(ng) : nullptr, *tb2 = g.menuBtn ? kBtnText.Of<UObject*>(g.menuBtn) : nullptr;
             if (ta && tb2) {
                 fwprintf(o, L"  text %s / %s\n", NameOf(ta->cls).c_str(), NameOf(tb2->cls).c_str());
                 for (int off = 0x28; off < 0x400; off += 4) { uint32_t x = At<uint32_t>(ta, off), y = At<uint32_t>(tb2, off);
                     if (x != y) fwprintf(o, L"  t+%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(ta, off), y, At<float>(tb2, off)); }
-                UObject *sa = At<UObject*>(ta, 0x30), *sb = At<UObject*>(tb2, 0x30);
+                UObject *sa = kSlot.Of<UObject*>(ta), *sb = kSlot.Of<UObject*>(tb2);
                 if (sa && sb) { fwprintf(o, L"  tslot %s\n", NameOf(sa->cls).c_str());
                     for (int off = 0x28; off < 0x80; off += 4) { uint32_t x = At<uint32_t>(sa, off), y = At<uint32_t>(sb, off);
                         if (x != y) fwprintf(o, L"  s+%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(sa, off), y, At<float>(sb, off)); } }
             }
         }
         else if (c == L"mtree" && g.menuBtn) {  // inner widgets of NewGame vs ours: render offset, opacity, slot padding
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, 0x6c8) : nullptr;
-            for (UObject* b : { ng, g.menuBtn }) { if (!b) continue; auto tr = At<UObject*>(b, 0x2c0);
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            for (UObject* b : { ng, g.menuBtn }) { if (!b) continue; auto tr = kWidgetTree.Of<UObject*>(b);
                 fwprintf(o, L" [%s]\n", NameOf(b).c_str());
                 for (int i = 0, n = NumObjects(); tr && i < n; ++i) { auto x = ObjectAt(i);
                     if (!x || x->outer != tr || (x->flags & 0x10)) continue;
-                    auto sl = At<UObject*>(x, 0x30); if (!sl) continue;
+                    auto sl = kSlot.Of<UObject*>(x); if (!sl) continue;
                     int po = InnerPadOff(sl); Margin pd = po ? At<Margin>(sl, po) : Margin{};
                     struct V2 { double x, y; }; Params q(uex::Fn(x, L"GetDesiredSize")); q.Call(x); auto ds = q.Get<V2>(L"ReturnValue");
                     fwprintf(o, L"  %s:%s vis=%d clip=%d ds=%.1f,%.1f pad=%.1f,%.1f,%.1f,%.1f\n", NameOf(x).c_str(), NameOf(x->cls).c_str(),
-                             int(At<uint8_t>(x, 0xdd)), int(At<uint8_t>(x, 0xdc)), ds.x, ds.y, pd.l, pd.t, pd.r, pd.b); } } }
+                             int(kVis.Of<uint8_t>(x)), int(kClip.Of<uint8_t>(x)), ds.x, ds.y, pd.l, pd.t, pd.r, pd.b); } } }
         else if (c == L"miaw" && g.menuBtn) {  // InputActionWidget of NewGame vs ours: differing words
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, 0x6c8) : nullptr;
-            auto find = [](UObject* b) -> UObject* { auto tr = At<UObject*>(b, 0x2c0);
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto find = [](UObject* b) -> UObject* { auto tr = kWidgetTree.Of<UObject*>(b);
                 for (int i = 0, n = NumObjects(); tr && i < n; ++i) { auto x = ObjectAt(i);
                     if (x && x->outer == tr && !(x->flags & 0x10) && NameOf(x) == L"InputActionWidget") return x; } return nullptr; };
             UObject *ia = ng ? find(ng) : nullptr, *ib = find(g.menuBtn);
@@ -1234,29 +1307,30 @@ void TestHook() {
                 for (int off = 0x28; off < 0x600; off += 4) { uint32_t x = At<uint32_t>(ia, off), y = At<uint32_t>(ib, off);
                     if (x != y) fwprintf(o, L"  +%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(ia, off), y, At<float>(ib, off)); } } }
         else if ((c == L"mcall" || c == L"ncall") && g.menuBtn) {  // mcall/ncall <fn>: no-arg fn on ours / NewGame
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* t = c == L"mcall" ? g.menuBtn : menu ? At<UObject*>(menu, 0x6c8) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* t = c == L"mcall" ? g.menuBtn : menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
             if (auto f = t ? uex::Fn(t, a.c_str()) : nullptr) { Params q(f); q.Call(t); fwprintf(o, L"called %s\n", a.c_str()); } else fwprintf(o, L"no fn\n"); }
         else if (c == L"mfont" && g.menuBtn) {  // font of the label of NewGame vs ours (object, typeface, size, style classes)
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, 0x6c8) : nullptr;
-            for (UObject* b : { ng, g.menuBtn }) { auto tb = b ? At<UObject*>(b, 0x1670) : nullptr; if (!tb) continue;
-                auto fo = At<UObject*>(tb, 0x1e0); auto st = At<UObject*>(tb, 0x340), ld = At<UObject*>(tb, 0x3a0);
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            for (UObject* b : { ng, g.menuBtn }) { auto tb = b ? kBtnText.Of<UObject*>(b) : nullptr; if (!tb) continue;
+                auto fo = kTbFont.Of<UObject*>(tb); auto st = kCtStyle.Of<UObject*>(tb), ld = kLocDeco.Of<UObject*>(tb);
                 fwprintf(o, L"  %s sel=%d font=%s face=%s size=%.1f style=%s deco=%s decoOn=%d\n", NameOf(b).c_str(), int(CallB(b, L"GetSelected")),
-                         fo ? PathOf(fo).c_str() : L"-", NameOf(*reinterpret_cast<const FName*>(reinterpret_cast<const uint8_t*>(tb) + 0x220)).c_str(), At<float>(tb, 0x228),
-                         st ? NameOf(st).c_str() : L"-", ld ? NameOf(ld).c_str() : L"-", int(At<uint8_t>(b, 0x1948))); } }
+                         fo ? PathOf(fo).c_str() : L"-", NameOf(*reinterpret_cast<const FName*>(reinterpret_cast<const uint8_t*>(tb) + kTbFont + kFontFace)).c_str(), At<float>(tb, kTbFont + kFontSize),
+                         st ? NameOf(st).c_str() : L"-", ld ? NameOf(ld).c_str() : L"-", int(At<uint8_t>(b, kMbDecoOnSelected))); } }
         else if (c == L"mtext" && g.menuBtn) {  // mtext <text>: relabel our title entry (layout checks)
             Params t(uex::Fn(g.menuBtn, L"SetButtonText")); t.Set(L"InText", uex::Text(a.c_str())); t.Call(g.menuBtn); }
         else if (c == L"mbtn") {  // menu buttons of the title menu: opacity, enabled flags, text opacity
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); auto tree = menu ? At<UObject*>(menu, 0x2c0) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); auto tree = menu ? kWidgetTree.Of<UObject*>(menu) : nullptr;
             for (int i = 0, n = NumObjects(); tree && i < n; ++i) { auto x = ObjectAt(i);
                 if (!x || (x->flags & 0x10) || x->cls != (g.menuBtn ? g.menuBtn->cls : nullptr)) continue;
                 if (x->outer != tree && x != g.menuBtn) continue;
-                auto tb = At<UObject*>(x, 0x1670);
-                fwprintf(o, L"  %s op=%.2f d9=%02x sel=%.2f unsel=%.2f dis=%d tbop=%.2f\n", NameOf(x).c_str(), At<float>(x, 0xe0), At<uint8_t>(x, 0xd9),
-                         At<float>(x, 0x1950), At<float>(x, 0x1958), int(At<uint8_t>(x, 0x1932)), tb ? At<float>(tb, 0xe0) : -1.f);
-                // render translation (+0x90) of the button and its text, slot padding, parent class
-                auto sl = At<UObject*>(x, 0x30); auto par = sl ? At<UObject*>(sl, 0x28) : nullptr; Margin pd = sl ? At<Margin>(sl, 0x40) : Margin{};
-                fwprintf(o, L"     tr=%.1f,%.1f sc=%.2f tbtr=%.1f,%.1f tbsc=%.2f pad=%.0f,%.0f,%.0f,%.0f parent=%s\n", At<double>(x, 0x90), At<double>(x, 0x98), At<double>(x, 0xa0),
-                         tb ? At<double>(tb, 0x90) : 0, tb ? At<double>(tb, 0x98) : 0, tb ? At<double>(tb, 0xa0) : 0, pd.l, pd.t, pd.r, pd.b, par ? NameOf(par->cls).c_str() : L"-"); }
+                auto tb = kBtnText.Of<UObject*>(x);
+                fwprintf(o, L"  %s op=%.2f d9=%02x sel=%.2f unsel=%.2f dis=%d tbop=%.2f\n", NameOf(x).c_str(), kOpacity.Of<float>(x), At<uint8_t>(x, kEnabled),
+                         At<float>(x, kMbSelOpacity), At<float>(x, kMbUnselOpacity), int(At<uint8_t>(x, kMbDisabled)), tb ? kOpacity.Of<float>(tb) : -1.f);
+                // render translation (RenderTransform) of the button and its text, slot padding, parent class
+                auto sl = kSlot.Of<UObject*>(x); auto par = sl ? kSlotParent.Of<UObject*>(sl) : nullptr; Margin pd = sl ? kVsPad.Of<Margin>(sl) : Margin{};
+                int tr = kXform + kXfTrans, sc = kXform + kXfScale;  // Translation x, y (doubles), Scale x
+                fwprintf(o, L"     tr=%.1f,%.1f sc=%.2f tbtr=%.1f,%.1f tbsc=%.2f pad=%.0f,%.0f,%.0f,%.0f parent=%s\n", At<double>(x, tr), At<double>(x, tr + 8), At<double>(x, sc),
+                         tb ? At<double>(tb, tr) : 0, tb ? At<double>(tb, tr + 8) : 0, tb ? At<double>(tb, sc) : 0, pd.l, pd.t, pd.r, pd.b, par ? NameOf(par->cls).c_str() : L"-"); }
         }
         else if (c == L"focus") { if (auto e = g.edit[a]) { Params q(uex::Fn(e, L"SetKeyboardFocus")); q.Call(e); } }  // focus <edit id>
         else if (c == L"foc") {  // who holds focus: our edit boxes, the title menu and its buttons
@@ -1271,11 +1345,11 @@ void TestHook() {
         else if (c == L"esc") SetEsc(a != L"0");  // esc 1|0: the in-match menu (key presses are never simulated)
         else if (c == L"keys") {  // keys: the player's live enhanced-input mappings for the menu keys (and F24)
             struct A { uint8_t* d; int32_t n, m; };
-            auto pi = uex::PC() ? At<UObject*>(uex::PC(), 0x428) : nullptr;
-            auto m = pi ? *reinterpret_cast<A*>(reinterpret_cast<uint8_t*>(pi) + 0x628) : A{};
+            auto pi = uex::PC() ? kPlayerInput.Of<UObject*>(uex::PC()) : nullptr;
+            auto m = pi ? kActionMappings.Of<A>(pi) : A{};
             fwprintf(o, L"player input %p, %d mappings\n", pi, m.n);
             for (int i = 0; i < m.n && i < 1024; ++i) {
-                auto e = m.d + i * 0x50; auto act = At<UObject*>(e, 0x20); auto key = NameOf(*reinterpret_cast<FName*>(e + 0x28));
+                auto e = m.d + i * MappingSize(); auto act = kMapAction.Of<UObject*>(e); auto key = NameOf(kMapKey.Of<FName>(e));
                 if (key == L"Escape" || key == L"F24" || key == L"M" || key == L"Tab" || key == L"I" || key == L"Gamepad_Special_Right")
                     fwprintf(o, L"  %s -> %s\n", key.c_str(), act ? NameOf(act).c_str() : L"-");
             }
@@ -1320,7 +1394,7 @@ void KeepEditFocus() {
         if (menu) g.kefMenu = uex::Hold(menu);
     }
     bool want = title && menu;
-    if (want && g.menuOff != menu) { g.menuVis = At<uint8_t>(menu, 0xdd); Vis(menu, kHidden); g.menuOff = menu; g.menuOffRef = uex::Hold(menu); }  // a hidden menu cannot hold or take focus
+    if (want && g.menuOff != menu) { g.menuVis = kVis.Of<uint8_t>(menu); Vis(menu, kHidden); g.menuOff = menu; g.menuOffRef = uex::Hold(menu); }  // a hidden menu cannot hold or take focus
     if (!want && g.menuOff) { if (uex::Get(g.menuOffRef) == g.menuOff) Vis(g.menuOff, g.menuVis); g.menuOff = nullptr; }
     if (!g.open) { g.lastEdit = nullptr; return; }
     UObject* now = nullptr;
@@ -1435,13 +1509,15 @@ void Tick(float) {
 }
 
 // crash rejoin: during a match <mod dir>mp_session.txt holds the connection, room code and token
-// (rewritten every 5 s with the time). A restarted game that finds a fresh one resumes the match.
-std::wstring SessionPath() { auto h = uex::Host(); return h ? std::wstring(h->dir) + L"mp_session.txt" : L""; }
+// (rewritten every 5 s with the time). A restarted game that finds a fresh one resumes the match
+// (one in the root, left by an old flat install, is read and removed the same way).
+std::wstring SessionPath() { auto d = ModDir(); return d.empty() ? L"" : d + L"mp_session.txt"; }
 void SessionTick(bool match) {
     static bool tried;
     if (!tried) {  // first tick: resume a match the last run was in (crash, killed process)
         tried = true;
-        auto p = SessionPath(); FILE* f = p.empty() ? nullptr : _wfopen(p.c_str(), L"r, ccs=UTF-8");
+        auto p = SessionPath(); if (!p.empty()) p = ModFileIn(L"mp_session.txt");
+        FILE* f = p.empty() ? nullptr : _wfopen(p.c_str(), L"r, ccs=UTF-8");
         if (f) {
             std::map<std::wstring, std::wstring> kv; wchar_t line[512];
             while (fgetws(line, 512, f)) {
@@ -1482,7 +1558,7 @@ void Shutdown() {
     if (g.menuOff && uex::Get(g.menuOffRef) == g.menuOff) Vis(g.menuOff, g.menuVis);
     if (g_sessionFile) { _wremove(SessionPath().c_str()); g_sessionFile = false; }  // left the room: nothing to resume
     if (MenuEntryOk()) {
-        if (auto grp = At<UObject*>(g.menu, 0x780)) Call1(grp, L"RemoveWidget", L"InWidget", g.menuBtn);
+        if (auto grp = At<UObject*>(g.menu, kMenuGroup)) Call1(grp, L"RemoveWidget", L"InWidget", g.menuBtn);
         uex::RemoveWidget(g.menuBtn);
     }
     if (Valid()) uex::RemoveWidget(g.root);
@@ -1492,4 +1568,8 @@ void Shutdown() {
 }
 
 bool InMenu() { return g.open && g.root != nullptr; }
+void SetModDir(const wchar_t* dir) {
+    g_modDir = dir ? dir : L"";
+    if (!g_modDir.empty() && g_modDir.back() != L'\\' && g_modDir.back() != L'/') g_modDir += L'\\';
+}
 }  // namespace ui

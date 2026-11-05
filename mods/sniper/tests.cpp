@@ -12,6 +12,90 @@ static UObject* FindMontage(const std::wstring& nm) {
     return nullptr;
 }
 
+// ---- reflection probes (posture break research): a property's type and value, read from memory ----
+static std::wstring PType(const uint8_t* p) {
+    auto fc = ue::At<const uint8_t*>(p, ue::kFField_Class);
+    std::wstring t = ue::NameOf(*reinterpret_cast<const ue::FName*>(fc + 0x30));  // FFieldClass name
+    if (t == L"ObjectProperty" || t == L"ClassProperty" || t == L"StructProperty" || t == L"SoftClassProperty" ||
+        t == L"SoftObjectProperty" || t == L"InterfaceProperty" || t == L"WeakObjectProperty")
+        if (auto x = ue::At<UObject*>(p, ue::kProp_Extra)) t += L"<" + ue::NameOf(x) + L">";
+    return t;
+}
+static std::wstring PName(const uint8_t* p) { return ue::NameOf(*reinterpret_cast<const ue::FName*>(p + ue::kFField_Name)); }
+static std::wstring PVal(const uint8_t* p, const uint8_t* v, int depth = 0);
+static std::wstring StructVal(UObject* st, const uint8_t* v, int depth) {
+    std::wstring s = L"{";
+    for (auto c = st; c; c = ue::At<UObject*>(c, ue::kUStruct_Super))
+        for (auto q = ue::At<const uint8_t*>(c, ue::kUStruct_ChildProps); q; q = ue::At<const uint8_t*>(q, ue::kFField_Next))
+            s += PName(q) + L"=" + PVal(q, v + ue::At<int32_t>(q, ue::kProp_Offset), depth + 1) + L" ";
+    return s + L"}";
+}
+static std::wstring PVal(const uint8_t* p, const uint8_t* v, int depth) {
+    auto t = PType(p); wchar_t b[64];
+    auto obj = [](UObject* o) { return o ? ue::NameOf(o) : std::wstring(L"null"); };
+    if (t.rfind(L"ObjectProperty", 0) == 0 || t.rfind(L"ClassProperty", 0) == 0 || t.rfind(L"InterfaceProperty", 0) == 0) return obj(*reinterpret_cast<UObject* const*>(v));
+    if (t == L"StructProperty<GameplayTag>" || t == L"NameProperty") return ue::NameOf(*reinterpret_cast<const ue::FName*>(v));
+    if (t == L"StructProperty<GameplayTagContainer>") {
+        struct C { ue::FName* d; int n, m; } c = *reinterpret_cast<const C*>(v); std::wstring s = L"[";
+        for (int i = 0; i < c.n && i < 16; ++i) s += ue::NameOf(c.d[i]) + L" ";
+        return s + L"]";
+    }
+    if (t == L"FloatProperty") { swprintf(b, 64, L"%g", *reinterpret_cast<const float*>(v)); return b; }
+    if (t == L"DoubleProperty") { swprintf(b, 64, L"%g", *reinterpret_cast<const double*>(v)); return b; }
+    if (t == L"IntProperty") { swprintf(b, 64, L"%d", *reinterpret_cast<const int32_t*>(v)); return b; }
+    if (t == L"BoolProperty") { auto off = ue::At<uint8_t>(p, ue::kProp_Extra + 1), m = ue::At<uint8_t>(p, ue::kProp_Extra + 2); return (v[off] & m) ? L"true" : L"false"; }
+    if (t == L"ByteProperty" || t == L"EnumProperty") { swprintf(b, 64, L"%u", v[0]); return b; }
+    if (t == L"ArrayProperty") {
+        struct A { const uint8_t* d; int n, m; } a = *reinterpret_cast<const A*>(v);
+        auto in = ue::At<const uint8_t*>(p, ue::kProp_Extra); int es = in ? ue::At<int32_t>(in, ue::kProp_ElemSize) : 0;
+        std::wstring s = L"#" + std::to_wstring(a.n) + L"[";
+        for (int i = 0; i < a.n && i < 12 && in && depth < 3; ++i) s += PVal(in, a.d + i * es, depth + 1) + L" ";
+        return s + L"]";
+    }
+    if (t == L"MapProperty") {  // TSparseArray: data, alloc flags (inline 4 words, ptr, num, max), first free, num free
+        auto kp = ue::At<const uint8_t*>(p, ue::kProp_Extra), vp = ue::At<const uint8_t*>(p, ue::kProp_Extra + 8);
+        int voff = ue::At<int32_t>(p, ue::kProp_Extra + 0x10), stride = ue::At<int32_t>(p, ue::kProp_Extra + 0x24);
+        auto d = *reinterpret_cast<const uint8_t* const*>(v); int n = *reinterpret_cast<const int32_t*>(v + 8);
+        int maxBits = *reinterpret_cast<const int32_t*>(v + 0x2c);
+        auto bits = maxBits > 128 ? *reinterpret_cast<const uint32_t* const*>(v + 0x20) : reinterpret_cast<const uint32_t*>(v + 0x10);
+        std::wstring s = L"#" + std::to_wstring(n) + L"{";
+        if (stride <= 0 || stride > 0x400) { swprintf(b, 64, L"stride? %d voff %d}", stride, voff); return s + b; }
+        for (int i = 0; i < n && i < 24 && d && depth < 3; ++i) {
+            if (!(bits[i >> 5] & (1u << (i & 31)))) continue;
+            s += PVal(kp, d + i * stride, depth + 1) + L": " + PVal(vp, d + i * stride + voff, depth + 1) + L"; ";
+        }
+        return s + L"}";
+    }
+    if (t.rfind(L"StructProperty", 0) == 0 && depth < 2) return StructVal(ue::At<UObject*>(p, ue::kProp_Extra), v, depth);
+    uint64_t x = 0; memcpy(&x, v, std::min(8, std::max(0, ue::At<int32_t>(p, ue::kProp_ElemSize)))); swprintf(b, 64, L"%llx", x); return b;
+}
+// a live object by name (exact name first, else the first containing it; "#<index>": by object index)
+static UObject* FindByName(const std::wstring& key) {
+    if (!key.empty() && key[0] == L'#') return ue::ObjectAt(_wtoi(key.c_str() + 1));
+    UObject* part = nullptr;
+    for (int k = 0, N = ue::NumObjects(); k < N; ++k) {
+        auto o = ue::ObjectAt(k); if (!o || (o->flags & 0x10)) continue;
+        auto nm = ue::NameOf(o); if (nm == key) return o;
+        if (!part && nm.find(key) != std::wstring::npos) part = o;
+    }
+    return part;
+}
+// all properties of an object (up its class chain, to UObject), optionally only those whose name has `filter`
+static void DumpProps(UObject* o, const std::wstring& filter) {
+    if (!o) { uex::Log(L"sniper: oprops: none"); return; }
+    uex::Log(L"sniper: oprops %s (%s) #%d outer %s", ue::NameOf(o).c_str(), ue::NameOf(o->cls).c_str(), o->index, o->outer ? ue::NameOf(o->outer).c_str() : L"-");
+    for (auto c = o->cls; c; c = ue::At<UObject*>(c, ue::kUStruct_Super)) {
+        if (ue::NameOf(c) == L"Object") break;
+        for (auto p = ue::At<const uint8_t*>(c, ue::kUStruct_ChildProps); p; p = ue::At<const uint8_t*>(p, ue::kFField_Next)) {
+            auto nm = PName(p); if (!filter.empty() && nm.find(filter) == std::wstring::npos) continue;
+            int off = ue::At<int32_t>(p, ue::kProp_Offset); std::wstring val;
+            try { val = PVal(p, reinterpret_cast<const uint8_t*>(o) + off); } catch (...) { val = L"?"; }
+            auto line = L"+" + std::to_wstring(off) + L" " + PType(p) + L" " + nm + L" = " + val;
+            for (size_t q = 0; q < line.size(); q += 500) uex::Log(L"sniper:  %s%s", q ? L"   " : L"", line.substr(q, 500).c_str());
+        }
+    }
+}
+
 // targets spawned with `still`: their AI brain is stopped (again every second: a hit wakes it up)
 struct Still { UObject* a; ULONGLONG at; };
 static std::vector<Still> g_still;
@@ -68,8 +152,7 @@ void TestCmds(UObject* me) {
                 continue;
             }
             if (c == L"icheck tags") {  // the player's owned gameplay tags
-                auto asc = ue::At<uint8_t*>(me, 0x750); struct C { ue::FName* d; int n, m; } tc{};
-                if (asc) tc = *reinterpret_cast<C*>(asc + 0xfb0);
+                auto tc = uex::OwnedTags(me);
                 for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"sniper: itag %s", ue::NameOf(tc.d[i]).c_str());
                 uex::Log(L"sniper: itags %d", tc.n);
                 continue;
@@ -113,6 +196,72 @@ void TestCmds(UObject* me) {
                 uex::Log(L"sniper: ofind %s (%s) outer %s", ue::NameOf(o).c_str(), cn.c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
                 for (size_t q = 0; q < fns.size(); q += 400) uex::Log(L"sniper:   %s", fns.substr(q, 400).c_str());
             }
+        }
+        else if (starts(L"oprops ")) {  // oprops <object name|#index> [property name part]
+            auto rest = c.substr(7); auto sp = rest.find(L' ');
+            DumpProps(FindByName(rest.substr(0, sp)), sp == std::wstring::npos ? L"" : rest.substr(sp + 1));
+        }
+        else if (starts(L"cdo ")) {  // cdo <class name> [property part]: its default object, and the objects inside it (GE components)
+            auto rest = c.substr(4); auto sp = rest.find(L' '); auto dn = L"Default__" + rest.substr(0, sp);
+            auto filt = sp == std::wstring::npos ? L"" : rest.substr(sp + 1); UObject* d = nullptr;
+            for (int k = 0, N = ue::NumObjects(); k < N && !d; ++k) { auto o = ue::ObjectAt(k); if (o && ue::NameOf(o) == dn) d = o; }
+            DumpProps(d, filt);
+            for (int k = 0, N = ue::NumObjects(); d && k < N; ++k) { auto o = ue::ObjectAt(k); if (o && o->outer == d) DumpProps(o, filt); }
+        }
+        else if (starts(L"gehit ")) {  // gehit <GE class name> [shachi first]: that effect from the player's ASC onto the aimed (or nearest) enemy
+            wchar_t cn[160]{}; float pre = -1; swscanf(arg(6), L"%159s %f", cn, &pre);
+            auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); auto ge = FindByName(cn);
+            auto src = uex::ASC(me), dst = e ? uex::ASC(e) : nullptr;
+            if (!e || !ge || !src || !dst) { uex::Log(L"sniper: gehit: missing %d %d %d %d", !!e, !!ge, !!src, !!dst); continue; }
+            if (pre >= 0) uex::SetAttr(e, uex::attr::Shachi, pre);
+            float hp = uex::Attr(e, uex::attr::Health), sc = uex::Attr(e, uex::attr::Shachi);
+            ue::Params p(uex::Fn(src, L"BP_ApplyGameplayEffectToTarget"));  // an empty context: the ASC makes one (source: the player)
+            p.Set(L"GameplayEffectClass", ge); p.Set(L"Target", dst); p.Set<float>(L"Level", 1.f); p.Call(src);
+            uex::Log(L"sniper: gehit %s -> %s hp %.0f -> %.0f shachi %.0f -> %.0f", cn, ue::NameOf(e).c_str(), hp, uex::Attr(e, uex::attr::Health), sc, uex::Attr(e, uex::attr::Shachi));
+            BreakInfo(e);
+        }
+        else if (c == L"break" || starts(L"break ")) BreakInfo(g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me));
+        else if (starts(L"eprops ")) {  // eprops <component class part|self> [property name part]: on the aimed (or nearest) enemy
+            auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); if (!e) continue;
+            auto rest = c.substr(7); auto sp = rest.find(L' '); auto key = rest.substr(0, sp);
+            auto filt = sp == std::wstring::npos ? L"" : rest.substr(sp + 1);
+            if (key == L"self") { DumpProps(e, filt); continue; }
+            for (int k = 0, N = ue::NumObjects(); k < N; ++k) {  // its subobjects (components, ability instances) whose class has key
+                auto o = ue::ObjectAt(k); if (!o || o->outer != e || (o->flags & 0x10)) continue;
+                if (ue::NameOf(o->cls).find(key) != std::wstring::npos) DumpProps(o, filt);
+            }
+        }
+        else if (starts(L"fnsig ")) {  // fnsig <object name|#index> <function>: its parameters
+            auto rest = c.substr(6); auto sp = rest.find(L' '); if (sp == std::wstring::npos) continue;
+            auto o = FindByName(rest.substr(0, sp)); auto fn = o ? uex::Fn(o, rest.substr(sp + 1).c_str()) : nullptr;
+            std::wstring s;
+            for (auto p = fn ? ue::At<const uint8_t*>(fn, ue::kUStruct_ChildProps) : nullptr; p; p = ue::At<const uint8_t*>(p, ue::kFField_Next))
+                s += PType(p) + L" " + PName(p) + L", ";
+            uex::Log(L"sniper: fnsig %s.%s (%s)", o ? ue::NameOf(o->cls).c_str() : L"-", rest.substr(sp + 1).c_str(), fn ? s.c_str() : L"not found");
+        }
+        else if (starts(L"oname ")) {  // oname <part> [class part]: live objects (classes, assets, instances) whose name has it
+            auto rest = c.substr(6); auto sp = rest.find(L' '); auto key = rest.substr(0, sp);
+            auto ck = sp == std::wstring::npos ? std::wstring() : rest.substr(sp + 1); int n = 0;
+            for (int k = 0, N = ue::NumObjects(); k < N && n < 80; ++k) {
+                auto o = ue::ObjectAt(k); if (!o || (o->flags & 0x10)) continue;
+                auto nm = ue::NameOf(o); if (nm.find(key) == std::wstring::npos || nm.rfind(L"Default__", 0) == 0) continue;
+                if (!ck.empty() && ue::NameOf(o->cls).find(ck) == std::wstring::npos) continue;
+                ++n; uex::Log(L"sniper: oname #%d %s (%s) outer %s", k, nm.c_str(), ue::NameOf(o->cls).c_str(), o->outer ? ue::NameOf(o->outer).c_str() : L"-");
+            }
+        }
+        else if (starts(L"ocls ")) {  // ocls <class part> <property> <value part>: objects of that class whose property's value has it
+            wchar_t cp[128]{}, pp[128]{}, vp[128]{}; swscanf(arg(5), L"%127s %127s %127s", cp, pp, vp); int n = 0;
+            for (int k = 0, N = ue::NumObjects(); k < N && n < 60; ++k) {
+                auto o = ue::ObjectAt(k); if (!o || !o->cls || ue::NameOf(o->cls).find(cp) == std::wstring::npos) continue;
+                for (auto cc = o->cls; cc; cc = ue::At<UObject*>(cc, ue::kUStruct_Super))
+                    for (auto p = ue::At<const uint8_t*>(cc, ue::kUStruct_ChildProps); p; p = ue::At<const uint8_t*>(p, ue::kFField_Next)) {
+                        if (PName(p) != pp) continue;
+                        std::wstring v; try { v = PVal(p, reinterpret_cast<const uint8_t*>(o) + ue::At<int32_t>(p, ue::kProp_Offset)); } catch (...) {}
+                        if (v.find(vp) == std::wstring::npos) continue;
+                        ++n; uex::Log(L"sniper: ocls #%d %s outer %s %s = %s", k, ue::NameOf(o).c_str(), o->outer ? ue::PathOf(o->outer).c_str() : L"-", pp, v.substr(0, 300).c_str());
+                    }
+            }
+            uex::Log(L"sniper: ocls %d", n);
         }
         else if (starts(L"burst ")) g_test.burst = _wtoi(arg(6));
         else if (c == L"hold") g_test.hold = !g_test.hold;
@@ -170,6 +319,34 @@ void TestCmds(UObject* me) {
             }
         }
         else if (c == L"heal") uex::SetAttr(me, uex::attr::Health, uex::Attr(me, uex::attr::HealthMax));
+        else if (c == L"posture") PostureInfo(g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me));  // the aimed (or nearest) enemy
+        else if (c == L"codex" || starts(L"codex ")) {  // codex [bosses|<part>]: enemy codex rows (DT_CodexEnemyDataTable): class path, boss flag
+            auto key = c.size() > 6 ? c.substr(6) : std::wstring(); bool bosses = key == L"bosses";
+            auto dt = uex::LoadAsset(L"/Game/PBZContent/DataTable/DT_CodexEnemyDataTable.DT_CodexEnemyDataTable");
+            if (!dt) { uex::Log(L"sniper: codex: no table"); continue; }
+            struct E { ue::FName k; uint8_t* row; int32_t next, hash; };  // TMap<FName, uint8*> RowMap (+0x30) element
+            auto d = ue::At<E*>(dt, 0x30); int n = ue::At<int32_t>(dt, 0x38), shown = 0;
+            for (int i = 0; i < n && d && shown < 120; ++i) {
+                auto r = d[i].row; if (!r) continue;
+                bool boss = r[0xb1] != 0; auto nm = ue::NameOf(d[i].k);
+                if (bosses ? !boss : (!key.empty() && nm.find(key) == std::wstring::npos)) continue;
+                // EnemyClass: TSoftClassPtr = weak ptr (8) + FSoftObjectPath {package, asset, sub path}
+                auto pkg = ue::NameOf(*reinterpret_cast<ue::FName*>(r + 0x10)), as = ue::NameOf(*reinterpret_cast<ue::FName*>(r + 0x18));
+                uex::Log(L"sniper: codex %s boss %d %s.%s", nm.c_str(), boss, pkg.c_str(), as.c_str()); ++shown;
+            }
+            uex::Log(L"sniper: codex %d rows", n);
+        }
+        else if (c == L"posture tags") {  // the aimed (or nearest) enemy's owned gameplay tags
+            auto e = g_test.aimAt && Live(g_test.aimAt) ? g_test.aimAt : NearestEnemy(me); if (!e) continue;
+            auto tc = uex::OwnedTags(e);
+            for (int i = 0; i < tc.n && i < 200; ++i) uex::Log(L"sniper: etag %s", ue::NameOf(tc.d[i]).c_str());
+            uex::Log(L"sniper: etags %s %d", ue::NameOf(e).c_str(), tc.n);
+        }
+        else if (starts(L"estat ")) {  // estat <hp> <shachi>: set the nearest enemy's Health and Shachi (negative = keep)
+            auto e = NearestEnemy(me); float h = -1, sh = -1; swscanf(arg(6), L"%f %f", &h, &sh); if (!e) continue;
+            if (h >= 0) uex::SetAttr(e, uex::attr::Health, h); if (sh >= 0) uex::SetAttr(e, uex::attr::Shachi, sh); PostureInfo(e);
+        }
+        else if (c == L"posture full") { auto e = NearestEnemy(me); if (e) uex::SetAttr(e, uex::attr::Shachi, uex::Attr(e, uex::attr::ShachiMax)); PostureInfo(e); }
         else if (c == L"pos") { auto l = uex::Loc(me); uex::Log(L"sniper: pos %.0f %.0f %.0f yaw %.1f", l.x, l.y, l.z, uex::GetRot(me).yaw); }
         else if (starts(L"tp ")) { swscanf(arg(3), L"%lf %lf %lf", v, v + 1, v + 2); uex::Teleport(me, {v[0], v[1], v[2]}, uex::GetRot(me).yaw); }
         else if (c == L"spawners" || starts(L"spawners ")) {  // NPC spawners: object index, class, distance, spawned actor
@@ -181,7 +358,7 @@ void TestCmds(UObject* me) {
                 auto nm = ue::NameOf(o->cls) + L" " + ue::NameOf(o) + L" " + (a ? ue::NameOf(a) : std::wstring(L"-"));
                 if (!key.empty() && nm.find(key) == std::wstring::npos) continue;
                 auto l = uex::Loc(o); double d = ik::Len(ik::FromU(l) - pl) / 100;
-                uex::Log(L"sniper: spawner #%d %s at %.0f %.0f %.0f (%.0f m) hp %.0f", k, nm.c_str(), l.x, l.y, l.z, d, a && ue::At<void*>(a, 0x758) ? uex::Attr(a, uex::attr::Health) : -1.f);
+                uex::Log(L"sniper: spawner #%d %s at %.0f %.0f %.0f (%.0f m) hp %.0f", k, nm.c_str(), l.x, l.y, l.z, d, a && uex::AttrSet(a) ? uex::Attr(a, uex::attr::Health) : -1.f);
                 ++n;
             }
         }
@@ -229,7 +406,7 @@ void TestCmds(UObject* me) {
                 auto ai = (o->flags & 0x10) ? nullptr : AnimOf(o); UObject* mt = nullptr;
                 if (ai) { ue::Params q(uex::Fn(ai, L"GetCurrentActiveMontage")); q.Call(ai); mt = q.Get<UObject*>(L"ReturnValue"); }
                 uex::Log(L"sniper: find %s flags %x hp %.0f alive %d dead %d at %.0f %.0f %.0f mont %s", ue::NameOf(o).c_str(), o->flags,
-                    ue::At<void*>(o, 0x758) ? uex::Attr(o, uex::attr::Health) : -1.f, uex::Alive(o), dead, l.x, l.y, l.z, mt ? ue::NameOf(mt).c_str() : L"-");
+                    uex::AttrSet(o) ? uex::Attr(o, uex::attr::Health) : -1.f, uex::Alive(o), dead, l.x, l.y, l.z, mt ? ue::NameOf(mt).c_str() : L"-");
             }
         }
         else if (starts(L"lsmont ")) {

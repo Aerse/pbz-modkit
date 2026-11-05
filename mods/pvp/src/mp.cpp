@@ -202,7 +202,7 @@ static void Tick(void*, float dt) {
     try { ui::Tick(dt); } catch (...) { static int n; Caught(L"ui", n); }
 }
 extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) { g_h = h; uex::SetHost(h); }
-extern "C" __declspec(dllexport) void PbzRun(const wchar_t*) { if (g_tick < 0) g_tick = g_h->addTick(Tick, nullptr); uex::Log(L"mp loaded"); }
+extern "C" __declspec(dllexport) void PbzRun(const wchar_t* dir) { ui::SetModDir(dir); if (g_tick < 0) g_tick = g_h->addTick(Tick, nullptr); uex::Log(L"mp loaded"); }
 extern "C" __declspec(dllexport) void PbzUnload() {
     if (g_tick >= 0) g_h->removeTick(g_tick);
     g_tick = -1;

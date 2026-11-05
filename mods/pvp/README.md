@@ -12,7 +12,7 @@
 
 ## 安装
 
-适配游戏版本 `CL-302256_JKS-17280 (2026-11-04)`（Steam 版 PBZ.exe 的文件版本：右键 → 属性 → 详细信息）。游戏更新后 Mod 可能失效，需要等待对应的新版本。
+测试于游戏版本 `CL-302256_JKS-17280 (2026-11-04)`（Steam 版 PBZ.exe 的文件版本：右键 → 属性 → 详细信息）。加载器启动时自己找引擎地址，字段按名字查，普通的游戏更新不需要新版本；更新后如果不工作，把 `pbzmp\loader.log` 发给作者。
 
 1. 把压缩包直接解压到游戏目录的 `platform\steam\` 文件夹（和 `PBZ.exe` 同一层）。
    Steam 里右键游戏 → 管理 → 浏览本地文件，再进 `platform\steam`。
@@ -21,7 +21,7 @@
 ## Mod管理器
 
 - 双击 `Mod管理器.exe`，勾选要启用的 Mod，点「保存」，下次启动游戏生效。
-- 以后的新 Mod 放进 `pbzmp` 文件夹（一个 dll，或一个同名子文件夹），就会出现在管理器的列表里。
+- 每个 Mod 在 `pbzmp` 里有自己的文件夹（例如联机 Mod 是 `pbzmp\mp\`）。以后的新 Mod 把它的文件夹放进 `pbzmp`，就会出现在管理器的列表里。
 - 管理器会检查前置 Mod 和版本、互相冲突的 Mod、需要更新加载器的 Mod，有问题时不让保存并说明原因。
 - 已经装了别的 Mod 的 `version.dll`：管理器打开时会提示，点「是」把它改名为 `version_chain.dll`，
   再把本包的 `version.dll` 放回去，两个就都能生效（本加载器会顺带加载 `version_chain.dll`）。
@@ -71,4 +71,4 @@
 | `docs/` | [设计](docs/pvp-design.md)、[大厅协议](docs/pvp-protocol.md)、[游戏通道 / 网络同步](docs/pvp-netcode.md) |
 | `maps/` | 大厅里的地图预览图 |
 
-Mod 信息文件是 `mp.txt`（id 为 `mp`，安装后位于 `pbzmp\mp.dll`）。构建和测试见仓库根目录的 [README](../../README.md)。
+Mod 信息文件是 `mp.txt`（id 为 `mp`）。安装后的文件夹是 `pbzmp\mp\`：`mp.dll`、`mp.txt`、`maps\`，以及运行时写的 `mp_settings.txt`（记住的连接设置）和 `mp_session.txt`（崩溃重连）。旧版本平铺在 `pbzmp\` 里的这两个文件会被读到，之后写进 `pbzmp\mp\`。构建和测试见仓库根目录的 [README](../../README.md)。

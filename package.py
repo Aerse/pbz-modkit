@@ -2,11 +2,13 @@
 <ver> is version= in mods/pvp/mp.txt, the one place the release version lives.
   --full  also packs the sniper mod with its local assets (mods/sniper/assets/cache, not in
           the repo, never published) into dist/pbz_mods_full-v<ver>.zip, for local testing.
-Layout (unzip into <game>/platform/steam/):
+Layout (unzip into <game>/platform/steam/), one folder per mod under pbzmp/:
   version.dll  Mod管理器.exe  README.txt
-  pbzmp/  autorun.txt  mp.dll  mp.txt  maps/*.png
+  pbzmp/  autorun.txt
+  pbzmp/mp/  mp.dll  mp.txt  maps/*.png
+  pbzmp/sniper/  sniper.dll  sniper.txt  cache/   (--full only)
   server/ rsrv.exe  pbzmp_server.py  开服务器.bat
-  sdk/    README.md  pbz_host.h  example/
+  sdk/    README.md  pbz_host.h  framework/  example/  hello/
 """
 import os, re, shutil, sys, zipfile
 
@@ -47,11 +49,11 @@ for f in ("out/version.dll", "out/modman.exe", "out/mp.dll", "out/rsrv.exe") + (
 shutil.rmtree(D, ignore_errors=True)
 cp("out/version.dll", "version.dll")
 cp("out/modman.exe", "Mod管理器.exe")
-cp("out/mp.dll", "pbzmp/mp.dll")
-cp("mods/pvp/mp.txt", "pbzmp/mp.txt")
+cp("out/mp.dll", "pbzmp/mp/mp.dll")
+cp("mods/pvp/mp.txt", "pbzmp/mp/mp.txt")
 text("pbzmp/autorun.txt", "mp\n")
 for m in sorted(os.listdir(os.path.join(R, "mods/pvp/maps"))):
-    cp("mods/pvp/maps/" + m, "pbzmp/maps/" + m)
+    cp("mods/pvp/maps/" + m, "pbzmp/mp/maps/" + m)
 cp("out/rsrv.exe", "server/rsrv.exe")
 cp("mods/pvp/server/pbzmp_server.py", "server/pbzmp_server.py")
 text("server/开服务器.bat", "@echo off\nrem PBZ PvP relay server, UDP 27777. Password: add  --password YOURPASS\n"
@@ -64,6 +66,17 @@ with open(os.path.join(R, "sdk/example/example.cpp"), "rb") as f:
     src = f.read().replace(b'"../../loader/host.h"  // or pbz_host.h from a release', b'"../pbz_host.h"')
 with open(os.path.join(D, "sdk/example/example.cpp"), "wb") as f:
     f.write(src)
+for f in ("hello.cpp", "hello.txt", "build.bat"):
+    cp("sdk/hello/" + f, "sdk/hello/" + f)
+# the framework the mods here are built on; in the sdk folder it finds pbz_host.h one level up
+for f in ("ue.h", "ue.cpp", "ue_call.h", "uex.h", "uex.cpp"):
+    with open(os.path.join(R, "framework", f), "rb") as fh:
+        src = fh.read()
+    if b'"../loader/host.h"' not in src and f in ("ue.cpp", "uex.h"):
+        sys.exit(f"framework/{f}: host.h include changed, fix package.py")
+    os.makedirs(os.path.join(D, "sdk/framework"), exist_ok=True)
+    with open(os.path.join(D, "sdk/framework", f), "wb") as fh:
+        fh.write(src.replace(b'"../loader/host.h"', b'"../pbz_host.h"'))
 
 
 def plain(md_path, cut=None):
@@ -84,23 +97,23 @@ def plain(md_path, cut=None):
 
 
 name = f"pbz_mods_full-v{VER}" if FULL else f"pbz_pvp-v{VER}"
-head = (f"影之刃零 Mod 包 v{VER}\n\n适配游戏版本: {GAME}（Steam 版 PBZ.exe 的文件版本，右键 → 属性 → 详细信息可查看）\n"
-        "游戏更新后 Mod 可能失效，请等待对应的新版本。\n\n"
+head = (f"影之刃零 Mod 包 v{VER}\n\n测试于游戏版本: {GAME}（Steam 版 PBZ.exe 的文件版本，右键 → 属性 → 详细信息可查看）\n"
+        "加载器启动时自己找引擎地址，字段按名字查，普通的游戏更新不需要新版本。更新后如果不工作，把 pbzmp\\loader.log 发给作者。\n\n"
         f"包含: 联机 PVP {VER}")
 if FULL:
     head += f"、CS 步枪 {SNIPER_VER}（仅自测，资源版权属于 Valve，不要外传）"
 readme = head + "\n解压到游戏目录的 platform\\steam\\（和 PBZ.exe 同一层）。\n\n" + "=" * 40 + "\n\n"
 readme += plain("mods/pvp/README.md", "## 开发者")
 if FULL:
-    cp("out/sniper.dll", "pbzmp/sniper.dll")
-    cp("mods/sniper/sniper.txt", "pbzmp/sniper.txt")
+    cp("out/sniper.dll", "pbzmp/sniper/sniper.dll")
+    cp("mods/sniper/sniper.txt", "pbzmp/sniper/sniper.txt")
     cache = os.path.join(R, "mods/sniper/assets/cache")
     if not os.path.isdir(cache):
         sys.exit("missing mods/sniper/assets/cache")
     for d, _, fs in os.walk(cache):
         for f in fs:
             rel = os.path.relpath(os.path.join(d, f), R).replace(os.sep, "/")
-            cp(rel, "pbzmp/sniper_cache/" + os.path.relpath(os.path.join(d, f), cache).replace(os.sep, "/"))
+            cp(rel, "pbzmp/sniper/cache/" + os.path.relpath(os.path.join(d, f), cache).replace(os.sep, "/"))
     readme += "\n" + "=" * 40 + "\n\n" + plain("mods/sniper/README.md", "## 资源")
     readme += "\n启用: 打开 Mod管理器.exe，勾选「CS 步枪」，保存，重启游戏。进联机房间时它会自动卸载，离开房间后自动恢复。\n"
 text("README.txt", "﻿" + readme)  # BOM: old Notepad reads it as UTF-8

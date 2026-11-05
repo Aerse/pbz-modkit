@@ -1,0 +1,6 @@
+name=框架示例
+version=1.0
+author=你的名字
+desc=SDK 框架示例：Ctrl+F10 把血量、架势、位置写进 loader.log，不含任何内存地址
+api=3
+mp=allow

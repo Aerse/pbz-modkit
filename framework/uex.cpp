@@ -16,9 +16,12 @@ static const PbzHost* g_host;
 void SetHost(const PbzHost* h) { g_host = h; }
 const PbzHost* Host() { return g_host; }
 
+static wchar_t g_logName[32] = L"mp: ";
+void SetLogName(const wchar_t* name) { swprintf(g_logName, 32, L"%s: ", name ? name : L"mod"); }
 void Log(const wchar_t* fmt, ...) {
-    wchar_t b[1024] = L"mp: ";
-    va_list a; va_start(a, fmt); _vsnwprintf_s(b + 4, 1020, _TRUNCATE, fmt, a); va_end(a);
+    wchar_t b[1024];
+    int n = swprintf(b, 32, L"%s", g_logName); if (n < 0) n = 0;
+    va_list a; va_start(a, fmt); _vsnwprintf_s(b + n, 1024 - n, _TRUNCATE, fmt, a); va_end(a);
     if (g_host) g_host->log(b);
 }
 
@@ -31,20 +34,86 @@ static UObject* WidgetLib() { return FindObject(L"WidgetBlueprintLibrary /Script
 static UObject* StringLib() { return FindObject(L"KismetStringLibrary /Script/Engine.Default__KismetStringLibrary"); }
 static UObject* TextLib() { return FindObject(L"KismetTextLibrary /Script/Engine.Default__KismetTextLibrary"); }
 
+// ---- reflection ------------------------------------------------------------------------------
+static std::wstring Short(const wchar_t* owner) {  // "Class /Script/Engine.Controller" -> "Controller"
+    std::wstring s = owner; auto k = s.find_last_of(L"."); return k == std::wstring::npos ? s : s.substr(k + 1);
+}
+int Prop::Resolve() {
+    if (retryAt && GetTickCount64() < retryAt) return off;  // class not loaded yet: fallback, look again later
+    auto cls = FindObject(owner);
+    const uint8_t* p = cls ? FindPropPtr(cls, name) : nullptr;
+    if (!p) {
+        static std::map<std::wstring, bool> told;
+        auto key = Short(owner) + L"." + name;
+        if (!told[key]) { told[key] = true; Log(L"field %s not found%s, using 0x%x", key.c_str(), cls ? L"" : L" (no class yet)", fallback); }
+        off = fallback; mask = fallbackMask;
+        done = cls != nullptr;
+        if (!done) retryAt = GetTickCount64() + 2000;  // the class may load later
+        return off;
+    }
+    off = At<int32_t>(p, kProp_Offset);
+    if (fallbackMask) {  // FBoolProperty FieldSize, ByteOffset, ByteMask, FieldMask; a native bool has FieldMask 0xff
+        off += At<uint8_t>(p, kProp_Extra + 1);
+        mask = At<uint8_t>(p, kProp_Extra + 3) == 0xff ? 0xff : At<uint8_t>(p, kProp_Extra + 2);
+    }
+    if (off != fallback || mask != fallbackMask)
+        Log(fallbackMask ? L"field %s.%s moved: 0x%x mask 0x%x (was 0x%x mask 0x%x)" : L"field %s.%s moved: 0x%x (was 0x%x)",
+            Short(owner).c_str(), name, off, fallbackMask ? mask : fallback, fallback, fallbackMask);
+    done = true;
+    return off;
+}
+int StructSize(const wchar_t* owner, int fallback) {
+    static std::map<std::wstring, int> cache;
+    if (auto it = cache.find(owner); it != cache.end()) return it->second;
+    auto st = FindObject(owner); if (!st) return fallback;
+    int n = At<int32_t>(st, kUStruct_PropsSize);
+    if (n != fallback) Log(L"struct %s size 0x%x (was 0x%x)", Short(owner).c_str(), n, fallback);
+    return cache[owner] = n;
+}
+int OffsetOf(UObject* cls, const wchar_t* prop) {
+    struct E { uint32_t clsName; int off; };
+    static std::map<std::pair<UObject*, std::wstring>, E> cache;  // classes can be freed and reused: name checked
+    if (!cls) return -1;
+    auto k = std::make_pair(cls, std::wstring(prop));
+    if (auto it = cache.find(k); it != cache.end() && it->second.clsName == cls->name.comparison) return it->second.off;
+    int off = FindProp(cls, prop).offset;
+    cache[k] = {cls->name.comparison, off};
+    return off;
+}
+
+namespace {
+Prop kGameInstance{L"Class /Script/Engine.GameEngine", L"GameInstance", 0x12e0};
+Prop kViewport{L"Class /Script/Engine.Engine", L"GameViewport", 0xc88};
+Prop kVpWorld{L"Class /Script/Engine.GameViewportClient", L"World", 0x78};
+Prop kLocalPlayers{L"Class /Script/Engine.GameInstance", L"LocalPlayers", 0x38};
+Prop kPlayerPC{L"Class /Script/Engine.Player", L"PlayerController", 0x30};
+Prop kPawn{L"Class /Script/Engine.Controller", L"Pawn", 0x2f0};
+Prop kAsc{L"Class /Script/ProjectPBZ.PBZCharacter", L"AbilitySystemComponent", 0x750};
+Prop kAttrSet{L"Class /Script/ProjectPBZ.PBZCharacter", L"AttributeSetBase", 0x758};
+Prop kCursor{L"Class /Script/Engine.PlayerController", L"bShowMouseCursor", 0x554, 0x1};
+Prop kHitLoc{L"ScriptStruct /Script/Engine.HitResult", L"Location", 0x10};
+Prop kKeyMappings{L"Class /Script/EnhancedInput.InputMappingContext", L"DefaultKeyMappings", 0x40};
+Prop kMappings{L"ScriptStruct /Script/EnhancedInput.InputMappingContextMappingData", L"Mappings", 0};
+Prop kMapAction{L"ScriptStruct /Script/EnhancedInput.EnhancedActionKeyMapping", L"Action", 0x20};
+Prop kMapKey{L"ScriptStruct /Script/EnhancedInput.EnhancedActionKeyMapping", L"Key", 0x28};
+int MappingSize() { return StructSize(L"ScriptStruct /Script/EnhancedInput.EnhancedActionKeyMapping", 0x50); }
+}  // namespace
+
 UObject* Engine() { return g_host ? static_cast<UObject*>(g_host->engine()) : nullptr; }
-UObject* GameInstance() { auto e = Engine(); return e ? At<UObject*>(e, 0x12e0) : nullptr; }
+UObject* GameInstance() { auto e = Engine(); return e ? kGameInstance.Of<UObject*>(e) : nullptr; }
 UObject* World() {
     auto e = Engine(); if (!e) return nullptr;
-    auto vp = At<UObject*>(e, 0xc88);
-    return vp ? At<UObject*>(vp, 0x78) : nullptr;
+    auto vp = kViewport.Of<UObject*>(e);
+    return vp ? kVpWorld.Of<UObject*>(vp) : nullptr;
 }
 UObject* PC() {
+    struct PArr { UObject** d; int32_t n, m; };
     auto gi = GameInstance(); if (!gi) return nullptr;
-    auto arr = At<UObject**>(gi, 0x38);
-    if (!arr || At<int32_t>(gi, 0x40) < 1 || !arr[0]) return nullptr;
-    return At<UObject*>(arr[0], 0x30);
+    auto& arr = kLocalPlayers.Of<PArr>(gi);
+    if (!arr.d || arr.n < 1 || !arr.d[0]) return nullptr;
+    return kPlayerPC.Of<UObject*>(arr.d[0]);
 }
-UObject* Me() { auto pc = PC(); return pc ? At<UObject*>(pc, 0x2f0) : nullptr; }
+UObject* Me() { auto pc = PC(); return pc ? kPawn.Of<UObject*>(pc) : nullptr; }
 
 // a stale pointer (the object freed, its page released) faults on the first read: no object then
 static int SafeIndex(UObject* o) {
@@ -206,7 +275,7 @@ UObject* Comp(UObject* a, UObject* cls) {
     return p.Get<UObject*>(L"ReturnValue");
 }
 
-struct HitBuf { uint8_t b[0x100]; };
+struct HitBuf { uint8_t b[0x100]; };  // FHitResult, 0x100 in this build (Location is near the start)
 bool Trace(UObject* ctx, Vec a, Vec b, Vec* hit) {
     auto lib = SystemLib(); if (!lib || !ctx) return false;
     Params t(Fn(lib, L"LineTraceSingle"));
@@ -214,11 +283,28 @@ bool Trace(UObject* ctx, Vec a, Vec b, Vec* hit) {
     t.Set<uint8_t>(L"TraceChannel", 0); t.Set<bool>(L"bIgnoreSelf", true);
     t.Call(lib);
     if (!t.Get<bool>(L"ReturnValue")) return false;
-    if (hit) *hit = *reinterpret_cast<const Vec*>(t.Get<HitBuf>(L"OutHit").b + 0x10);
+    if (hit) *hit = *reinterpret_cast<const Vec*>(t.Get<HitBuf>(L"OutHit").b + kHitLoc);
     return true;
 }
 
-static uint8_t* AttrSet(UObject* ch) { return ch ? At<uint8_t*>(ch, 0x758) : nullptr; }
+uint8_t* AttrSet(UObject* ch) { return ch ? kAttrSet.Of<uint8_t*>(ch) : nullptr; }
+UObject* ASC(UObject* ch) { return ch ? kAsc.Of<UObject*>(ch) : nullptr; }
+namespace {
+Prop kTagCount{L"Class /Script/GameplayAbilities.AbilitySystemComponent", L"GameplayTagCountContainer", 0xee8};
+constexpr int kExplicitTags = 0xc8;  // FGameplayTagCountContainer.ExplicitTags (native, not reflected)
+}
+TagList OwnedTags(UObject* ch) {
+    auto asc = reinterpret_cast<uint8_t*>(ASC(ch)); if (!asc) return {};
+    struct C { const FName* d; int32_t n, m; } c = *reinterpret_cast<C*>(asc + kTagCount + kExplicitTags);
+    if (!c.d || c.n < 0 || c.n > 4096) return {};
+    return {c.d, c.n};
+}
+bool HasTag(UObject* ch, const wchar_t* tag) {
+    auto t = OwnedTags(ch); if (!t.n) return false;
+    FName want = Name(tag);
+    for (int i = 0; i < t.n; ++i) if (t.d[i].comparison == want.comparison && t.d[i].number == want.number) return true;
+    return false;
+}
 float Attr(UObject* ch, int off) { auto s = AttrSet(ch); return s ? *reinterpret_cast<float*>(s + off + 0xC) : 0.f; }
 void SetAttr(UObject* ch, int off, float v) {
     auto s = AttrSet(ch); if (!s) return;
@@ -306,12 +392,12 @@ void UiMode(UObject* focus) {
     auto lib = WidgetLib(); auto pc = PC(); if (!lib || !pc) return;
     Params p(Fn(lib, L"SetInputMode_UIOnlyEx"));
     p.Set(L"PlayerController", pc); p.Set(L"InWidgetToFocus", focus); p.Set<uint8_t>(L"InMouseLockMode", 0); p.Set<bool>(L"bFlushInput", true);
-    p.Call(lib); reinterpret_cast<uint8_t*>(pc)[0x554] |= 1;
+    p.Call(lib); kCursor.SetBit(pc, true);
 }
 void GameMode() {
     auto lib = WidgetLib(); auto pc = PC(); if (!lib || !pc) return;
     Params p(Fn(lib, L"SetInputMode_GameOnly")); p.Set(L"PlayerController", pc); p.Set<bool>(L"bFlushInput", true);
-    p.Call(lib); reinterpret_cast<uint8_t*>(pc)[0x554] &= ~1;
+    p.Call(lib); kCursor.SetBit(pc, false);
 }
 
 void SaveVeto(bool on, const wchar_t* source) {
@@ -342,7 +428,7 @@ void Hostile(UObject* a, UObject* b, bool on) {
     }
 }
 bool Ability(UObject* ch, UObject* cls) {
-    auto asc = ch ? At<UObject*>(ch, 0x750) : nullptr; if (!asc || !cls) return false;
+    auto asc = ASC(ch); if (!asc || !cls) return false;
     Params p(Fn(asc, L"TryActivateAbilityByClass")); p.Set(L"InAbilityToActivate", cls); p.Set<bool>(L"bAllowRemoteActivation", true);
     p.Call(asc); return p.Get<bool>(L"ReturnValue");
 }
@@ -367,8 +453,8 @@ void SetMoveMode(UObject* ch, int mode) {
 }
 
 // ---- game menu keys ------------------------------------------------------------------------
-// InputMappingContext::DefaultKeyMappings.Mappings (+0x40): FEnhancedActionKeyMapping, stride 0x50,
-// Action +0x20, FKey +0x28. A blocked entry gets a null Action (the control mapping rebuild skips
+// InputMappingContext::DefaultKeyMappings.Mappings: FEnhancedActionKeyMapping (stride, Action and Key
+// found by reflection). A blocked entry gets a null Action (the control mapping rebuild skips
 // those; changing the key instead is undone by the user key profile for rebindable keys). The
 // original action is kept here and written back by BlockMenuKeys(false).
 namespace {
@@ -384,12 +470,14 @@ void Rebuild(UObject* imc) {
     Params p(Fn(lib, L"RequestRebuildControlMappingsUsingContext"));
     p.Set(L"Context", imc); p.Set<bool>(L"bForceImmediately", true); p.Call(lib);
 }
-UObject*& ActionAt(UObject* imc, int i) {
-    auto a = *reinterpret_cast<MArr*>(reinterpret_cast<uint8_t*>(imc) + 0x40);
-    return *reinterpret_cast<UObject**>(a.d + i * 0x50 + 0x20);
-}
-int Count(UObject* imc) { return reinterpret_cast<MArr*>(reinterpret_cast<uint8_t*>(imc) + 0x40)->n; }
+MArr& Mappings(UObject* imc) { return *reinterpret_cast<MArr*>(reinterpret_cast<uint8_t*>(imc) + kKeyMappings + kMappings); }
+UObject*& ActionAt(UObject* imc, int i) { return *reinterpret_cast<UObject**>(Mappings(imc).d + i * MappingSize() + kMapAction); }
+int Count(UObject* imc) { return Mappings(imc).n; }
 }  // namespace
+int KeyMappingCount(UObject* imc) { return imc ? Count(imc) : 0; }
+UObject*& KeyMappingAction(UObject* imc, int i) { return ActionAt(imc, i); }
+FName KeyMappingKey(UObject* imc, int i) { return *reinterpret_cast<FName*>(Mappings(imc).d + i * MappingSize() + kMapKey); }
+void RebuildMappings(UObject* imc) { Rebuild(imc); }
 void BlockMenuKeys(bool on) {
     if (!on) {
         if (g_blocked.empty()) return;
@@ -412,13 +500,13 @@ void BlockMenuKeys(bool on) {
     for (int k = 0, n = NumObjects(); k < n; ++k) {
         auto o = ObjectAt(k);
         if (!o || o->cls != cls || (o->flags & 0x30)) continue;
-        auto a = *reinterpret_cast<MArr*>(reinterpret_cast<uint8_t*>(o) + 0x40);
+        auto a = Mappings(o);
         bool changed = false;
         for (int i = 0; i < a.n && i < 512; ++i) {
-            auto e = a.d + i * 0x50; auto act = At<UObject*>(e, 0x20);
+            auto e = a.d + i * MappingSize(); auto act = At<UObject*>(e, kMapAction);
             if (!MenuAction(act)) continue;
             g_blocked.push_back({o, i, act});
-            Log(L"menu key %s blocked in %s", NameOf(*reinterpret_cast<FName*>(e + 0x28)).c_str(), NameOf(o).c_str());
+            Log(L"menu key %s blocked in %s", NameOf(*reinterpret_cast<FName*>(e + kMapKey)).c_str(), NameOf(o).c_str());
             ActionAt(o, i) = nullptr; changed = true;
         }
         if (changed) Rebuild(o);

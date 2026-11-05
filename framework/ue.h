@@ -1,12 +1,23 @@
-// Minimal UE5.7 runtime access for PBZ (CL-302256_JKS-17280, 2026-11-04 build). Offsets are tied to this game build.
+// Minimal UE5.7 runtime access for PBZ. The engine globals (object array, name pool, ProcessEvent
+// slot) come from the loader, which finds them at every start (host.h v3), so they follow game
+// updates. The UObject / UStruct / FProperty layout below is UE5.7's and only changes with the engine.
 #pragma once
 #include <cstdint>
 #include <string>
 
 namespace ue {
-constexpr uintptr_t kObjObjects    = 0x14de28c68;  // FUObjectItem** chunk table
-constexpr uintptr_t kNumElements   = 0x14de28c70;  // int32
-constexpr uintptr_t kFNameToString = 0x14144d2c0;  // void(const FName*, FString*); allocates, don't use
+// Where the engine globals are. Filled when the module loads: from the loader's PbzHost (found
+// through the PBZMP_HOST variable, so also for modules that never get PbzInit), else the values of
+// the 2026-11-04 build.
+struct Globals {
+    uintptr_t objects;      // FUObjectItem** chunk table (GUObjectArray.Objects)
+    uintptr_t numElements;  // int32
+    uintptr_t namePool;     // FNamePool
+    int processEvent;       // UObject::ProcessEvent vtable index
+    bool fromLoader;        // false: built-in values (old loader)
+};
+Globals LoadGlobals();
+inline const Globals globals = LoadGlobals();
 constexpr int kItemSize = 24, kItemObjOff = 8, kChunk = 65536;
 
 struct FString { wchar_t* data; int32_t num; int32_t max; };
@@ -45,9 +56,9 @@ template <class T> inline T At(const void* p, int off) {
     return *reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(p) + off);
 }
 
-inline int32_t NumObjects() { return *reinterpret_cast<int32_t*>(kNumElements); }
+inline int32_t NumObjects() { return *reinterpret_cast<int32_t*>(globals.numElements); }
 inline UObject* ObjectAt(int32_t i) {
-    auto chunks = *reinterpret_cast<uint8_t***>(kObjObjects);
+    auto chunks = *reinterpret_cast<uint8_t***>(globals.objects);
     uint8_t* c = chunks[i / kChunk];
     if (!c) return nullptr;
     return *reinterpret_cast<UObject**>(c + (i % kChunk) * kItemSize + kItemObjOff);

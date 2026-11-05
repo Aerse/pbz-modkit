@@ -9,7 +9,9 @@
 #include <algorithm>
 
 bool Live(UObject* o) { return o && uex::Alive(o); }
-UObject* MeshOf(UObject* ch) { return ch ? ue::At<UObject*>(ch, 0x330) : nullptr; }  // Character.Mesh
+static uex::Prop kMesh{L"Class /Script/Engine.Character", L"Mesh", 0x330};
+static uex::Prop kHidden{L"Class /Script/Engine.Actor", L"bHidden", 0x58, 0x80};
+UObject* MeshOf(UObject* ch) { return ch ? kMesh.Of<UObject*>(ch) : nullptr; }
 UObject* AnimOf(UObject* ch) {
     auto m = MeshOf(ch); if (!m) return nullptr;
     ue::Params g(uex::Fn(m, L"GetAnimInstance")); g.Call(m); return g.Get<UObject*>(L"ReturnValue");
@@ -65,7 +67,7 @@ static bool LoadMesh(int i) {
     auto& m = g_md[i];
     if (m.tried) return !m.tri.empty();
     m.tried = true;
-    std::wstring path = g_modDir + L"sniper_cache\\" + g_wpn[i].id + L".bin";
+    std::wstring path = g_cacheDir + g_wpn[i].id + L".bin";
     FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) { uex::Log(L"sniper: no %s", path.c_str()); return false; }
     char tag[4]; uint32_t nv = 0, ni = 0;
@@ -105,7 +107,7 @@ static UObject* MakeMaterial(UObject* owner, int i) {
     if (!mat || !rl) return mat;
     static const wchar_t* tex[][2] = {{L"Albedo", L"_color.png"}, {L"Normal", L"_normal.png"}, {L"Mix", L"_orm.png"}};
     for (auto& t : tex) {
-        std::wstring path = g_modDir + L"sniper_cache\\" + g_wpn[i].id + t[1];
+        std::wstring path = g_cacheDir + g_wpn[i].id + t[1];
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         struct FS { const wchar_t* d; int32_t n, m; } fs{path.c_str(), int32_t(path.size() + 1), int32_t(path.size() + 1)};
         ue::Params q(uex::Fn(rl, L"ImportFileAsTexture2D")); q.Set(L"WorldContextObject", owner); q.Set(L"Filename", fs); q.Call(rl);
@@ -391,7 +393,7 @@ void HideWeapons(UObject* me, bool hide) {
         for (int i = 0; i < arr.n; ++i) {
             auto a = static_cast<UObject**>(arr.d)[i];
             if (!a || a == g_model || std::find(g_hidden.begin(), g_hidden.end(), a) != g_hidden.end()) continue;
-            if (ue::At<uint8_t>(a, 0x58) & 0x80) continue;  // already hidden by the game
+            if (kHidden.Bit(a)) continue;  // already hidden by the game
             ue::Params q(uex::Fn(a, L"SetActorHiddenInGame")); q.Set<bool>(L"bNewHidden", true); q.Call(a);
             g_hidden.push_back(a); uex::Log(L"sniper: hide %s", ue::NameOf(a).c_str());
         }
@@ -409,5 +411,5 @@ void ModelDebug() {
     UObject* par = nullptr; { ue::Params q(uex::Fn(comp, L"GetAttachParent")); q.Call(comp); par = q.Get<UObject*>(L"ReturnValue"); }
     auto me = uex::Me(); ik::V pl = me ? ik::FromU(uex::Loc(me)) : ik::V{};
     uex::Log(L"sniper: mdbg at %.0f %.0f %.0f (player %.0f %.0f %.0f) scale %.2f vis %d sections %d parent %s actorHidden %d",
-        loc.x, loc.y, loc.z, pl.x, pl.y, pl.z, sc.x, vis, ns, par ? ue::NameOf(par).c_str() : L"-", (ue::At<uint8_t>(g_model, 0x58) & 0x80) != 0);
+        loc.x, loc.y, loc.z, pl.x, pl.y, pl.z, sc.x, vis, ns, par ? ue::NameOf(par).c_str() : L"-", kHidden.Bit(g_model));
 }

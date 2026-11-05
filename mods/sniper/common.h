@@ -17,7 +17,8 @@ template <class T> inline TA Arr(std::vector<T>& v) { return {v.data(), int32_t(
 struct FLinColor { float r, g, b, a; };
 
 extern const PbzHost* g_h;
-extern std::wstring g_modDir;  // mod folder, ends with '\'
+extern std::wstring g_modDir;  // mod folder (PbzRun's dir), ends with '\'
+extern std::wstring g_cacheDir;  // meshes, textures, sounds: <mod>\cache\ (older installs: sniper_cache\)
 extern bool g_dbg;             // extra logging (test command "dbg")
 extern double g_now;           // seconds, mod clock (advances while equipped)
 
@@ -43,6 +44,7 @@ struct Stats { float maxSpeed, spread, stand, crouch, move, jump, fire, rMag, rM
 struct Wpn {
     const wchar_t *id, *label;              // file prefix in sniper_cache, HUD name
     float damage, head, rangeMod;           // CS damage (x kDmgScale), head multiplier, falloff per 500 units
+    float posture;                          // body hit: Shachi (posture) taken, fraction of Shachi_Max (x kPostureHead on the head)
     int clip, reserve; bool autoFire;
     float cycle, reload, deploy;            // seconds
     Stats st[2];                            // [0] normal, [1] zoomed
@@ -128,6 +130,8 @@ void PlayHitReact(UObject* victim, ik::V dir);
 void KillTest(UObject* victim, int mode, ik::V dir);  // test: one death path (0 the one shots use, 1 Kill, 2 attribute system, 3 GE_Kill, 4-7 with the death montage)
 void DeathTick();                                     // holds the death poses we play
 void Aggro(UObject* victim, UObject* me, float dmg, ik::V at);
+void PostureInfo(UObject* victim);  // test: log Health and Shachi (posture) with their limits
+void BreakInfo(UObject* victim);    // test: hit state, montage and break tags
 bool HeadPos(UObject* victim, ik::V* out);  // head bone
 extern double g_fxK[4];                     // effect scale: impact, spark, blood, tracer
 extern double g_headR, g_bodyMargin;        // hit test: head sphere radius, capsule margin (cm)

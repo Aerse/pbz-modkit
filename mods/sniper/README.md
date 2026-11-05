@@ -18,13 +18,13 @@
 
 ## 资源（仓库不包含）
 
-模型、贴图和音效来自 Counter-Strike，版权属于 Valve，所以本仓库**不包含**这些资源，需要你自己准备。Mod 运行时从 `pbzmp\sniper_cache\` 读取：
+模型、贴图和音效来自 Counter-Strike，版权属于 Valve，所以本仓库**不包含**这些资源，需要你自己准备。Mod 运行时从自己文件夹里的 `pbzmp\sniper\cache\` 读取（旧的 `pbzmp\sniper_cache\` 也能用）：
 
 ```
-pbzmp\
+pbzmp\sniper\
   sniper.dll
   sniper.txt
-  sniper_cache\
+  cache\
     awp.bin   awp_color.png   awp_normal.png   awp_orm.png
     ak47.bin  ak47_color.png  ak47_normal.png  ak47_orm.png
     m4a4.bin  m4a4_color.png  m4a4_normal.png  m4a4_orm.png
@@ -52,6 +52,6 @@ pbzmp\
 | `overlay.cpp/.h` | 准星、弹药 HUD、瞄准镜画面 |
 | `audio.cpp` | XAudio2 播放音效 |
 | `input.cpp` | 键鼠状态（仅在游戏窗口在前台时），屏蔽游戏自己的绑定 |
-| `tests.cpp` | 开发用：从 `pbzmp\sniper.cmd` 读测试命令（每帧读取后删除），以及转向敌人的瞄准辅助 |
+| `tests.cpp` | 开发用：从 `pbzmp\sniper\sniper.cmd` 读测试命令（每帧读取后删除），以及转向敌人的瞄准辅助 |
 
 构建：在仓库根目录运行 `build.bat`，产物是 `out\sniper.dll`。

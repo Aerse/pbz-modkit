@@ -2,12 +2,13 @@
 #define UNICODE
 #define _UNICODE
 // modman.cpp: Mod 管理器. Sits next to version.dll (platform\steam\), lists the mods in pbzmp\ (one
-// <name>.dll each, optional <name>.txt info) and writes the checked ones to pbzmp\autorun.txt, which the
-// loader reads once at game start. No install, no runtime: one exe.
+// folder pbzmp\<id>\ each with <id>.dll and optional <id>.txt info) and writes the checked ones to
+// pbzmp\autorun.txt, which the loader reads once at game start. No install, no runtime: one exe.
 // <name>.txt (UTF-8, key=value per line, all optional):
 //   name=显示名  desc=一句话说明  version=1.0  author=...  hidden=1 (framework module, not listed)
 //   requires=a,b>=1.2   conflicts=c,d   api=1 (loader host API it needs)   mp=allow|block (online play)
-// A mod is pbzmp\<id>.dll or pbzmp\<id>\<id>.dll (own folder). Use a namespaced id (author.name).
+// A mod is pbzmp\<id>\<id>.dll (own folder, wins like in the loader) or legacy flat pbzmp\<id>.dll
+// (info then in pbzmp\<id>.txt). Use a namespaced id (author.name).
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -25,7 +26,7 @@
 struct Req { std::wstring id, minVer; };
 struct Mod { std::wstring id, name, desc, version, author, dir; std::vector<Req> req; std::vector<std::wstring> conflicts;
              int api = 0; bool mpBlock = false, hidden = false, on = false; };
-constexpr int kHostApi = 2;  // main.cpp kHostApi
+constexpr int kHostApi = 3;  // main.cpp kHostApi
 static std::wstring g_loaderNote;  // set when version.dll is not our loader
 static std::wstring g_dir;          // <exe dir>pbzmp (with a trailing backslash)
 static std::vector<Mod> g_mods;     // listed (not hidden) mods, list view order
@@ -92,6 +93,23 @@ static bool ChainForeign(const std::wstring& exeDir, std::wstring* msg) {
     *msg = L"已把原 version.dll 改名为 version_chain.dll。\n现在把 Mod 包里的 version.dll 复制回这里即可两个都生效。";
     return true;
 }
+// An older package kept every mod's files flat in pbzmp\. Once the new pbzmp\<id>\<id>.dll is unpacked
+// over it, move the user's files for that mod into its folder (only when the folder has none yet).
+// Nothing is deleted; the stale flat dll / txt are left alone (the loader prefers the folder).
+static void MigrateFlat() {
+    static const wchar_t* kMove[][3] = {  // mod id, old name in pbzmp\, new name in the mod's folder
+        {L"mp", L"mp_settings.txt", L"mp_settings.txt"},
+        {L"mp", L"mp_session.txt", L"mp_session.txt"},
+        {L"sniper", L"sniper_cache", L"cache"},
+        {L"sniper", L"sniper.ini", L"sniper.ini"},
+    };
+    for (auto& e : kMove) {
+        std::wstring mod = g_dir + e[0] + L"\\", from = g_dir + e[1], to = mod + e[2];
+        if (GetFileAttributesW((mod + e[0] + L".dll").c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES || GetFileAttributesW(to.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        MoveFileW(from.c_str(), to.c_str());  // same volume: a rename, folders included
+    }
+}
 static void Scan() {
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring d = exe; d = d.substr(0, d.find_last_of(L'\\') + 1); g_dir = d + L"pbzmp\\";
@@ -109,9 +127,12 @@ static void Scan() {
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+    // the same id in both places: the own folder wins, like the loader
+    std::stable_partition(found.begin(), found.end(), [](auto& f) { return f.second != g_dir; });
+    MigrateFlat();
     {
         for (auto& [id, dir] : found) {
-            if (Find(id)) continue;  // the same id in both places: the loose dll wins, like the loader
+            if (Find(id)) continue;
             Mod m; m.id = m.name = id; m.dir = dir;
             for (auto& l : Lines(dir + id + L".txt")) {
                 size_t e = l.find(L'='); if (e == std::wstring::npos) continue;
@@ -201,7 +222,7 @@ static bool GameRunning() {
 }
 
 static void ShowInfo(int i) {
-    if (i < 0 || i >= int(g_mods.size())) { SetWindowTextW(g_info, L"勾选要启用的 Mod，然后点「保存」。新 Mod 放进 pbzmp 文件夹即可出现在列表里。"); return; }
+    if (i < 0 || i >= int(g_mods.size())) { SetWindowTextW(g_info, L"勾选要启用的 Mod，然后点「保存」。新 Mod 的文件夹放进 pbzmp 即可出现在列表里。"); return; }
     auto& m = g_mods[i];
     std::wstring t = m.name + (m.version.empty() ? L"" : L"  v" + m.version) + (m.author.empty() ? L"" : L"  作者 " + m.author);
     t += L"\r\n" + (m.desc.empty() ? L"（没有说明）" : m.desc);
@@ -266,7 +287,7 @@ static LRESULT CALLBACK Wnd(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         Scan(); Fill(); ShowInfo(-1);
         if (GetFileAttributesW(g_dir.c_str()) == INVALID_FILE_ATTRIBUTES)
             MessageBoxW(w, (L"没找到 Mod 文件夹：\n" + g_dir + L"\n\n请把 Mod管理器.exe 放在游戏的 platform\\steam 文件夹里（和 PBZ.exe、version.dll 同一层）。").c_str(), L"Mod管理器", MB_ICONWARNING);
-        else if (g_mods.empty()) SetWindowTextW(g_info, L"pbzmp 文件夹里还没有 Mod。把 Mod 的 dll 放进去后重新打开管理器。");
+        else if (g_mods.empty()) SetWindowTextW(g_info, L"pbzmp 文件夹里还没有 Mod。把 Mod 的文件夹（里面有同名 dll）放进去后重新打开管理器。");
         if (!g_loaderNote.empty()) {
             std::wstring exeDir = g_dir.substr(0, g_dir.size() - 6);
             bool foreign = GetFileAttributesW((exeDir + L"version.dll").c_str()) != INVALID_FILE_ATTRIBUTES;

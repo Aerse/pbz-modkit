@@ -1,23 +1,21 @@
 // outfits: lobby outfit list and wearing outfits in a match (see outfits.h). Visual only.
-// PBZAppearanceComponent (sdk.txt:48623; the player class has BP_AppearanceComp, a subclass):
-//   +0xc8 DoPBZAppearanceLogic, +0xc9 bSuppressAppearanceSave, +0xcc CharacterId,
-//   +0x130 DefaultVisualOutfitID, +0x188 bUseConfiguredAppearance, +0x18c ConfiguredOutfit,
-//   +0x278 CurrentOutfit, +0x288 CurrentSkinColor (EPBZSkinColor: Black, GrayWhite, White,
-//   PureWhite), +0x28a bAppliedHatVisible, +0x2e4 CachedOutfit (BeginSuppress's copy).
+// PBZAppearanceComponent (the player class has BP_AppearanceComp, a subclass): DoPBZAppearanceLogic,
+//   bSuppressAppearanceSave, CharacterId, DefaultVisualOutfitID, bUseConfiguredAppearance,
+//   ConfiguredOutfit, CurrentOutfit, CurrentSkinColor (EPBZSkinColor: Black, GrayWhite, White,
+//   PureWhite), bAppliedHatVisible, CachedOutfit (BeginSuppress's copy). Fields by name (kComp*).
 // ApplyOutfitVisual(OutfitID, bShowHat, SkinColor, bForceApplyMeshes): needs a type-4 row (found
-// by ItemId), never saves; writes +0x28a and +0x288, and +0x278 only while +0xc8 is clear; without
-// bForceApplyMeshes it skips the meshes when the id is +0x130. Hair changes only with the cvar
-// pbz.appearance.ApplyOutfitVisualHair (default 0).
-// The wardrobe is saved only with +0xc8 set, +0xc9 clear and a CharacterId (PreSaveGame skips the
-// appearance while +0xc9 is set). BeginSuppressAppearanceSave caches outfit/skin/hat/owned and
-// sets +0xc9; it does not nest (a second Begin overwrites the cache, any End ends it).
+// by ItemId), never saves; writes bAppliedHatVisible and CurrentSkinColor, and CurrentOutfit only
+// while DoPBZAppearanceLogic is clear; without bForceApplyMeshes it skips the meshes when the id is
+// DefaultVisualOutfitID. Hair changes only with the cvar pbz.appearance.ApplyOutfitVisualHair (default 0).
+// The wardrobe is saved only with DoPBZAppearanceLogic set, bSuppressAppearanceSave clear and a
+// CharacterId (PreSaveGame skips the appearance while bSuppressAppearanceSave is set).
+// BeginSuppressAppearanceSave caches outfit/skin/hat/owned and sets bSuppressAppearanceSave; it does
+// not nest (a second Begin overwrites the cache, any End ends it).
 // EndSuppressAppearanceSave(false) puts the cache back and applies it, without saving.
-// DT_PBZAppearanceTable RowMap at UDataTable +0x30, a TSet<TPair<FName, uint8*>> (TSparseArray):
-//   data +0x0, num +0x8, max +0xc, allocation bits inline +0x10 / heap +0x20 (if not null),
-//   num bits +0x28, first free +0x30, num free +0x34; element 0x18: key FName +0x0, row +0x8.
-// Row = PBZAppearanceStruct : ItemDataBase (sdk.txt:101164): ItemId +0x8, AppearanceType +0xd8
-//   (Outfit = 4), BodyMeshAsset package FName +0xe8 / asset +0xf0, bDefaultHatHidden +0x2a8,
-//   bObtainableInGame +0x2a9. All found offline (dump, disassembly): Probe shows the real thing.
+// DT_PBZAppearanceTable RowMap (native, not reflected): a TSet<TPair<FName, uint8*>> (TSparseArray),
+//   layout in the kSet* constants; element: key FName, row pointer.
+// Row = PBZAppearanceStruct : ItemDataBase: ItemId, AppearanceType (Outfit = 4), BodyMeshAsset,
+//   bDefaultHatHidden, bObtainableInGame (kRow*). Probe shows the real thing.
 #include "outfits.h"
 #include <chrono>
 #include <cstdarg>
@@ -52,6 +50,32 @@ std::map<std::string, std::wstring> g_icons;  // card id -> texture path
 bool g_named;                                 // names and icons read from the table
 const wchar_t* kTable = L"/Game/PBZContent/DataTable/UI/DT_PBZAppearanceTable.DT_PBZAppearanceTable";
 
+// reflected fields (by name; the number is this build's offset, used only if the field is gone)
+constexpr const wchar_t* kComp = L"Class /Script/ProjectPBZ.PBZAppearanceComponent";
+uex::Prop kCompLogic{kComp, L"DoPBZAppearanceLogic", 0xc8, 0xff}, kCompSuppress{kComp, L"bSuppressAppearanceSave", 0xc9, 0xff},
+    kCompCharId{kComp, L"CharacterId", 0xcc}, kCompDefault{kComp, L"DefaultOutfitID", 0x128},
+    kCompDefaultVisual{kComp, L"DefaultVisualOutfitID", 0x130}, kCompUseCfg{kComp, L"bUseConfiguredAppearance", 0x188, 0xff},
+    kCompCfg{kComp, L"ConfiguredOutfit", 0x18c}, kCompCurrent{kComp, L"CurrentOutfit", 0x278},
+    kCompSkin{kComp, L"CurrentSkinColor", 0x288}, kCompHat{kComp, L"bAppliedHatVisible", 0x28a, 0xff},
+    kCompCached{kComp, L"CachedOutfit", 0x2e4};
+uex::Prop kRowStruct{L"Class /Script/Engine.DataTable", L"RowStruct", 0x28};
+uex::Prop kItemId{L"ScriptStruct /Script/ProjectPBZ.ItemDataBase", L"ItemId", 0x8};
+constexpr const wchar_t* kRow = L"ScriptStruct /Script/ProjectPBZ.PBZAppearanceStruct";
+uex::Prop kRowName{kRow, L"AppearanceName", 0x28}, kRowTexture{kRow, L"AppearanceTexture", 0x88},
+    kRowHiTexture{kRow, L"HighPrecisionTexture", 0xb0}, kRowType{kRow, L"AppearanceType", 0xd8},
+    kRowBody{kRow, L"BodyMeshAsset", 0xe0}, kRowCloth{kRow, L"ClothMeshAsset", 0x108}, kRowHat{kRow, L"HatAsset", 0x140},
+    kRowHead{kRow, L"HeadAsset", 0x170}, kRowNeck{kRow, L"NeckAsset", 0x1f0}, kRowBand{kRow, L"MeshBandAsset", 0x218},
+    kRowBrow{kRow, L"BrowLashCardAsset", 0x240}, kRowBodyItem{kRow, L"OutfitBodyItem", 0x268},
+    kRowHatHidden{kRow, L"bDefaultHatHidden", 0x2a8, 0xff}, kRowObtainable{kRow, L"bObtainableInGame", 0x2a9, 0xff};
+uex::Prop kValueCache{L"ScriptStruct /Script/ProjectPBZ.FlowLocText", L"ValueCache", 0x20};
+constexpr int kOutfitItems = 8;  // OutfitBodyItem .. OutfitBrowLashCardItem: 8 consecutive FNames
+// engine / native layouts (not reflected properties: change only with the engine version)
+constexpr int kRowMap = 0x30;    // UDataTable::RowMap (native TMap<FName, uint8*>)
+constexpr int kSetNum = 0x8, kSetMax = 0xc, kSetBitsInline = 0x10, kSetBitsHeap = 0x20, kSetNumBits = 0x28,
+    kSetNumFree = 0x34;          // TSet / TSparseArray: data +0, num, max, allocation bits, num bits, num free
+constexpr int kRowStride = 0x18, kRowPtr = 0x8;   // TMap<FName, uint8*> element: key +0, row pointer
+constexpr int kSoftPkg = 0x8, kSoftAsset = 0x10;  // TSoftObjectPtr: weak ptr +0, FSoftObjectPath package / asset FName
+
 double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 uex::Ref g_dt;                        // the appearance table
@@ -71,16 +95,16 @@ UObject* Table() {
 
 // every row: f(key, row); false if the RowMap does not look like one
 template <class F> bool Rows(UObject* dt, F f) {
-    auto m = reinterpret_cast<uint8_t*>(dt) + 0x30;
+    auto m = reinterpret_cast<uint8_t*>(dt) + kRowMap;
     auto data = At<uint8_t*>(m, 0x0);
-    int num = At<int32_t>(m, 0x8), max = At<int32_t>(m, 0xc), nbits = At<int32_t>(m, 0x28), nfree = At<int32_t>(m, 0x34);
+    int num = At<int32_t>(m, kSetNum), max = At<int32_t>(m, kSetMax), nbits = At<int32_t>(m, kSetNumBits), nfree = At<int32_t>(m, kSetNumFree);
     if (num < 0 || num > 4096 || max < num || (num && !data) || nfree < 0 || nfree > num) return false;
-    auto bits = At<const uint32_t*>(m, 0x20);
-    if (!bits) bits = reinterpret_cast<const uint32_t*>(m + 0x10);
+    auto bits = At<const uint32_t*>(m, kSetBitsHeap);
+    if (!bits) bits = reinterpret_cast<const uint32_t*>(m + kSetBitsInline);
     for (int k = 0; k < num; ++k) {
         if (nfree && (k >= nbits || !((bits[k >> 5] >> (k & 31)) & 1))) continue;  // a hole
-        auto e = data + size_t(k) * 0x18;
-        if (auto row = At<uint8_t*>(e, 8)) f(*reinterpret_cast<const FName*>(e), row);
+        auto e = data + size_t(k) * kRowStride;
+        if (auto row = At<uint8_t*>(e, kRowPtr)) f(*reinterpret_cast<const FName*>(e), row);
     }
     return true;
 }
@@ -93,8 +117,8 @@ bool FindOutfit(const std::wstring& id, FName* out) {
     if (g_bad.count(id)) return false;
     bool found = false;
     Rows(dt, [&](const FName&, uint8_t* row) {
-        if (found || row[0xd8] != 4 || !NameIs(*reinterpret_cast<const FName*>(row + 8), id)) return;
-        *out = *reinterpret_cast<const FName*>(row + 8); found = true;
+        if (found || kRowType.Of<uint8_t>(row) != 4 || !NameIs(kItemId.Of<FName>(row), id)) return;
+        *out = kItemId.Of<FName>(row); found = true;
     });
     if (found) g_ids[id] = *out;
     else { if (g_bad.size() >= 64) g_bad.clear(); g_bad.insert(id); }
@@ -125,11 +149,11 @@ bool HatHidden(UObject* c, const FName& id) {
     return p.Get<bool>(L"ReturnValue");
 }
 FName NameFn(UObject* c, const wchar_t* fn) { Params p(uex::Fn(c, fn)); p.Call(c); return p.Get<FName>(L"ReturnValue"); }
-bool Suppressed(UObject* c) { return At<uint8_t>(c, 0xc9) != 0; }
+bool Suppressed(UObject* c) { return kCompSuppress.Bit(c); }
 // the outfit it shows now: GetEffectiveOutfit, else CurrentOutfit, else the defaults
 FName Shown(UObject* c) {
     FName n = NameFn(c, L"GetEffectiveOutfit");
-    for (int off : {0x278, 0x128, 0x130}) if (!n.comparison) n = At<FName>(c, off);
+    for (int off : {int(kCompCurrent), int(kCompDefault), int(kCompDefaultVisual)}) if (!n.comparison) n = At<FName>(c, off);
     return n;
 }
 UObject* Ent() {  // PBZEntitlementSubsystem (game instance)
@@ -155,17 +179,18 @@ bool Allowed(UObject* c, const FName& fid) {
 }
 
 // ---- lobby cards ----
-// TSoftObjectPtr: package FName +8, asset +0x10 -> "/Pkg/Path.Asset", "" if unset
+// TSoftObjectPtr -> "/Pkg/Path.Asset", "" if unset
 std::wstring SoftPath(const uint8_t* p) {
-    auto pkg = NameOf(*reinterpret_cast<const FName*>(p + 8));
-    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + NameOf(*reinterpret_cast<const FName*>(p + 0x10));
+    auto pkg = NameOf(*reinterpret_cast<const FName*>(p + kSoftPkg));
+    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + NameOf(*reinterpret_cast<const FName*>(p + kSoftAsset));
 }
-// a row's AppearanceName (FlowLocText +0x28, its FText +0x20), "" if none or a key. Once per row (the FString leaks)
+// a row's AppearanceName (FlowLocText, its ValueCache FText), "" if none or a key. Once per row (the FString leaks)
 std::wstring RowName(const uint8_t* row) {
     auto lib = uex::Lib(L"KismetTextLibrary /Script/Engine.Default__KismetTextLibrary");
     auto conv = uex::Fn(lib, L"Conv_TextToString");
-    if (!conv || !At<void*>(row, 0x48)) return L"";
-    Params b(conv); b.Set(L"InText", *reinterpret_cast<const uex::FText*>(row + 0x48)); b.Call(lib);
+    int name = kRowName + kValueCache;
+    if (!conv || !At<void*>(row, name)) return L"";
+    Params b(conv); b.Set(L"InText", *reinterpret_cast<const uex::FText*>(row + name)); b.Call(lib);
     auto t = b.Get<FString>(L"ReturnValue");
     std::wstring l; if (t.data && t.num > 1) l.assign(t.data, t.num - 1);
     return l.find(L'_') == std::wstring::npos ? l : L"";
@@ -182,19 +207,19 @@ void LoadNames() {
     g_named = true;
     std::map<std::wstring, uint8_t*> outfitRows, allRows;  // ItemId -> row (the first one wins)
     Rows(dt, [&](const FName&, uint8_t* row) {
-        auto id = NameOf(*reinterpret_cast<const FName*>(row + 8));
-        allRows.emplace(id, row); if (row[0xd8] == 4) outfitRows.emplace(id, row);
+        auto id = NameOf(kItemId.Of<FName>(row));
+        allRows.emplace(id, row); if (kRowType.Of<uint8_t>(row) == 4) outfitRows.emplace(id, row);
     });
     for (auto& c : g_cards) {
         auto it = outfitRows.find(uex::Wide(c.id)); if (it == outfitRows.end()) continue;
         auto row = it->second;
-        auto body = allRows.find(NameOf(At<FName>(row, 0x268)));  // OutfitBodyItem
+        auto body = allRows.find(NameOf(kRowBodyItem.Of<FName>(row)));
         const wchar_t* src = L"built-in";
         if (auto n = RowName(row); !n.empty()) { c.label = n; src = L"outfit row"; }
         else if (body != allRows.end()) { if (auto n2 = RowName(body->second); !n2.empty()) { c.label = n2; src = L"body row"; } }
-        std::wstring icon = SoftPath(row + 0x88);                       // AppearanceTexture
-        if (icon.empty()) icon = SoftPath(row + 0xb0);                  // HighPrecisionTexture
-        if (icon.empty() && body != allRows.end()) icon = SoftPath(body->second + 0x88);
+        std::wstring icon = SoftPath(row + kRowTexture);
+        if (icon.empty()) icon = SoftPath(row + kRowHiTexture);
+        if (icon.empty() && body != allRows.end()) icon = SoftPath(body->second + kRowTexture);
         if (!icon.empty()) g_icons[c.id] = icon;
         uex::Log(L"outfits: card %S %s (%s) icon %s", c.id.c_str(), c.label.c_str(), src, icon.empty() ? L"-" : icon.c_str());
     }
@@ -239,18 +264,18 @@ void Preload(const FName& id) {
     auto dt = Table(); if (!dt) return;
     FName items[9] = {id};
     Rows(dt, [&](const FName&, uint8_t* row) {
-        auto& rid = *reinterpret_cast<const FName*>(row + 8);
+        auto& rid = kItemId.Of<const FName>(row);
         if (rid.comparison == id.comparison && rid.number == id.number)
-            for (int i = 0; i < 8; ++i) items[i + 1] = At<FName>(row, 0x268 + 8 * i);  // Outfit*Item
+            for (int i = 0; i < kOutfitItems; ++i) items[i + 1] = At<FName>(row, kRowBodyItem + 8 * i);  // Outfit*Item
     });
     Rows(dt, [&](const FName&, uint8_t* row) {
-        auto& rid = *reinterpret_cast<const FName*>(row + 8);
+        auto& rid = kItemId.Of<const FName>(row);
         bool want = false;
         for (auto& n : items) if (n.comparison && n.comparison == rid.comparison && n.number == rid.number) want = true;
         if (!want) return;
-        // TSoftObjectPtr<SkeletalMesh> (0x28): weak ptr +0, FSoftObjectPath package FName +8, asset +0x10
-        for (int off : {0xe0, 0x108, 0x140, 0x170, 0x1f0, 0x218, 0x240}) {
-            auto pkg = At<FName>(row, off + 8), asset = At<FName>(row, off + 0x10);
+        // the TSoftObjectPtr<SkeletalMesh> fields
+        for (int off : {int(kRowBody), int(kRowCloth), int(kRowHat), int(kRowHead), int(kRowNeck), int(kRowBand), int(kRowBrow)}) {
+            auto pkg = At<FName>(row, off + kSoftPkg), asset = At<FName>(row, off + kSoftAsset);
             if (!pkg.comparison || !asset.comparison) continue;
             auto p = NameOf(pkg), a = NameOf(asset);
             if (p.size() > 1 && p[0] == L'/' && !a.empty()) uex::LoadAsset((p + L"." + a).c_str());
@@ -274,9 +299,9 @@ const wchar_t* W(const std::wstring& s) { return s.c_str(); }
 void CompInfo(std::wstring* out, const wchar_t* who, UObject* c) {
     if (!c) { Add(out, L"%s: no appearance component", who); return; }
     Add(out, L"%s: %s logic %d suppressed %d char %s current %s effective %s skin %d hat %d useCfg %d cfg %s cached %s",
-        who, W(NameOf(c->cls)), At<uint8_t>(c, 0xc8), At<uint8_t>(c, 0xc9), W(NameOf(At<FName>(c, 0xcc))),
-        W(NameOf(At<FName>(c, 0x278))), W(NameOf(NameFn(c, L"GetEffectiveOutfit"))), At<uint8_t>(c, 0x288),
-        At<uint8_t>(c, 0x28a), At<uint8_t>(c, 0x188), W(NameOf(At<FName>(c, 0x18c))), W(NameOf(At<FName>(c, 0x2e4))));
+        who, W(NameOf(c->cls)), kCompLogic.Of<uint8_t>(c), kCompSuppress.Of<uint8_t>(c), W(NameOf(kCompCharId.Of<FName>(c))),
+        W(NameOf(kCompCurrent.Of<FName>(c))), W(NameOf(NameFn(c, L"GetEffectiveOutfit"))), kCompSkin.Of<uint8_t>(c),
+        kCompHat.Of<uint8_t>(c), kCompUseCfg.Of<uint8_t>(c), W(NameOf(kCompCfg.Of<FName>(c))), W(NameOf(kCompCached.Of<FName>(c))));
 }
 }  // namespace
 
@@ -307,16 +332,17 @@ int Probe(std::wstring* out) {
             }
         auto dt = Table();
         if (!dt) { Add(out, L"no table %s", kTable); return -1; }
-        auto m = reinterpret_cast<uint8_t*>(dt) + 0x30;
-        Add(out, L"table %s rowstruct %s rows %d max %d free %d", W(PathOf(dt)), W(NameOf(At<UObject*>(dt, 0x28))),
-            At<int32_t>(m, 0x8), At<int32_t>(m, 0xc), At<int32_t>(m, 0x34));
+        auto m = reinterpret_cast<uint8_t*>(dt) + kRowMap;
+        Add(out, L"table %s rowstruct %s rows %d max %d free %d", W(PathOf(dt)), W(NameOf(kRowStruct.Of<UObject*>(dt))),
+            At<int32_t>(m, kSetNum), At<int32_t>(m, kSetMax), At<int32_t>(m, kSetNumFree));
         auto ent = Ent(); int n = 0;
         bool ok = Rows(dt, [&](const FName& key, uint8_t* row) {
-            FName id = *reinterpret_cast<const FName*>(row + 8);
-            std::wstring s = L"row " + NameOf(key) + L" id " + NameOf(id) + L" type " + std::to_wstring(row[0xd8]) +
-                L" obtainable " + std::to_wstring(row[0x2a9]) + L" hatHidden " + std::to_wstring(row[0x2a8]) +
-                L" body " + NameOf(At<FName>(row, 0xe8)) + L"." + NameOf(At<FName>(row, 0xf0));
-            if (row[0xd8] == 4) {
+            FName id = kItemId.Of<FName>(row);
+            uint8_t type = kRowType.Of<uint8_t>(row);
+            std::wstring s = L"row " + NameOf(key) + L" id " + NameOf(id) + L" type " + std::to_wstring(type) +
+                L" obtainable " + std::to_wstring(kRowObtainable.Of<uint8_t>(row)) + L" hatHidden " + std::to_wstring(kRowHatHidden.Of<uint8_t>(row)) +
+                L" body " + NameOf(At<FName>(row, kRowBody + kSoftPkg)) + L"." + NameOf(At<FName>(row, kRowBody + kSoftAsset));
+            if (type == 4) {
                 if (ent) {
                     Params e(uex::Fn(ent, L"IsEntitlementOutfit")); e.Set(L"OutfitID", id); e.Call(ent);
                     Params st(uex::Fn(ent, L"GetOutfitState")); st.Set(L"OutfitID", id); st.Call(ent);
@@ -368,7 +394,7 @@ void Wear(UObject* pawn, const std::wstring& id) {
             return;
         }
         if (c != held) {  // first change to this component: remember its look, keep the wardrobe from saving
-            g_origOutfit = Shown(c); g_origSkin = At<uint8_t>(c, 0x288); g_origHat = At<uint8_t>(c, 0x28a) != 0;
+            g_origOutfit = Shown(c); g_origSkin = kCompSkin.Of<uint8_t>(c); g_origHat = kCompHat.Bit(c);
             g_begun = !Suppressed(c);
             if (g_begun) BeginSuppress(c);
             g_pawn = uex::Hold(pawn); g_comp = uex::Hold(c); g_world = uex::World();
@@ -456,8 +482,8 @@ std::string Event() {
         auto c = AppComp(uex::Me()); if (!c) return "";
         auto id = uex::Utf8(NameOf(Shown(c)));
         if (!ValidId(id) || id == "None") return "";
-        int skin = At<uint8_t>(c, 0x288); if (skin > 3) skin = 0;
-        return "O " + id + " " + std::to_string(skin) + (At<uint8_t>(c, 0x28a) ? " 1" : " 0");
+        int skin = kCompSkin.Of<uint8_t>(c); if (skin > 3) skin = 0;
+        return "O " + id + " " + std::to_string(skin) + (kCompHat.Bit(c) ? " 1" : " 0");
     } catch (...) { return ""; }
 }
 

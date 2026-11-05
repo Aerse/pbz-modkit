@@ -55,6 +55,34 @@ const std::map<std::wstring, std::wstring> kGaKey = {
     {L"JadeDualChakram", L"Jade"}, {L"Jigsaw", L"JigSaw"}, {L"ChaosBlade", L"Chaos"}, {L"ZiMingJian", L"ZiMingJian_New"},
 };
 
+// reflected fields (by name; the number is this build's offset, used only if the field is gone)
+constexpr const wchar_t* kBp = L"Class /Script/ProjectPBZ.PBZBackPackSubsystem";
+uex::Prop kMainWeapons{kBp, L"MainWeapons", 0x708}, kShaqiWeapons{kBp, L"ShaqiWeapons", 0x770},
+    kCurWeapon{kBp, L"CurrentWeaponIndex", 0x6f8}, kCurShaqi{kBp, L"CurrentShaqiWeaponIndex", 0x768},
+    kMainInfos{kBp, L"MainWeaponInfos", 0x718}, kShaqiInfos{kBp, L"ShaqiWeaponInfos", 0x780};
+uex::Prop kRuntimeData{L"Class /Script/SGameCombatSystem.CharacterWeaponsComponent", L"RuntimeWeaponData", 0xf8};
+uex::Prop kSlotWeapons{L"ScriptStruct /Script/SGameCombatSystem.RuntimeWeaponSlotData", L"Weapons", 0};
+uex::Prop kSingleConfig{L"ScriptStruct /Script/SGameCombatSystem.RuntimeWeaponSingleData", L"WeaponConfig", 0};
+int SingleSize() { return uex::StructSize(L"ScriptStruct /Script/SGameCombatSystem.RuntimeWeaponSingleData", 0x120); }
+uex::Prop kItemId{L"ScriptStruct /Script/ProjectPBZ.ItemDataBase", L"ItemId", 0x8};
+uex::Prop kWeaponConfig{L"ScriptStruct /Script/ProjectPBZ.WeaponData", L"WeaponConfig", 0x520};
+constexpr const wchar_t* kEdgeRow = L"ScriptStruct /Script/ProjectPBZ.ShaqiWeaponData";
+uex::Prop kEdgeName{kEdgeRow, L"WeaponName", 0x30}, kEdgeIcon{kEdgeRow, L"Icon", 0x60}, kEdgeWhite{kEdgeRow, L"WhiteIcon", 0xb0},
+    kEdgeRender{kEdgeRow, L"RenderIcon", 0x128}, kEdgeConfig{kEdgeRow, L"WeaponConfig", 0x5f8};
+uex::Prop kValueCache{L"ScriptStruct /Script/ProjectPBZ.FlowLocText", L"ValueCache", 0x20};
+uex::Prop kEdgeRedPoint{L"Class /Script/ProjectPBZ.ShaqiWeaponInfo", L"bHasUIRedPoint", 0x49, 0xff};
+constexpr int kMainRedPoint = 0x49;      // MainWeaponInfo: no reflected red point field, the same byte as ShaqiWeaponInfo's
+// engine / native layouts (not reflected properties: change only with the engine version)
+constexpr int kRowMap = 0x30;            // UDataTable::RowMap (native TMap<FName, uint8*>)
+constexpr int kNameMapStride = 0x18;     // TMap<FName, ptr> element: key +0, value +8
+constexpr int kNameMapValue = 0x8;
+constexpr int kTagMapStride = 0x30;      // TMap<GameplayTag, RuntimeWeaponSlotData> element: key +0, value +8
+constexpr int kTagMapValue = 0x8;
+constexpr int kSetBitsInline = 0x10, kSetBitsHeap = 0x20, kSetNumBits = 0x28, kArrNum = 0x8;  // TSet / TSparseArray
+constexpr int kSoftPkg = 0x8, kSoftAsset = 0x10;  // TSoftObjectPtr: FSoftObjectPath package / asset FName
+constexpr int kInfoData = 0x28, kInfoLen = 0x28;  // *WeaponInfo: everything after the UObject header (0x50 objects, no pointers)
+constexpr int kConfigIface = 0x30;       // PBZ_WeaponConfigBase: native interface pointer (before its first property)
+
 bool g_saved;                      // backpack snapshot taken (first Equip of a match)
 std::vector<FName> g_origSlots;    // PBZBackPackSubsystem::MainWeapons
 bool g_edgeSaved;                  // Phantom Edge snapshot taken (first EquipEdge of a match)
@@ -68,14 +96,14 @@ UObject* Backpack() {
     Params g(uex::Fn(lib, L"GetWorldSubsystem")); g.Set(L"ContextObject", me); g.Set(L"Class", cls); g.Call(lib);
     return g.Get<UObject*>(L"ReturnValue");
 }
-Arr MainSlots(UObject* bp) { return *reinterpret_cast<Arr*>(reinterpret_cast<uint8_t*>(bp) + 0x708); }
-Arr EdgeSlots(UObject* bp) { return *reinterpret_cast<Arr*>(reinterpret_cast<uint8_t*>(bp) + 0x770); }  // ShaqiWeapons: 2 slots, None = empty
+Arr MainSlots(UObject* bp) { return kMainWeapons.Of<Arr>(bp); }
+Arr EdgeSlots(UObject* bp) { return kShaqiWeapons.Of<Arr>(bp); }  // 2 slots, None = empty
 bool Same(const FName& a, const FName& b) { return a.comparison == b.comparison && a.number == b.number; }
 bool IsNone(const FName& n) { return !n.comparison && !n.number; }
-// soft object pointer (package FName +8, asset FName +0x10) -> "/Pkg/Path.Asset", "" if unset
+// soft object pointer -> "/Pkg/Path.Asset", "" if unset
 std::wstring Soft(const uint8_t* p) {
-    auto pkg = NameOf(*reinterpret_cast<const FName*>(p + 8));
-    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + NameOf(*reinterpret_cast<const FName*>(p + 0x10));
+    auto pkg = NameOf(*reinterpret_cast<const FName*>(p + kSoftPkg));
+    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + NameOf(*reinterpret_cast<const FName*>(p + kSoftAsset));
 }
 
 // CharacterWeaponsComponent of an actor (outer == actor), cached per actor
@@ -90,16 +118,17 @@ UObject* WComp(UObject* ch) {
     }
     return nullptr;
 }
-// RuntimeWeaponData (TMap<GameplayTag, ...> at +0xf8, element stride 0x30): the key of a slot
-// (Weapon.Slot.Main / .Shachi), its weapons array at element +8
+// RuntimeWeaponData (TMap<GameplayTag, RuntimeWeaponSlotData>): the key of a slot
+// (Weapon.Slot.Main / .Shachi), its Weapons array
 bool SlotTag(UObject* comp, const wchar_t* name, FName& tag, int* count = nullptr, Arr* weapons = nullptr) {
-    auto m = *reinterpret_cast<Arr*>(reinterpret_cast<uint8_t*>(comp) + 0xf8);
+    auto m = kRuntimeData.Of<Arr>(comp);
     for (int k = 0; m.d && k < m.n && k < 16; ++k) {
-        auto e = m.d + k * 0x30;
+        auto e = m.d + k * kTagMapStride;
         if (NameIs(*reinterpret_cast<FName*>(e), name)) {
             tag = *reinterpret_cast<FName*>(e);
-            if (count) *count = reinterpret_cast<Arr*>(e + 8)->n;
-            if (weapons) *weapons = *reinterpret_cast<Arr*>(e + 8);  // RuntimeWeaponSingleData, stride 0x120, config object at +0
+            auto& w = kSlotWeapons.Of<Arr>(e + kTagMapValue);  // of RuntimeWeaponSingleData (config object first)
+            if (count) *count = w.n;
+            if (weapons) *weapons = w;
             return true;
         }
     }
@@ -123,21 +152,21 @@ std::wstring ConfigPath(const std::string& id) {
     if (auto it = cache.find(id); it != cache.end()) return it->second;
     auto dt = FindObject(L"DataTable /Game/PBZContent/DataTable/UI/DT_WeaponData.DT_WeaponData");
     if (!dt) return L"";
-    auto rm = *reinterpret_cast<Arr*>(reinterpret_cast<uint8_t*>(dt) + 0x30);
+    auto rm = At<Arr>(dt, kRowMap);
     std::wstring want = uex::Wide(id);
     for (int k = 0; k < rm.n; ++k) {
-        auto e = rm.d + k * 0x18;
-        auto row = At<uint8_t*>(e, 8);
-        if (!row || !NameIs(*reinterpret_cast<FName*>(row + 8), want)) continue;  // ItemId (row keys are display names)
-        auto pkg = NameOf(*reinterpret_cast<FName*>(row + 0x520 + 0x8));
-        auto asset = NameOf(*reinterpret_cast<FName*>(row + 0x520 + 0x10));
+        auto e = rm.d + k * kNameMapStride;
+        auto row = At<uint8_t*>(e, kNameMapValue);
+        if (!row || !NameIs(kItemId.Of<FName>(row), want)) continue;  // ItemId (row keys are display names)
+        auto pkg = NameOf(At<FName>(row, kWeaponConfig + kSoftPkg));
+        auto asset = NameOf(At<FName>(row, kWeaponConfig + kSoftAsset));
         return cache[id] = pkg.empty() ? L"" : pkg + L"." + asset;
     }
     return cache[id] = L"";
 }
 
-// Phantom Edges: DT_ShaqiWeaponData rows (ItemId +8, WeaponName.ValueCache FText +0x50, Icon +0x60,
-// WhiteIcon +0xb0, RenderIcon +0x128, WeaponConfig soft +0x5f8)
+// Phantom Edges: DT_ShaqiWeaponData rows (ShaqiWeaponData: ItemId, WeaponName.ValueCache FText, Icon,
+// WhiteIcon, RenderIcon, WeaponConfig soft pointer)
 struct EdgeRow { FName id; std::wstring cfg, icon; bool pick; };
 std::map<std::string, EdgeRow> g_edgeRows;   // ItemId -> row (also _Interact / Placeholder ones: not picks)
 std::vector<Weapon> g_edges = {{"", L"当前装备"}};
@@ -152,23 +181,24 @@ void LoadEdges() {
     auto dt = FindObject(std::wstring(L"DataTable ") + path);
     if (!dt && !loadTried) { loadTried = true; dt = uex::LoadAsset(path); }
     if (!dt) return;
-    auto rm = *reinterpret_cast<Arr*>(reinterpret_cast<uint8_t*>(dt) + 0x30);
+    auto rm = At<Arr>(dt, kRowMap);
     auto lib = uex::Lib(L"KismetTextLibrary /Script/Engine.Default__KismetTextLibrary");
     auto conv = uex::Fn(lib, L"Conv_TextToString");
     for (int k = 0; k < rm.n && k < 256; ++k) {
-        auto e = rm.d + k * 0x18; auto row = At<uint8_t*>(e, 8); if (!row) continue;
-        FName idn = *reinterpret_cast<FName*>(row + 8);
+        auto e = rm.d + k * kNameMapStride; auto row = At<uint8_t*>(e, kNameMapValue); if (!row) continue;
+        FName idn = kItemId.Of<FName>(row);
         // icon: RenderIcon (Temp_Render, like the weapon cards), else Icon, else WhiteIcon
-        std::wstring cfg = Soft(row + 0x5f8), icon = Soft(row + 0x128);
-        if (icon.empty()) icon = Soft(row + 0x60);
-        if (icon.empty()) icon = Soft(row + 0xb0);
+        std::wstring cfg = Soft(row + kEdgeConfig), icon = Soft(row + kEdgeRender);
+        if (icon.empty()) icon = Soft(row + kEdgeIcon);
+        if (icon.empty()) icon = Soft(row + kEdgeWhite);
         if (IsNone(idn) || cfg.empty()) { uex::Log(L"weapons: Phantom Edge row %s skipped (no id/config)", NameOf(*reinterpret_cast<FName*>(e)).c_str()); continue; }
         std::string id = uex::Utf8(NameOf(idn));
         if (g_edgeRows.count(id)) continue;  // first row of an id wins
         bool pick = cfg.find(L"_Interact") == std::wstring::npos && cfg.find(L"Placeholder") == std::wstring::npos;
         std::wstring label;
-        if (pick && conv && At<void*>(row, 0x50)) {  // once per row at load (the FString leaks)
-            Params b(conv); b.Set(L"InText", *reinterpret_cast<uex::FText*>(row + 0x50)); b.Call(lib);
+        int name = kEdgeName + kValueCache;
+        if (pick && conv && At<void*>(row, name)) {  // once per row at load (the FString leaks)
+            Params b(conv); b.Set(L"InText", *reinterpret_cast<uex::FText*>(row + name)); b.Call(lib);
             auto s = b.Get<FString>(L"ReturnValue"); if (s.data && s.num > 1) label.assign(s.data, s.num - 1);
         }
         // unreleased rows: no localized name (the text is the row key "PhantomEdges_NNN") or another
@@ -203,34 +233,34 @@ void PutEdge(UObject* bp, const FName& id, int i) {
     if (IsNone(park)) { uex::Log(L"weapons: no free Phantom Edge to swap slots"); return; }
     ReplaceEdge(bp, park, j); ReplaceEdge(bp, id, i); ReplaceEdge(bp, old, j);
 }
-// MainWeaponInfos (+0x718) / ShaqiWeaponInfos (+0x780): TMap<FName, Info*> (element stride 0x18, value +8,
-// allocation bits inline at +0x10 or at the pointer at +0x20, NumBits +0x28). The swaps clear red points
-// (DisableRedPoint), so the plain data of every info (bytes 0x28..0x50, no pointers) is snapshotted.
+// MainWeaponInfos / ShaqiWeaponInfos: TMap<FName, Info*> (TSet layout constants above). The swaps
+// clear red points (DisableRedPoint), so the plain data of every info (all of it after the UObject
+// header, no pointers) is snapshotted.
 template <class F> void EachInfo(UObject* bp, int off, F f) {
     auto b = reinterpret_cast<uint8_t*>(bp) + off;
-    auto d = At<uint8_t*>(b, 0); int n = At<int32_t>(b, 8), nbits = At<int32_t>(b, 0x28);
-    auto bits = At<uint32_t*>(b, 0x20); if (!bits) bits = reinterpret_cast<uint32_t*>(b + 0x10);
+    auto d = At<uint8_t*>(b, 0); int n = At<int32_t>(b, kArrNum), nbits = At<int32_t>(b, kSetNumBits);
+    auto bits = At<uint32_t*>(b, kSetBitsHeap); if (!bits) bits = reinterpret_cast<uint32_t*>(b + kSetBitsInline);
     if (!d) return;
     for (int i = 0; i < n && i < nbits && i < 4096; ++i) {
         if (!((bits[i >> 5] >> (i & 31)) & 1)) continue;
-        auto e = d + i * 0x18; auto info = At<UObject*>(e, 8);
+        auto e = d + i * kNameMapStride; auto info = At<UObject*>(e, kNameMapValue);
         if (info && uex::Alive(info)) f(*reinterpret_cast<FName*>(e), info);
     }
 }
-struct InfoSave { int map; FName id; uint8_t b[0x28]; };
+struct InfoSave { int map; FName id; uint8_t b[kInfoLen]; };
 std::vector<InfoSave> g_infos; bool g_infosSaved;
 void SaveInfos(UObject* bp) {
     if (g_infosSaved) return;
     g_infosSaved = true; g_infos.clear();
-    for (int off : {0x718, 0x780}) EachInfo(bp, off, [&](const FName& id, UObject* o) {
-        InfoSave s{off, id}; memcpy(s.b, reinterpret_cast<uint8_t*>(o) + 0x28, 0x28); g_infos.push_back(s); });
+    for (int off : {int(kMainInfos), int(kShaqiInfos)}) EachInfo(bp, off, [&](const FName& id, UObject* o) {
+        InfoSave s{off, id}; memcpy(s.b, reinterpret_cast<uint8_t*>(o) + kInfoData, kInfoLen); g_infos.push_back(s); });
 }
 int RestoreInfos(UObject* bp) {
     int n = 0;
-    for (int off : {0x718, 0x780}) EachInfo(bp, off, [&](const FName& id, UObject* o) {
+    for (int off : {int(kMainInfos), int(kShaqiInfos)}) EachInfo(bp, off, [&](const FName& id, UObject* o) {
         for (auto& s : g_infos) if (s.map == off && Same(s.id, id)) {
-            auto p = reinterpret_cast<uint8_t*>(o) + 0x28;
-            if (memcmp(p, s.b, 0x28)) { memcpy(p, s.b, 0x28); ++n; }
+            auto p = reinterpret_cast<uint8_t*>(o) + kInfoData;
+            if (memcmp(p, s.b, kInfoLen)) { memcpy(p, s.b, kInfoLen); ++n; }
             break;
         } });
     return n;
@@ -259,7 +289,7 @@ void EquipEdge(const std::string& id) {
     auto bp = Backpack(); if (!bp) { uex::Log(L"weapons: no backpack"); return; }
     Arr a = EdgeSlots(bp); auto s = reinterpret_cast<FName*>(a.d);
     if (!s) a.n = 0;
-    int cur = At<int32_t>(bp, 0x768), i = -1;  // CurrentShaqiWeaponIndex
+    int cur = kCurShaqi.Of<int32_t>(bp), i = -1;
     if (cur >= 0 && cur < a.n && cur < 2 && !IsNone(s[cur])) i = cur;
     else for (int k = 0; k < a.n && k < 2; ++k) if (!IsNone(s[k])) { i = k; break; }
     if (i < 0) { uex::Log(L"weapons: no Phantom Edge equipped in this save, %S skipped (an empty slot would add it to the inventory)", id.c_str()); return; }
@@ -342,7 +372,7 @@ bool SetGhostWeapon(UObject* ghost, const std::string& cfgPath, bool armed) {
         int idx = 0; auto cur = CurConfig(comp, tag, &idx);
         if (cur != cfg) {
             if (idx < 0 || idx >= count) idx = 0;
-            struct If { UObject* obj; void* iface; } v{cfg, reinterpret_cast<uint8_t*>(cfg) + 0x30};  // PBZ_MainWeaponConfig_C: interface at +0x30
+            struct If { UObject* obj; void* iface; } v{cfg, reinterpret_cast<uint8_t*>(cfg) + kConfigIface};  // PBZ_MainWeaponConfig_C
             Params s(uex::Fn(comp, L"SetSlotWeapon"));
             s.Set(L"SlotTag", tag); s.Set<int>(L"Index", idx); bool okc = s.Set(L"Config", v); s.Call(comp);
             Params c(uex::Fn(comp, L"SetCurrentWeapon")); c.Set(L"SlotTag", tag); c.Set<int>(L"Index", idx); c.Call(comp);
@@ -388,7 +418,7 @@ std::string CurrentEdgePath(UObject* ch) {
     if (!comp || !SlotTag(comp, L"Weapon.Slot.Shachi", tag, nullptr, &w)) return "";
     auto cfg = CurConfig(comp, tag, nullptr);
     for (int j = 0; !cfg && w.d && j < w.n && j < 4; ++j)  // no current one: the slot's first weapon
-        if (auto o = At<UObject*>(w.d + j * 0x120, 0); o && uex::Alive(o)) cfg = o;
+        if (auto o = kSingleConfig.Of<UObject*>(w.d + j * SingleSize()); o && uex::Alive(o)) cfg = o;
     return cfg ? uex::Utf8(PathOf(cfg)) : "";
 }
 void SetGhostEdge(UObject* ghost, const std::string& cfgPath) {
@@ -399,12 +429,12 @@ void SetGhostEdge(UObject* ghost, const std::string& cfgPath) {
     FName tag{}; if (!SlotTag(comp, L"Weapon.Slot.Shachi", tag)) tag = uex::Name(L"Weapon.Slot.Shachi");
     auto fs = uex::Fn(comp, L"SetSlotWeapon"), fc = uex::Fn(comp, L"SetCurrentWeapon");
     if (!fs || !fc) { uex::Log(L"weapons: no SetSlotWeapon/SetCurrentWeapon"); return; }
-    // the weapon config interface sits at +0x30 of PBZ_WeaponConfigBase (8-byte gap before its first property)
+    // the weapon config interface sits in PBZ_WeaponConfigBase's 8-byte gap before its first property
     auto base = uex::Class(L"Class /Script/PBZCombatAsset.PBZ_WeaponConfigBase");
     if (base && !IsA(cfg, base)) { uex::Log(L"weapons: %s is no weapon config", NameOf(cfg).c_str()); return; }
     int idx = -1; auto cur = CurConfig(comp, tag, &idx);
     if (cur == cfg && idx == 0) return;
-    struct If { UObject* obj; void* iface; } v{cfg, reinterpret_cast<uint8_t*>(cfg) + 0x30};
+    struct If { UObject* obj; void* iface; } v{cfg, reinterpret_cast<uint8_t*>(cfg) + kConfigIface};
     Params s(fs); s.Set(L"SlotTag", tag); s.Set<int>(L"Index", 0); bool okc = s.Set(L"Config", v); s.Call(comp);
     Params c(fc); c.Set(L"SlotTag", tag); c.Set<int>(L"Index", 0); c.Call(comp);
     auto now = CurConfig(comp, tag, nullptr);
@@ -416,18 +446,18 @@ std::wstring LoadoutReport() {
         std::wstring s; for (int i = 0; a.d && i < a.n && i < 8; ++i) s += (i ? L"," : L"") + NameOf(reinterpret_cast<FName*>(a.d)[i]);
         return s;
     };
-    std::wstring r = L"main [" + names(MainSlots(bp)) + L"] cur " + std::to_wstring(At<int32_t>(bp, 0x6f8)) + L"\n";
-    r += L"edges [" + names(EdgeSlots(bp)) + L"] cur " + std::to_wstring(At<int32_t>(bp, 0x768)) + L"\n";
+    std::wstring r = L"main [" + names(MainSlots(bp)) + L"] cur " + std::to_wstring(kCurWeapon.Of<int32_t>(bp)) + L"\n";
+    r += L"edges [" + names(EdgeSlots(bp)) + L"] cur " + std::to_wstring(kCurShaqi.Of<int32_t>(bp)) + L"\n";
     wchar_t b[128];
-    for (int off : {0x718, 0x780}) {  // order-independent hash of every info's id and plain data
+    for (int off : {int(kMainInfos), int(kShaqiInfos)}) {  // order-independent hash of every info's id and plain data
         int n = 0, red = 0; uint64_t hash = 0;
         EachInfo(bp, off, [&](const FName& id, UObject* o) {
             uint64_t h = 1469598103934665603ull;
             auto mix = [&](const uint8_t* p, int len) { for (int i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ull; } };
-            mix(reinterpret_cast<const uint8_t*>(&id), 8); mix(reinterpret_cast<const uint8_t*>(o) + 0x28, 0x28);
-            hash += h; ++n; red += At<uint8_t>(o, 0x49) != 0;
+            mix(reinterpret_cast<const uint8_t*>(&id), 8); mix(reinterpret_cast<const uint8_t*>(o) + kInfoData, kInfoLen);
+            hash += h; ++n; red += off == kShaqiInfos ? kEdgeRedPoint.Bit(o) : At<uint8_t>(o, kMainRedPoint) != 0;
         });
-        swprintf(b, 128, L"%s infos %d red %d hash %016llx\n", off == 0x718 ? L"main" : L"edge", n, red, (unsigned long long)hash);
+        swprintf(b, 128, L"%s infos %d red %d hash %016llx\n", off == kMainInfos ? L"main" : L"edge", n, red, (unsigned long long)hash);
         r += b;
     }
     r += L"hand " + uex::Wide(CurrentWeaponPath(uex::Me())) + L"\n";

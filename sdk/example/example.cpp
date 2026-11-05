@@ -1,5 +1,5 @@
 // example.cpp: the smallest useful PBZ mod. Build with build.bat, copy example.dll and example.txt
-// into <game>\platform\steam\pbzmp\, tick it in Mod管理器, start the game.
+// into the folder <game>\platform\steam\pbzmp\example\, tick it in Mod管理器, start the game.
 // Shows: a per-frame callback, a hotkey (Ctrl+F9), a function hook through the loader, clean unload.
 #include <windows.h>
 #include <cstdio>

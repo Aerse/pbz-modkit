@@ -44,7 +44,7 @@ bool Init() {
     if (FAILED(g_xa->CreateMasteringVoice(&g_master, 2, 44100))) {
         g_xa->Release(); g_xa = nullptr; uex::Log(L"sniper: audio: no mastering voice"); return false;
     }
-    std::wstring dir = g_modDir + L"sniper_cache\\snd\\";
+    std::wstring dir = g_cacheDir + L"snd\\";
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW((dir + L"*.wav").c_str(), &fd);
     size_t bytes = 0;
     if (h != INVALID_HANDLE_VALUE) {

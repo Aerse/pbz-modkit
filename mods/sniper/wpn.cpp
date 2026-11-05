@@ -18,7 +18,7 @@ Wpn g_wpn[kWpnN];
 #define MUZ L"/PBZVFXPack/VFX/BattleFX/GuiChai/"
 static void Fill() {
     Wpn& a = g_wpn[0];  // AWP: Stats {maxSpeed, spread, stand, crouch, move, jump, fire, rMag, rMagVar}
-    a.id = L"awp"; a.label = L"AWP"; a.damage = 115; a.head = 4; a.rangeMod = .99f;
+    a.id = L"awp"; a.label = L"AWP"; a.damage = 115; a.head = 4; a.rangeMod = .99f; a.posture = .25f;
     a.clip = 5; a.reserve = 30; a.autoFire = false; a.cycle = .6f; a.reload = 3.666667f; a.deploy = 1.266667f;
     a.st[0] = {200, .0002f, .0808f, .0606f, .17648f, .13383f, .05385f, 78, 15};
     a.st[1] = {100, .0002f, .002f, .0015f, .17648f, .13383f, .05385f, 25, 2};
@@ -32,7 +32,7 @@ static void Fill() {
     a.grip = {4, -1, 13}; a.muzzle = {108, -1, 23.5}; a.tracerFreq = 1; a.muzzleFx = MUZ L"NS_GuiChaiBlack_Rifle_004_MuzzleStrong.NS_GuiChaiBlack_Rifle_004_MuzzleStrong"; a.fxScale = 1;
 
     Wpn& k = g_wpn[1];  // AK-47
-    k.id = L"ak47"; k.label = L"AK-47"; k.damage = 36; k.head = 4; k.rangeMod = .98f;
+    k.id = L"ak47"; k.label = L"AK-47"; k.damage = 36; k.head = 4; k.rangeMod = .98f; k.posture = .05f;
     k.clip = 30; k.reserve = 90; k.autoFire = true; k.cycle = .1f; k.reload = 2.466667f; k.deploy = 1;
     k.st[0] = k.st[1] = {215, .0006f, .00641f, .00481f, .17506f, .14076f, .0078f, 30, 0};
     k.rec[0] = .368f; k.rec[1] = .506f; k.rec[2] = .305257f; k.rec[3] = .419728f; k.trans[0] = 2; k.trans[1] = 5;
@@ -44,7 +44,7 @@ static void Fill() {
     k.grip = {2, -1, -5}; k.muzzle = {66, -1, 6.5}; k.tracerFreq = 3; k.muzzleFx = MUZ L"NS_GuiChaiBlack_Rifle_002_Muzzle.NS_GuiChaiBlack_Rifle_002_Muzzle"; k.fxScale = .8;
 
     Wpn& m = g_wpn[2];  // M4A4
-    m.id = L"m4a4"; m.label = L"M4A4"; m.damage = 33; m.head = 4; m.rangeMod = .97f;
+    m.id = L"m4a4"; m.label = L"M4A4"; m.damage = 33; m.head = 4; m.rangeMod = .97f; m.posture = .045f;
     m.clip = 30; m.reserve = 120; m.autoFire = true; m.cycle = .09f; m.reload = 3.066667f; m.deploy = 1.133333f;
     m.st[0] = m.st[1] = {225, .0006f, .0049f, .0041f, .13788f, .09727f, .007f, 23, 0};
     m.rec[0] = .338941f; m.rec[1] = .466044f; m.rec[2] = .2421f; m.rec[3] = .332888f; m.trans[0] = 2; m.trans[1] = 5;

@@ -11,7 +11,7 @@
 #include <algorithm>
 
 const PbzHost* g_h;
-std::wstring g_modDir;
+std::wstring g_modDir, g_cacheDir;
 bool g_dbg;
 double g_now;
 static int g_tick;
@@ -341,8 +341,19 @@ bool MainCmd(UObject* me, const std::wstring& c) {
 }
 
 extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) { g_h = h; uex::SetHost(h); }
-extern "C" __declspec(dllexport) void PbzRun(const wchar_t*) {
-    g_modDir = g_h->dir;
+static bool IsDir(const std::wstring& p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+extern "C" __declspec(dllexport) void PbzRun(const wchar_t* dir) {
+    g_modDir = dir && *dir ? dir : g_h->dir;
+    if (g_modDir.back() != L'\\' && g_modDir.back() != L'/') g_modDir += L'\\';
+    // assets: <mod>\cache\, else an older layout's <mod>\sniper_cache\ or <root>\sniper_cache\ (flat install)
+    std::wstring root = g_h->dir;
+    g_cacheDir = g_modDir + L"cache\\";
+    for (auto& c : {g_modDir + L"cache\\", g_modDir + L"sniper_cache\\", root + L"sniper_cache\\"})
+        if (IsDir(c)) { g_cacheDir = c; break; }
+    uex::Log(L"sniper: assets in %s", g_cacheDir.c_str());
     WpnInit();
     overlay::Start();
     g_tick = g_h->addTick(Tick, nullptr);

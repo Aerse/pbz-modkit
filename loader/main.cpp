@@ -17,6 +17,7 @@
 #include "proxy_exports.h"
 #include "host.h"
 #include "MinHook.h"
+#include "discover.h"
 
 static HMODULE g_self;
 static std::wstring g_dir;
@@ -55,9 +56,12 @@ static std::wstring ModDir() {
 }
 
 // ---- tick hub ------------------------------------------------------------------------------
-constexpr uintptr_t kEngineVTable = 0x14b1f9290;
-constexpr int kTickSlot = 0x5e;
-constexpr uintptr_t kNumObjects = 0x14de28c70;
+// Engine addresses are found at runtime (discover.cpp), so a game update does not need a new
+// loader. These are the values for the 2026-11-04 build, used only when a search fails and the
+// value still checks out.
+constexpr uintptr_t kRvaObjects = 0xde28c68, kRvaNamePool = 0xdd86ac0, kRvaEngineVt = 0xb1f9290;
+constexpr int kTickSlot = 0x5e, kProcessEvent = 0x4c;
+static disc::Result g_disc;
 using TickFn = void(__fastcall*)(void*, float, bool);
 
 struct TickEntry { int id; void (*fn)(void*, float); void* ctx; HMODULE owner; };
@@ -140,7 +144,7 @@ static int AddHotkey(int vk, int mods, void (*fn)(void*), void* ctx) {
     return g_nextId++;
 }
 static void RemoveHotkey(int id) { std::lock_guard lk(g_mx); std::erase_if(g_hot, [id](const HotEntry& h) { return h.id == id; }); }
-static PbzHost g_host{2, nullptr, Engine, AddTick, RemoveTick, Post, HostLog, HookFn, Unhook, AddHotkey, RemoveHotkey};
+static PbzHost g_host{3, nullptr, Engine, AddTick, RemoveTick, Post, HostLog, HookFn, Unhook, AddHotkey, RemoveHotkey};
 
 static bool GameInFront() {
     DWORD pid = 0;
@@ -209,7 +213,7 @@ static void __fastcall TickHook(void* self, float dt, bool idle) {
 }
 
 static bool HookTick() {
-    auto slot = reinterpret_cast<TickFn*>(kEngineVTable + kTickSlot * 8);
+    auto slot = reinterpret_cast<TickFn*>(g_disc.engineVt + g_disc.tickSlot * 8);
     auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
     auto cur = reinterpret_cast<uintptr_t>(*slot);
@@ -221,6 +225,46 @@ static bool HookTick() {
     return true;
 }
 
+// Finds the engine globals; called every loader poll until it returns true. Each piece is
+// searched for (discover.cpp); a known address from the 11-04 build is used only when the search
+// gives no single answer and that address still checks out.
+static void DiscLog(const std::wstring& s) { LogLine(s); }
+static bool Discover() {
+    static int tries;
+    ++tries;
+    auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    auto& r = g_disc;
+    if (!r.objects && !disc::FindObjectArray(r, DiscLog)) {
+        if (tries < 40) return false;
+        disc::Result k; k.objects = base + kRvaObjects;
+        if (!disc::FindObjectArray(k, DiscLog)) return false;  // k.objects is checked first
+        r.objects = k.objects; r.numObjects = k.numObjects; r.how += L" objects (known)";
+    }
+    if (!r.namePool && !disc::FindNamePool(r, DiscLog)) {
+        if (tries < 40) return false;
+        disc::Result k; k.namePool = base + kRvaNamePool;
+        if (!disc::FindNamePool(k, DiscLog)) return false;
+        r.namePool = k.namePool; r.how += L" names (known)";
+    }
+    static int engTries;
+    if (*reinterpret_cast<volatile int32_t*>(r.numObjects) <= 50000) return false;
+    if (!disc::FindEngine(r, DiscLog)) {
+        if (++engTries < 40 || r.engineVt != base + kRvaEngineVt) return false;
+        r.tickSlot = kTickSlot; r.processEvent = kProcessEvent; r.how += L" tick/ProcessEvent (known)";
+    }
+    if (!HookTick()) return false;  // vtable slot not pointing into the exe yet
+    g_host.objects = reinterpret_cast<void*>(r.objects);
+    g_host.namePool = reinterpret_cast<void*>(r.namePool);
+    g_host.processEvent = r.processEvent;
+    g_host.tickSlot = r.tickSlot;
+    wchar_t b[200];
+    swprintf_s(b, L"engine: objects %s, names %s, engine vtable %s, tick slot 0x%x, ProcessEvent slot 0x%x",
+               disc::Hex(r.objects).c_str(), disc::Hex(r.namePool).c_str(), disc::Hex(r.engineVt).c_str(), r.tickSlot, r.processEvent);
+    LogLine(b);
+    LogLine(L"engine found by:" + r.how);
+    return true;
+}
+
 // ---- modules (loader thread) ---------------------------------------------------------------
 using InitFn = void(__cdecl*)(const PbzHost*);
 using RunFn = void(__cdecl*)(const wchar_t*);
@@ -229,7 +273,7 @@ struct Loaded { HMODULE m; std::wstring tmp; };
 static std::map<std::wstring, Loaded> g_mods;  // modules with PbzUnload, by name
 
 static bool SehInit(InitFn fn) { __try { fn(&g_host); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
-static bool SehRun(RunFn fn) { __try { fn(g_dir.c_str()); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+static bool SehRun(RunFn fn, const wchar_t* dir) { __try { fn(dir); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
 static bool SehUnload(UnloadFn fn) { __try { fn(); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
 
 static void Purge(HMODULE m) {
@@ -288,7 +332,7 @@ static std::wstring Trim(std::wstring s) {
 }
 
 // Host API level modules may ask for with "api=N" in <name>.txt. Bump when PbzHost grows.
-constexpr int kHostApi = 2;
+constexpr int kHostApi = 3;
 // Mod managers find our version.dll by this export name (they scan the file for "PbzLoaderApi").
 extern "C" __declspec(dllexport) int PbzLoaderApi() { return kHostApi; }
 
@@ -309,10 +353,10 @@ static std::wstring InfoValue(const std::wstring& txt, const wchar_t* key) {
 static void RunModule(const std::wstring& name) {
     static int counter = 0;
     if (!Unload(name)) return;  // the old copy is still busy
-    // a mod lives in the mod dir (<name>.dll) or in its own subfolder (<name>\<name>.dll)
+    // a mod lives in its own subfolder (<name>\<name>.dll, preferred) or flat in the mod dir
+    // (<name>.dll, legacy). PbzRun gets that folder; host->dir stays the mod dir root.
     std::wstring base = g_dir;
-    if (GetFileAttributesW((base + name + L".dll").c_str()) == INVALID_FILE_ATTRIBUTES &&
-        GetFileAttributesW((g_dir + name + L"\\" + name + L".dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW((g_dir + name + L"\\" + name + L".dll").c_str()) != INVALID_FILE_ATTRIBUTES)
         base = g_dir + name + L"\\";
     if (auto api = InfoValue(base + name + L".txt", L"api"); !api.empty() && _wtoi(api.c_str()) > kHostApi) {
         LogLine(L"skip " + name + L": needs loader api " + api + L", this loader has " + std::to_wstring(kHostApi));
@@ -331,7 +375,7 @@ static void RunModule(const std::wstring& name) {
     if (init && !SehInit(init)) LogLine(L"PbzInit crashed in " + name);
     if (run) {
         LogLine(L"run " + name);
-        if (!SehRun(run)) LogLine(L"module crashed (SEH) " + name);
+        if (!SehRun(run, base.c_str())) LogLine(L"module crashed (SEH) " + name);
         LogLine(L"done " + name);
     }
     if (!init && !run) LogLine(L"no PbzInit/PbzRun in " + name);
@@ -377,7 +421,7 @@ static DWORD WINAPI Worker(LPVOID) {
     for (;;) {
         Sleep(g_origTick ? 250 : 500);
         // hook once the engine is up (object array filled, vtable slot points into the exe)
-        if (!g_origTick && *reinterpret_cast<volatile int32_t*>(kNumObjects) > 50000 && HookTick()) LogLine(L"tick hooked");
+        if (!g_origTick && Discover()) LogLine(L"tick hooked");
         if (g_origTick && !autorun) {
             autorun = true;
             for (auto& n : ReadLines(g_dir + L"autorun.txt", false)) RunModule(n);

@@ -1,5 +1,6 @@
-// uex: shared UE helpers for mp.dll (ui/, arena/, fight/, flow/). Game thread only.
-// Offsets are tied to the current game build. Rules: nothing here allocates in the game heap per frame except
+// uex: shared UE helpers for mods (pvp, sniper, your own). Game thread only.
+// Fields are found by name through reflection (Prop, Field below), so a game update that moves them
+// needs no code change; the numbers next to the names are only fallbacks. Rules: nothing here allocates in the game heap per frame except
 // Text() on a new string (cached) and console commands; never call FString-returning UE
 // functions per frame (their results leak: our param buffers run no destructors).
 #pragma once
@@ -17,7 +18,8 @@ struct FText { uint8_t b[16]; };  // opaque, owned by the game
 
 void SetHost(const PbzHost* h);
 const PbzHost* Host();
-void Log(const wchar_t* fmt, ...);  // loader.log, prefixed "mp: "
+void Log(const wchar_t* fmt, ...);  // one line in loader.log, prefixed "<name>: " (default "mp: ")
+void SetLogName(const wchar_t* name);  // your mod's log prefix, e.g. L"hello"
 
 // static library objects ("Default__X"), cached
 UObject* Lib(const wchar_t* fullName);
@@ -56,11 +58,56 @@ void SetControlYaw(double yaw);                      // player's camera/controll
 UObject* Comp(UObject* actor, UObject* compCls);     // GetComponentByClass
 bool Trace(UObject* ctx, Vec a, Vec b, Vec* hit);     // Visibility line trace, ignores ctx
 
-// attributes (BasicAttributeSet at PBZCharacter +0x758; offset = attribute struct offset)
-namespace attr { constexpr int Health = 0x58, HealthMax = 0x68, HealthMin = 0xd78, Shield = 0x88,
-    Attack = 0xc8, Shachi = 0x638, ShachiMax = 0x658, Ult = 0x898, UltMax = 0x8a8; }
+// ---- reflection: fields by name ----------------------------------------------------------
+// A Prop is a field of a native class or struct ("Class /Script/Engine.Controller",
+// "ScriptStruct /Script/Engine.HitResult"), looked up by name on first use and cached. The fallback
+// is the offset in the build the mod was written for: used, and logged once, only when the field is
+// gone. A changed offset is logged once too ("field X.Y moved"), handy after a game update.
+//   static uex::Prop kPawn{L"Class /Script/Engine.Controller", L"Pawn", 0x2f0};
+//   UObject* pawn = kPawn.Of<UObject*>(pc);
+// BoolProperty: give the fallback mask (4th value); Mask() then is the field's bit.
+struct Prop {
+    const wchar_t* owner; const wchar_t* name; int fallback; uint8_t fallbackMask = 0;
+    int off = -1; uint8_t mask = 0; bool done = false; uint64_t retryAt = 0;
+    int Resolve();
+    operator int() { return done ? off : Resolve(); }
+    uint8_t Mask() { if (!done) Resolve(); return mask; }
+    template <class T> T& Of(const void* o) {
+        return *reinterpret_cast<T*>(const_cast<uint8_t*>(static_cast<const uint8_t*>(o)) + int(*this));
+    }
+    bool Bit(const void* o) { int k = *this; return (static_cast<const uint8_t*>(o)[k] & mask) != 0; }
+    void SetBit(void* o, bool v) { int k = *this; auto& b = static_cast<uint8_t*>(o)[k]; b = v ? (b | mask) : (b & ~mask); }
+};
+int StructSize(const wchar_t* owner, int fallback);  // PropertiesSize of a native struct, cached
+// any object's field by name (its own class, up the Super chain), cached per class; -1 / null if none
+int OffsetOf(UObject* cls, const wchar_t* prop);
+template <class T> T* Field(UObject* o, const wchar_t* prop) {
+    int k = o ? OffsetOf(o->cls, prop) : -1;
+    return k < 0 ? nullptr : reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(o) + k);
+}
+
+// attributes: BasicAttributeSet fields (FGameplayAttributeData: base +8, current +0xC), by name.
+// Use them where an int offset goes: Attr(ch, attr::Health), attr::Shachi + 0x10 (not constexpr).
+namespace attr {
+inline constexpr const wchar_t* kSet = L"Class /Script/CharacterBasics.BasicAttributeSet";
+inline Prop Level{kSet, L"Level", 0x48}, Health{kSet, L"Health", 0x58}, HealthMax{kSet, L"Health_Max", 0x68},
+    HealthMin{kSet, L"Health_Min", 0xd78}, Shield{kSet, L"Shield", 0x88}, Attack{kSet, L"Attack", 0xc8},
+    Shachi{kSet, L"Shachi", 0x638}, ShachiMin{kSet, L"Shachi_Min", 0x648}, ShachiMax{kSet, L"Shachi_Max", 0x658},
+    ShachiRegen{kSet, L"ShachiRegen", 0x678}, ShachiRegenCooldown{kSet, L"ShachiRegenCooldown", 0x688},
+    Ult{kSet, L"UltimateCharge", 0x898}, UltMax{kSet, L"UltimateCharge_Max", 0x8a8},
+    Spirit{kSet, L"SpiritShadow", 0x8f8}, SpiritMax{kSet, L"SpiritShadow_Max", 0x908},
+    AccFirst{kSet, L"Ignite_Accumulation", 0x918}, AccLast{kSet, L"Water_Accumulation", 0x988},  // *_Accumulation, 0x10 apart
+    FinalWalkSpeed{kSet, L"FinalWalkSpeed", 0xdc8};
+}
+uint8_t* AttrSet(UObject* ch);                  // PBZCharacter.AttributeSetBase, null if none
 float Attr(UObject* ch, int off);               // current value
 void SetAttr(UObject* ch, int off, float v);    // base and current
+UObject* ASC(UObject* ch);                      // PBZCharacter.AbilitySystemComponent
+// gameplay tags the character owns (its ASC's GameplayTagCountContainer.ExplicitTags), game memory:
+// read it right away, it changes as tags come and go
+struct TagList { const ue::FName* d = nullptr; int n = 0; };
+TagList OwnedTags(UObject* ch);
+bool HasTag(UObject* ch, const wchar_t* tag);   // exact match, e.g. L"CharacterState.Stand.Break"
 
 // assets, console
 UObject* LoadAsset(const wchar_t* path);  // "/Game/.../X.X" soft path, blocking, cached
@@ -93,4 +140,10 @@ void SetMoveMode(UObject* ch, int mode);       // 0 none (frozen, no gravity), 1
 // on: the game's pause/system menu (Esc, I, gamepad menu) and map (M, Tab) keys do nothing (rescans
 // every few seconds for contexts loaded later); off: puts them back. Idempotent.
 void BlockMenuKeys(bool on);
+// an InputMappingContext's key mappings (DefaultKeyMappings.Mappings), by reflection. Setting an
+// entry's action to null and rebuilding disables that key; put the action back to restore it.
+int KeyMappingCount(UObject* imc);
+UObject*& KeyMappingAction(UObject* imc, int i);  // i < KeyMappingCount
+ue::FName KeyMappingKey(UObject* imc, int i);      // FKey's name ("LeftMouseButton", "R", ...)
+void RebuildMappings(UObject* imc);                // apply changes now
 }  // namespace uex

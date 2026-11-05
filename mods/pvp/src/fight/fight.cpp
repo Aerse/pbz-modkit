@@ -114,34 +114,40 @@ bool g_lastHitBack;     // last hit came from behind
 struct HitM { uint32_t name, number; bool hit; };
 std::unordered_map<UObject*, HitM> g_isHit;
 std::map<std::wstring, uex::Ref> g_montByName, g_gaCls;
-struct PropC { uint32_t clsName; int off; };
-std::map<std::pair<UObject*, std::wstring>, PropC> g_propOff;
 UObject* g_fightWorld;            // world the ghosts were spawned in
 std::map<int, double> g_spawnAt;  // slot -> next ghost spawn try
 int g_deadBy = -1; double g_deadSentAt, g_countCheck; bool g_resetOk;
 
+// engine fields, by name (fallback = the 2026-11 build)
+constexpr const wchar_t* kChar = L"Class /Script/Engine.Character";
+constexpr const wchar_t* kCmc = L"Class /Script/Engine.CharacterMovementComponent";
+constexpr const wchar_t* kGa = L"Class /Script/GameplayAbilities.GameplayAbility";
+uex::Prop kMesh{kChar, L"Mesh", 0x330}, kCharMove{kChar, L"CharacterMovement", 0x338},
+    kRoot{L"Class /Script/Engine.Actor", L"RootComponent", 0x1b8},
+    kRelLoc{L"Class /Script/Engine.SceneComponent", L"RelativeLocation", 0x148},
+    kRelRot{L"Class /Script/Engine.SceneComponent", L"RelativeRotation", 0x160},
+    kVelocity{L"Class /Script/Engine.MovementComponent", L"Velocity", 0xd8},
+    kAccel{kCmc, L"Acceleration", 0x338},
+    kNoCtrlPhysics{kCmc, L"bRunPhysicsWithNoController", 0x2f9, 0x8},
+    kUro{L"Class /Script/Engine.SkinnedMeshComponent", L"bEnableUpdateRateOptimizations", 0x7d9, 0x8},
+    kController{L"Class /Script/Engine.Pawn", L"Controller", 0x2e0},
+    kGaActive{kGa, L"bIsActive", 0x388, 0xff}, kGaMontage{kGa, L"CurrentMontage", 0x320};
+
+UObject* MeshOf(UObject* ch) { return ch ? kMesh.Of<UObject*>(ch) : nullptr; }
+UObject* CtrlOf(UObject* pawn) { return kController.Of<UObject*>(pawn); }
 UObject* AnimOf(UObject* ch) {
-    auto mesh = ch ? At<UObject*>(ch, 0x330) : nullptr;
+    auto mesh = MeshOf(ch);
     if (!mesh) return nullptr;
     Params p(uex::Fn(mesh, L"GetAnimInstance")); p.Call(mesh);
     return p.Get<UObject*>(L"ReturnValue");
 }
-UObject* CM(UObject* ch) { return ch ? At<UObject*>(ch, 0x338) : nullptr; }
-int PropOff(UObject* o, const wchar_t* n) {
-    auto k = std::make_pair(o->cls, std::wstring(n));
-    if (auto it = g_propOff.find(k); it != g_propOff.end() && it->second.clsName == o->cls->name.comparison) return it->second.off;
-    int off = FindProp(o->cls, n).offset;
-    g_propOff[k] = {o->cls->name.comparison, off};
-    return off;
-}
-template <class T> T* Field(UObject* o, const wchar_t* n) {
-    int off = PropOff(o, n); return off < 0 ? nullptr : reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(o) + off);
-}
+UObject* CM(UObject* ch) { return ch ? kCharMove.Of<UObject*>(ch) : nullptr; }
+using uex::Field;
 uint8_t Mode(UObject* ch) { auto cm = CM(ch); auto m = cm ? Field<uint8_t>(cm, L"MovementMode") : nullptr; return m ? *m : 0; }
 void SetMode(UObject* cm, uint8_t m) { Params p(uex::Fn(cm, L"SetMovementMode")); p.Set<uint8_t>(L"NewMovementMode", m); p.Call(cm); }
-Vec& VelRef(UObject* cm) { return *reinterpret_cast<Vec*>(reinterpret_cast<uint8_t*>(cm) + 0xd8); }
-Vec RootLoc(UObject* a) { return *reinterpret_cast<Vec*>(At<uint8_t*>(a, 0x1b8) + 0x148); }
-double RootYaw(UObject* a) { return reinterpret_cast<double*>(At<uint8_t*>(a, 0x1b8) + 0x160)[1]; }
+Vec& VelRef(UObject* cm) { return kVelocity.Of<Vec>(cm); }
+Vec RootLoc(UObject* a) { return kRelLoc.Of<Vec>(kRoot.Of<UObject*>(a)); }
+double RootYaw(UObject* a) { return (&kRelRot.Of<double>(kRoot.Of<UObject*>(a)))[1]; }
 double Ang(double d) { return std::fmod(d + 540.0, 360.0) - 180.0; }
 
 UObject* CurMontage(UObject* ai) { Params g(uex::Fn(ai, L"GetCurrentActiveMontage")); g.Call(ai); return g.Get<UObject*>(L"ReturnValue"); }
@@ -161,8 +167,8 @@ std::vector<UObject*> Children(UObject* actor) {
     return r;
 }
 
-bool Live(UObject* a) { return uex::Alive(a) && At<void*>(a, 0x1b8); }
-bool GhostLive(const Ghost& g) { auto a = uex::Get(g.ref); return a && a == g.actor && At<void*>(a, 0x1b8); }
+bool Live(UObject* a) { return uex::Alive(a) && kRoot.Of<void*>(a); }
+bool GhostLive(const Ghost& g) { auto a = uex::Get(g.ref); return a && a == g.actor && kRoot.Of<void*>(a); }
 
 // ---- ghost setup (the dummy recipe) ----------------------------------------------------------
 void SetupGhost(Ghost& g) {
@@ -181,7 +187,7 @@ void SetupGhost(Ghost& g) {
         for (int i = 0, n = NumObjects(); i < n; ++i) {
             auto o = ObjectAt(i);
             if (o && o->cls == lockCls && !(o->flags & 0x10) && o->outer && o->outer != a && IsA(o->outer, charCls)) {
-                auto l = reinterpret_cast<double*>(reinterpret_cast<uint8_t*>(o) + 0x148);
+                auto l = &kRelLoc.Of<double>(o);
                 tf.v[4] = l[0]; tf.v[5] = l[1]; tf.v[6] = l[2]; break;
             }
         }
@@ -191,33 +197,33 @@ void SetupGhost(Ghost& g) {
         if (!p.Get<UObject*>(L"ReturnValue")) uex::Log(L"fight: lock point add failed");
     }
     // attributes from the local player (partial copies leave taken-multipliers at 0 = no damage)
-    auto dst = At<uint8_t*>(a, 0x758), src = At<uint8_t*>(g_me, 0x758);
-    if (dst && src) for (int off = 0x48; off < 0xdc8; off += 0x10) memcpy(dst + off + 8, src + off + 8, 8);
+    auto dst = uex::AttrSet(a), src = uex::AttrSet(g_me);
+    if (dst && src) for (int off = uex::attr::Level, end = uex::attr::FinalWalkSpeed; off < end; off += 0x10) memcpy(dst + off + 8, src + off + 8, 8);
     uex::SetAttr(a, uex::attr::HealthMin, 1.f);
     uex::SetAttr(a, uex::attr::Health, uex::Attr(a, uex::attr::HealthMax));
     g.shownHp = uex::Attr(a, uex::attr::Health);
     // its death must stay local (BP_RenewalPlayer binds these to the respawn flow)
-    if (int dco = PropOff(a, L"Death Component"); dco >= 0)
+    if (int dco = uex::OffsetOf(a->cls, L"Death Component"); dco >= 0)
         if (auto dc = At<UObject*>(a, dco))
             for (const wchar_t* nm : {L"Death Event", L"Pending Death Event"})
                 if (int o = FindProp(dc->cls, nm).offset; o >= 0) *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(dc) + o + 8) = 0;
     // movement: own AI controller, walks by input; gravity even if the controller is missing
-    if (!At<UObject*>(a, 0x2e0)) { Params sc(uex::Fn(a, L"SpawnDefaultController")); sc.Call(a); }
+    if (!CtrlOf(a)) { Params sc(uex::Fn(a, L"SpawnDefaultController")); sc.Call(a); }
     if (auto cm = CM(a)) {
         if (auto f = Field<float>(cm, L"MaxAcceleration")) *f = 12000.f;
         if (auto f = Field<float>(cm, L"AirControl")) *f = 1.f;
-        reinterpret_cast<uint8_t*>(cm)[0x2f9] |= 0x8;  // bRunPhysicsWithNoController
+        kNoCtrlPhysics.SetBit(cm, true);
         Params t(uex::Fn(cm, L"SetComponentTickEnabled")); t.Set<bool>(L"bEnabled", true); t.Call(cm);
         SetMode(cm, 1);
     }
     // pose always ticks, no update-rate skipping (choppy otherwise)
-    if (auto mesh = At<UObject*>(a, 0x330)) {
+    if (auto mesh = MeshOf(a)) {
         if (auto v = Field<uint8_t>(mesh, L"VisibilityBasedAnimTickOption")) *v = 0;
-        reinterpret_cast<uint8_t*>(mesh)[0x7d9] &= ~0x8;
+        kUro.SetBit(mesh, false);  // bEnableUpdateRateOptimizations
     }
     uex::Hostile(g_me, a, true);
     g.setup = true;
-    uex::Log(L"fight: ghost slot %d ready %s ctrl %p", g.slot, NameOf(a).c_str(), At<UObject*>(a, 0x2e0));
+    uex::Log(L"fight: ghost slot %d ready %s ctrl %p", g.slot, NameOf(a).c_str(), CtrlOf(a));
 }
 
 void DestroyActor(UObject* a);
@@ -351,7 +357,7 @@ void DriveGhost(Ghost& g, const net::State& s) {
     // walking follows the local floor), velocity stays for the locomotion graph
     Place(a, {dst.x, dst.y, std::fabs(dz) < 40 ? c.z : dst.z}, g.yaw, false);
     VelRef(cm) = vel;
-    if (now >= g.nextLog) { g.nextLog = now + 2; auto st = net::GetStats(g.slot); uex::Log(L"fight: ghost %d err %.0f v %.0f ctrl %p rx %.0f/s rtt %d delay %.0f jit %.0f starves %d", g.slot, dist, std::hypot(vel.x, vel.y), At<UObject*>(a, 0x2e0), st.rxPerSec, st.rttMs, st.delayMs, st.jitterMs, st.starves); }
+    if (now >= g.nextLog) { g.nextLog = now + 2; auto st = net::GetStats(g.slot); uex::Log(L"fight: ghost %d err %.0f v %.0f ctrl %p rx %.0f/s rtt %d delay %.0f jit %.0f starves %d", g.slot, dist, std::hypot(vel.x, vel.y), CtrlOf(a), st.rxPerSec, st.rttMs, st.delayMs, st.jitterMs, st.starves); }
 }
 
 int DmgPct() { net::Room r; return net::GetRoom(r) && r.dmg > 0 ? r.dmg : 100; }
@@ -419,13 +425,9 @@ void HitReaction(bool back) {
     if (m && !CurMontage(ai)) MontPlay(ai, m, 1.f, 0.f);
 }
 
-// owned gameplay tag (ASC GameplayTagCountContainer.ExplicitTags at +0xfb0), exact match
+// owned gameplay tag (ASC GameplayTagCountContainer.ExplicitTags), exact match
 bool HasTag(UObject* ch, const wchar_t* tag) {
-    auto asc = ch ? At<uint8_t*>(ch, 0x750) : nullptr; if (!asc) return false;
-    struct C { FName* d; int n, m; } c = *reinterpret_cast<C*>(asc + 0xfb0);
-    FName want = uex::Name(tag);
-    for (int i = 0; i < c.n && i < 400; ++i) if (c.d[i].comparison == want.comparison && c.d[i].number == want.number) return true;
-    return false;
+    return ch && uex::HasTag(ch, tag);
 }
 // attacker behind us? from its ghost's position, else from its yaw (facing our way = behind)
 bool FromBehind(int from, double attackerYaw) {
@@ -449,7 +451,7 @@ void ApplyHit(float amt, float frac, int from, float posture, bool back) {
     float nh = (std::max)(1.f, h - (d - fromShield));
     uex::SetAttr(g_me, Health, nh);
     if (posture > 0) {
-        float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, Shachi + 0x10);  // Shachi_Min
+        float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, ShachiMin);
         uex::SetAttr(g_me, Shachi, (std::max)(smin, uex::Attr(g_me, Shachi) - posture * smx));
     }
     g_lastHitter = from; g_lastHitAt = net::Now();
@@ -468,7 +470,7 @@ void ResolveHit(float amt, float frac, int from, float posture, int round, doubl
     if (res) {
         if (res[0] == 'b' && posture > 0) {  // guard: posture only
             using namespace uex::attr;
-            float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, Shachi + 0x10);
+            float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, ShachiMin);
             uex::SetAttr(g_me, Shachi, (std::max)(smin, uex::Attr(g_me, Shachi) - posture * smx));
         }
         char b[96]; snprintf(b, sizeof b, "res %d %d %s %d", from, MySlot(), res, round);
@@ -589,7 +591,7 @@ void Publish() {
     auto cm = CM(g_me);
     if (cm) {
         Vec v = VelRef(cm); s.vel[0] = float(v.x); s.vel[1] = float(v.y); s.vel[2] = float(v.z);
-        Vec acc = *reinterpret_cast<Vec*>(reinterpret_cast<uint8_t*>(cm) + 0x338);
+        Vec acc = kAccel.Of<Vec>(cm);
         float ma = 1; if (auto f = Field<float>(cm, L"MaxAcceleration")) ma = (std::max)(1.f, *f);
         s.acc[0] = float((std::max)(-1.0, (std::min)(1.0, acc.x / ma)));
         s.acc[1] = float((std::max)(-1.0, (std::min)(1.0, acc.y / ma)));
@@ -680,8 +682,6 @@ void GhostOutfit(Ghost& g) {
     if (it != g_remoteOutfit.end()) outfits::WearGhost(g.actor, it->second.id, it->second.skin, it->second.hat);
 }
 
-// BasicAttributeSet offsets not in uex::attr
-constexpr int kSpirit = 0x8f8, kSpiritMax = 0x908, kAccFirst = 0x918, kAccLast = 0x988;  // *_Accumulation
 
 // abilities that are running a move (montage): attacks, dodges, hit reactions. Passives stay.
 int CancelMoves(UObject* ch) {
@@ -690,7 +690,7 @@ int CancelMoves(UObject* ch) {
     for (int i = 0, c = NumObjects(); i < c; ++i) {
         auto o = ObjectAt(i);
         if (!o || o->outer != ch || (o->flags & 0x10) || !IsA(o, ga)) continue;
-        if (!At<uint8_t>(o, 0x388) || !At<UObject*>(o, 0x320)) continue;  // bIsActive, CurrentMontage
+        if (!kGaActive.Bit(o) || !kGaMontage.Of<UObject*>(o)) continue;
         if (auto f = uex::Fn(o, L"K2_CancelAbility")) { Params p(f); p.Call(o); ++n; }
     }
     if (auto ai = AnimOf(ch)) MontStop(ai, nullptr, 0.1f);  // null = every active montage
@@ -698,7 +698,7 @@ int CancelMoves(UObject* ch) {
 }
 // buffs/debuffs with a duration (potions, status, combat buffs); infinite ones are equipment / passives
 int ClearTimedEffects(UObject* ch) {
-    auto asc = At<UObject*>(ch, 0x750); if (!asc) return 0;
+    auto asc = uex::ASC(ch); if (!asc) return 0;
     auto lib = uex::Lib(L"AbilitySystemBlueprintLibrary /Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary");
     auto fGet = uex::Fn(asc, L"GetActiveEffects"), fRem = uex::Fn(asc, L"RemoveActiveGameplayEffect");
     auto fDur = lib ? uex::Fn(lib, L"GetActiveGameplayEffectTotalDuration") : nullptr;
@@ -720,7 +720,7 @@ void SaveOriginal() {
     using namespace uex::attr;
     if (g_saved.valid || !g_me) return;
     g_saved = {true, uex::Attr(g_me, Health), uex::Attr(g_me, HealthMin), uex::Attr(g_me, Shachi),
-               uex::Attr(g_me, Shield), uex::Attr(g_me, Ult), uex::Attr(g_me, kSpirit)};
+               uex::Attr(g_me, Shield), uex::Attr(g_me, Ult), uex::Attr(g_me, uex::attr::Spirit)};
     uex::Log(L"fight: saved hp %.0f min %.0f shachi %.0f shield %.0f", g_saved.health, g_saved.healthMin, g_saved.shachi, g_saved.shield);
 }
 
@@ -736,8 +736,8 @@ void ResetLocal() {
     uex::SetAttr(g_me, Shachi, uex::Attr(g_me, ShachiMax));
     uex::SetAttr(g_me, Shield, 0.f);
     uex::SetAttr(g_me, Ult, 0.f);
-    uex::SetAttr(g_me, kSpirit, uex::Attr(g_me, kSpiritMax));
-    for (int off = kAccFirst; off <= kAccLast; off += 0x10) uex::SetAttr(g_me, off, 0.f);
+    uex::SetAttr(g_me, uex::attr::Spirit, uex::Attr(g_me, uex::attr::SpiritMax));
+    for (int off = uex::attr::AccFirst, last = uex::attr::AccLast; off <= last; off += 0x10) uex::SetAttr(g_me, off, 0.f);
     g_resetOk = uex::Attr(g_me, HealthMax) > 0;
     uex::Log(L"fight: reset hp %.0f shachi %.0f, cancelled %d, effects removed %d", uex::Attr(g_me, Health), uex::Attr(g_me, Shachi), moves, fx);
 }
@@ -761,7 +761,7 @@ bool ActivateAbility(UObject* ch, const wchar_t* gaClassName) {
     return cls && uex::Ability(ch, cls);
 }
 void PlayMontageAt(UObject* ch, UObject* m, float pos, float rate) {
-    auto mesh = At<UObject*>(ch, 0x330); if (!mesh || !m) return;
+    auto mesh = MeshOf(ch); if (!mesh || !m) return;
     Params g(uex::Fn(mesh, L"GetAnimInstance")); g.Call(mesh);
     if (auto ai = g.Get<UObject*>(L"ReturnValue")) MontPlay(ai, m, rate, pos);
 }
@@ -796,7 +796,7 @@ void RemoveGhost(Ghost& g) {
     // only the very actor we spawned, in the world we spawned it in, never the player's own
     if (!GhostLive(g) || uex::World() != g_fightWorld || g.actor == uex::Me()) return;
     if (g_me && uex::Me() == g_me) uex::Hostile(g_me, g.actor, false);
-    if (auto c = At<UObject*>(g.actor, 0x2e0); c && c != uex::PC()) uex::Destroy(c);
+    if (auto c = CtrlOf(g.actor); c && c != uex::PC()) uex::Destroy(c);
     DestroyActor(g.actor);
     uex::Log(L"fight: ghost %d destroy -> alive %d", g.slot, int(uex::Get(g.ref) != nullptr));
 }
@@ -806,7 +806,7 @@ void RemoveGhosts() {
 }
 void ForgetObjects() {
     g_montIds.clear(); g_remoteMont.clear(); g_hitMont[0] = g_hitMont[1] = {}; g_hitMontSearched = false;
-    g_isHit.clear(); g_montByName.clear(); g_gaCls.clear(); g_propOff.clear(); g_deathLenOf = nullptr;
+    g_isHit.clear(); g_montByName.clear(); g_gaCls.clear(); g_deathLenOf = nullptr;
 }
 }  // namespace
 
@@ -946,7 +946,7 @@ void MatchOver() {
         uex::SetAttr(me, Shachi, g_saved.shachi);
         uex::SetAttr(me, Shield, g_saved.shield);
         uex::SetAttr(me, Ult, g_saved.ult);
-        uex::SetAttr(me, kSpirit, g_saved.spirit);
+        uex::SetAttr(me, uex::attr::Spirit, g_saved.spirit);
         uex::Log(L"fight: match over, restored hp %.0f min %.0f", g_saved.health, g_saved.healthMin);
     }
     g_saved = {};
