@@ -20,6 +20,10 @@
 // Weapons: "W <config path>" (SURE, again on change, QUICK every 2 s) -> ghost SetSlotWeapon.
 // Phantom Edge (杀器): "E <config path>" (same schedule) -> ghost Weapon.Slot.Shachi; only Phantom Edge configs (IsEdgeConfig) are loaded.
 // ext: [0]='S', [1..2] shield permille.
+// Alert VFX: the attack warnings (NS_AttackAlert*, e.g. the blue light of a Phantom-Edge-charged
+// heavy) come from the ability, not the montage, so a ghost never shows them. A new one attached
+// under our mesh sends "V <asset>|<parent actor class>|<parent component>|<socket>|x y z|p y r"
+// (SURE); the receiver spawns it on the ghost's matching component (else its mesh).
 #include "fight.h"
 #include "weapons.h"
 #include "outfits.h"
@@ -81,6 +85,7 @@ struct Ghost {
     double weaponRetryAt = 0; // a weapon that did not take is tried again from then
     float baseMax = -1;       // its own Health_Max before the damage-% scaling
     double spawnedAt = -100;  // the game settles a new pawn's attributes (Health can drop to its Min): no hits then
+    double fxAt = -100;       // last alert VFX spawned on it
 };
 
 bool g_on;
@@ -549,6 +554,95 @@ void OnOutfit(int slot, const std::string& ev) {
     uex::Log(L"fight: slot %d outfit %S skin %d hat %d", slot, o.id.c_str(), o.skin, o.hat);
 }
 
+// ---- alert VFX ---------------------------------------------------------------------------
+struct CompArr { UObject** d; int n, m; };
+// components attached under c (depth-limited), c excluded
+void AttachTree(UObject* c, std::vector<UObject*>& out, int depth) {
+    if (!c || depth > 4) return;
+    auto a = Field<CompArr>(c, L"AttachChildren");
+    if (!a || !a->d || a->n <= 0 || a->n > 256) return;
+    for (int i = 0; i < a->n; ++i) {
+        UObject* k = a->d[i];
+        if (!k || !uex::Alive(k)) continue;
+        out.push_back(k);
+        AttachTree(k, out, depth + 1);
+    }
+}
+bool IsAlertAsset(const std::wstring& p) {
+    return p.rfind(L"/PBZVFXPack/", 0) == 0 && p.find(L"AttackAlert") != std::wstring::npos && p.find(L'|') == std::wstring::npos;
+}
+UObject* NiagaraAsset(UObject* c) {
+    static UObject* cls = uex::Class(L"Class /Script/Niagara.NiagaraComponent");
+    if (!cls || !c || c->cls != cls) return nullptr;
+    auto as = Field<UObject*>(c, L"Asset");
+    return as ? *as : nullptr;
+}
+std::set<UObject*> g_fxSeen;  // alert components under our mesh last frame
+bool g_fxPrimed;              // the first look only records what is already there
+void PublishFx() {
+    std::vector<UObject*> tree; AttachTree(MeshOf(g_me), tree, 0);
+    std::set<UObject*> now;
+    for (UObject* c : tree) {
+        UObject* sys = NiagaraAsset(c); if (!sys) continue;
+        std::wstring path = PathOf(sys);
+        if (!IsAlertAsset(path)) continue;
+        now.insert(c);
+        if (!g_fxPrimed || g_fxSeen.count(c)) continue;
+        UObject* par = nullptr; if (auto ap = Field<UObject*>(c, L"AttachParent")) par = *ap;
+        std::wstring parCls = par && par->outer && par->outer->cls ? NameOf(par->outer->cls) : L"";
+        std::wstring parName = par ? NameOf(par) : L"";
+        std::wstring sock; if (auto sn = Field<FName>(c, L"AttachSocketName")) sock = NameOf(*sn);
+        if (sock == L"None") sock.clear();
+        Vec l = kRelLoc.Of<Vec>(c); Rot r = kRelRot.Of<Rot>(c);
+        char nums[128]; snprintf(nums, sizeof nums, "|%.1f %.1f %.1f|%.1f %.1f %.1f", l.x, l.y, l.z, r.pitch, r.yaw, r.roll);
+        net::Sure("V " + uex::Utf8(path) + "|" + uex::Utf8(parCls) + "|" + uex::Utf8(parName) + "|" + uex::Utf8(sock) + nums);
+        uex::Log(L"fight: alert fx %s on %s.%s sent", NameOf(sys).c_str(), parCls.c_str(), parName.c_str());
+    }
+    g_fxSeen.swap(now); g_fxPrimed = true;
+}
+void OnFx(int slot, const std::string& ev) {
+    // asset|parent class|parent comp|socket|x y z|p y r
+    std::vector<std::string> f; size_t b = 0;
+    for (size_t i = 0; i <= ev.size(); ++i) if (i == ev.size() || ev[i] == '|') { f.push_back(ev.substr(b, i - b)); b = i + 1; }
+    std::wstring path = f.empty() ? L"" : uex::Wide(f[0]);
+    Vec l; Rot r;
+    if (f.size() != 6 || !IsAlertAsset(path) || sscanf(f[4].c_str(), "%lf %lf %lf", &l.x, &l.y, &l.z) != 3 ||
+        sscanf(f[5].c_str(), "%lf %lf %lf", &r.pitch, &r.yaw, &r.roll) != 3 ||
+        !std::isfinite(l.x + l.y + l.z + r.pitch + r.yaw + r.roll) || std::fabs(l.x) + std::fabs(l.y) + std::fabs(l.z) > 1e4) {
+        static double at = -10;
+        if (net::Now() - at > 5) { at = net::Now(); uex::Log(L"fight: slot %d sent a bad fx event, ignored", slot); }
+        return;
+    }
+    auto it = g_ghosts.find(slot);
+    if (it == g_ghosts.end() || !GhostLive(it->second)) return;
+    Ghost& g = it->second;
+    double now = net::Now();
+    if (now - g.fxAt < 0.1) return;  // a peer cannot flood the ghost with systems
+    g.fxAt = now;
+    UObject* mesh = MeshOf(g.actor); if (!mesh) return;
+    std::wstring parCls = uex::Wide(f[1]), parName = uex::Wide(f[2]), sock = uex::Wide(f[3]);
+    UObject* at = mesh;
+    std::vector<UObject*> tree; AttachTree(mesh, tree, 0);
+    for (UObject* c : tree)
+        if (NameOf(c) == parName && c->outer && c->outer->cls && NameOf(c->outer->cls) == parCls) { at = c; break; }
+    if (at == mesh && !parName.empty() && parCls != NameOf(g.actor->cls)) { sock.clear(); l = {}; r = {}; }  // no such part: at the mesh root
+    try {
+        auto lib = uex::Lib(L"NiagaraFunctionLibrary /Script/Niagara.Default__NiagaraFunctionLibrary");
+        auto sys = uex::LoadAsset(path.c_str());
+        if (!lib || !sys) return;
+        Params p(uex::Fn(lib, L"SpawnSystemAttached"));
+        p.Set(L"SystemTemplate", sys); p.Set(L"AttachToComponent", at);
+        p.Set(L"AttachPointName", sock.empty() ? FName{} : uex::Name(sock));
+        p.Set(L"Location", l); p.Set(L"Rotation", r);
+        p.Set<uint8_t>(L"LocationType", 0);  // EAttachLocation::KeepRelativeOffset
+        p.Set<bool>(L"bAutoDestroy", true); p.Set<bool>(L"bAutoActivate", true);
+        p.Set<uint8_t>(L"PoolingMethod", 0); p.Set<bool>(L"bPreCullCheck", false);
+        p.Call(lib);
+        uex::Log(L"fight: slot %d alert fx %s on %s -> %s", slot, path.c_str(), NameOf(at).c_str(),
+                 p.Get<UObject*>(L"ReturnValue") ? L"ok" : L"none");
+    } catch (...) { uex::Log(L"fight: alert fx crashed %s", path.c_str()); }
+}
+
 void Events() {
     net::Event e;
     while (net::PollEvent(e)) {
@@ -571,6 +665,8 @@ void Events() {
             OnEdge(e.slot, e.text.substr(2));
         } else if (e.text.size() > 2 && e.text[0] == 'O' && e.text[1] == ' ') {
             OnOutfit(e.slot, e.text);
+        } else if (e.text.size() > 2 && e.text[0] == 'V' && e.text[1] == ' ') {
+            OnFx(e.slot, e.text.substr(2));
         }
     }
 }
@@ -580,6 +676,7 @@ void DrainEvents() {
         if (e.text.rfind("W ", 0) == 0) OnWeapon(e.slot, e.text.substr(2));
         else if (e.text.rfind("E ", 0) == 0) OnEdge(e.slot, e.text.substr(2));
         else if (e.text.rfind("O ", 0) == 0) OnOutfit(e.slot, e.text);
+        else if (e.text.rfind("V ", 0) == 0) {}  // a past effect
         else ++n;
     }
     if (n) uex::Log(L"fight: dropped %d queued events", n);
@@ -619,6 +716,7 @@ void Publish() {
         s.extLen = 3; s.ext[0] = 'S'; s.ext[1] = uint8_t(sp); s.ext[2] = uint8_t(sp >> 8);
     }
     net::SetLocalState(s);
+    PublishFx();
     // weapon: SURE on change, QUICK every 2 s (a peer that joined late or a dropped STATE)
     double now = net::Now();
     if (now >= g_nextWeaponSend) {
@@ -807,6 +905,7 @@ void RemoveGhosts() {
 void ForgetObjects() {
     g_montIds.clear(); g_remoteMont.clear(); g_hitMont[0] = g_hitMont[1] = {}; g_hitMontSearched = false;
     g_isHit.clear(); g_montByName.clear(); g_gaCls.clear(); g_deathLenOf = nullptr;
+    g_fxSeen.clear(); g_fxPrimed = false;
 }
 }  // namespace
 

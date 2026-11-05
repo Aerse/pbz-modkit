@@ -234,25 +234,33 @@ const char* kTestPw = "pw t%1";  // the lobby test runs the server with --passwo
 int Client(int port, const std::string& code, double seconds) {
     net::SetServer("127.0.0.1", port);
     net::SetPassword(kTestPw);
+    net::Intern("/Game/Anim/Played_Before");  // a game that already played a match: its string table is resent on join
     net::Join(code, "child \xE4\xB9\x99 b,c");
     if (!WaitFor(5, [] { return net::GetStatus() == net::Status::InRoom && !Phase().empty(); })) { printf("child: join failed %s\n", net::LastError().c_str()); return 2; }
     net::SetWeapon("/Game/Weapons/Sword A");
     net::SetReady(true);
     Sender tx; tx.t0 = 1000.0;  // fixed epoch shared with the parent (same machine QPC clock)
     tx.mont = net::Intern("/Game/Anim/Test_Montage");
-    bool arena = false;
+    bool arena = false, hostMont = false;
+    Receiver rx; rx.t0 = 1000.0; rx.slot = -1;  // the other direction: the host's SURE and montage reach us
     RunFrames(seconds, [&](double now) {
         net::Room r;
         if (net::GetRoom(r)) {
             if (r.phase == "load" && !arena) { net::ArenaReady(r.round); arena = true; }
             if (r.phase == "fight") net::Hp(r.round, 900);
+            if (rx.slot < 0 && r.host != r.you) rx.slot = r.host;
         }
         tx.Frame(now);
+        if (rx.slot >= 0) {
+            rx.Frame(now, false);
+            net::State hs;
+            if (net::Sample(rx.slot, hs, now) && hs.montage && net::Lookup(rx.slot, hs.montage) == "/Game/Anim/Host_Montage") hostMont = true;
+        }
     });
-    printf("child: sent sure=%d quick=%d\n", tx.sureSent, tx.quickSent);
+    printf("child: sent sure=%d quick=%d | from host: sure=%d inOrder=%d montage=%d\n", tx.sureSent, tx.quickSent, rx.sureGot, rx.sureOrder, hostMont);
     net::Leave();
     net::Shutdown();
-    return 0;
+    return rx.sureOrder && rx.sureGot > 0 && hostMont ? 0 : 3;
 }
 
 void LobbyTest() {
@@ -268,6 +276,7 @@ void LobbyTest() {
     bool refused = WaitFor(5, [] { return net::GetStatus() == net::Status::Failed; });
     Check("create without password refused", refused && net::LastError() == "password", "%s", net::LastError().c_str());
     net::SetPassword(kTestPw);
+    net::Intern("/Game/Anim/Host_Played_Before");  // the host played a match before too
     net::Create("host \xE7\x94\xB2", 2);
     bool ok = WaitFor(5, [] { return net::GetStatus() == net::Status::InRoom && !Phase().empty(); });
     Check("create", ok, "%s", ok ? "" : net::LastError().c_str());
@@ -287,6 +296,8 @@ void LobbyTest() {
     net::Start();
     std::vector<std::string> seen;
     Receiver rx; rx.slot = -1; rx.t0 = 1000.0;
+    Sender htx; htx.t0 = 1000.0;  // the host sends too: its hits and montages must reach the child
+    htx.mont = net::Intern("/Game/Anim/Host_Montage");
     bool arena = false, haveData = false;
     double t = net::Now();
     while (net::Now() - t < seconds - 4) {
@@ -296,6 +307,7 @@ void LobbyTest() {
         if (ph == "load" && !arena) { net::GetRoom(r); net::ArenaReady(r.round); arena = true; }
         if (rx.slot < 0) { auto sl = net::RemoteSlots(); if (!sl.empty()) rx.slot = sl[0]; }
         if (rx.slot >= 0) { haveData = true; rx.Frame(now, true); }
+        htx.Frame(now);
         SleepMs(1000.0 / 60);
     }
     auto has = [&](const char* p) { return std::find(seen.begin(), seen.end(), p) != seen.end(); };
@@ -309,6 +321,8 @@ void LobbyTest() {
     Check("lobby SURE in order", rx.sureOrder && rx.sureGot > 0, "");
     Check("lobby montage interned", rx.montOk, "");
     WaitForSingleObject(pc.hProcess, 10000);
+    DWORD crc = 99; GetExitCodeProcess(pc.hProcess, &crc);
+    Check("child got host SURE + montage", crc == 0, "child exit %lu", crc);
     net::Leave();
     TerminateProcess(ps.hProcess, 0);
     CloseHandle(ps.hProcess); CloseHandle(pc.hProcess);

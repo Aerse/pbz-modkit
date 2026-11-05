@@ -286,7 +286,11 @@ uint32_t PeerMask() {
     S& s = g().s;
     if (s.loop) return 1u << 1;
     uint32_t m = 0;
-    if (!s.haveRoom) return 0;
+    // peers heard from count too: a member the room STATE does not list yet must still get its SURE
+    double now = NowMs();
+    for (auto& [slot, r] : s.rem)
+        if (r.has && slot >= 0 && slot < 32 && slot != s.room.you && now - r.lastRecv < 5000) m |= 1u << slot;
+    if (!s.haveRoom) return m;
     for (auto& mb : s.room.members)
         if (mb.slot != s.room.you && mb.conn && mb.slot >= 0 && mb.slot < 32) m |= 1u << mb.slot;
     return m;
@@ -309,10 +313,17 @@ void NewSession() {
     s.osure.clear();
     s.oquick.clear();
     s.sessionAt = NowMs();
-    // Re-send every interned string so local ids stay valid across sessions.
+    Wake();  // every peer starts over on the new session: PeerReset sends it the strings
+}
+
+// A peer whose receiver starts over (its first packet, or it came back with a new session) has none of
+// our strings: they go out again. Older ids it never got are skipped through the floor (section 5).
+void PeerReset(int slot) {
+    S& s = g().s;
+    if (slot < 0 || slot >= 32) return;
     for (size_t i = 0; i < s.internList.size(); ++i)
         QueueSureLocked(std::string("\x01 ") + std::to_string(i + 1) + " " + s.internList[i]);
-    Wake();
+    s.evPending = true;
 }
 
 void ResetRoom() {
@@ -398,6 +409,10 @@ void SendGame() {
         w.u16(r.sureNext);
         w.u32(bits);
     }
+    // SURE floor: ids below it are not kept for re-sending any more (acked by every peer, or dropped
+    // while no peer was there to ack them). A receiver still waiting for one skips to the floor.
+    w.u8(5); w.u16(2);
+    w.u16(s.osure.empty() ? s.sureId : s.osure.front().id);
     int budget = std::min<int>(kEvBudget, kMaxPayload - (int)w.b.size());
     for (auto& e : s.osure) {
         int need = 7 + (int)e.bytes.size();
@@ -489,13 +504,16 @@ void ProcessGame(const uint8_t* d, size_t n, int slot, double tr) {
     uint32_t tSend = rd.u32();
     if (!rd.ok) return;
     Remote& r = s.rem[slot];
+    bool fresh = !r.has;
     if (r.has && session != r.session) {
         if (std::find(r.oldSess.begin(), r.oldSess.end(), session) != r.oldSess.end()) return;  // stale
         uint16_t prev = r.session;
         ResetRemote(r);
         r.oldSess.push_back(prev);
         if (r.oldSess.size() > 8) r.oldSess.pop_front();
+        fresh = true;  // it restarted: its receiver of us starts over too
     }
+    if (fresh) PeerReset(slot);
     r.has = true;
     r.session = session;
     // sequence / loss
@@ -546,6 +564,7 @@ void ProcessGame(const uint8_t* d, size_t n, int slot, double tr) {
             sec.u8(); sec.u8(); sec.u8();
             st.extLen = sec.u8();
             if (len != 49 + st.extLen) continue;
+            if (age > 1000) continue;  // a stale state (the age saturates at 65535) would wreck the timeline
             memcpy(st.ext, sec.p + sec.i, st.extLen);
             double ts = ts64 - age;
             auto it = std::lower_bound(r.samples.begin(), r.samples.end(), ts, [](const Smp& a, double t) { return a.ts < t; });
@@ -600,6 +619,13 @@ void ProcessGame(const uint8_t* d, size_t n, int slot, double tr) {
                 int dd = D16(e.id, next);
                 if (dd < 0 || (dd >= 1 && dd <= 32 && (bits >> (dd - 1)) & 1)) e.acked |= bit;
             }
+        } else if (type == 5) {  // the sender's floor for us: ids below it are never coming
+            if (len < 2) continue;
+            uint16_t f = sec.u16();
+            if (D16(f, r.sureNext) <= 0 || D16(f, r.sureNext) > 4096) continue;
+            for (auto it = r.sureBuf.begin(); it != r.sureBuf.end();) it = D16(it->first, f) < 0 ? r.sureBuf.erase(it) : std::next(it);
+            r.sureNext = f;
+            DeliverSureInOrder(r);
         }
     }
 }
