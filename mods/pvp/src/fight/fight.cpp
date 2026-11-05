@@ -85,7 +85,9 @@ struct Ghost {
     double weaponRetryAt = 0; // a weapon that did not take is tried again from then
     float baseMax = -1;       // its own Health_Max before the damage-% scaling
     double spawnedAt = -100;  // the game settles a new pawn's attributes (Health can drop to its Min): no hits then
-    double fxAt = -100;       // last alert VFX spawned on it
+    double fxAt = -100;       // start of the current alert VFX window
+    int fxN = 0;              // alert VFX spawned in that window
+    std::map<int, uex::Ref> fx;  // peer's fx id -> our copy (ended by "X <id>")
 };
 
 bool g_on;
@@ -93,6 +95,7 @@ int g_round;
 bool g_dead;
 int g_lastHitter = -1;
 double g_lastHitAt = -100;
+double g_lastHitSent = -100;  // our last "hit" event: blood on the ghost after it is ours
 double g_nextHp;
 // player state before the first round of the match, put back by MatchOver
 struct Saved { bool valid = false; float health, healthMin, shachi, shield, ult, spirit; } g_saved;
@@ -392,7 +395,7 @@ void GhostHp(Ghost& g, const net::State& s) {
             // the ghost's Health_Min = 1 truncates the drop of a killing blow: make it lethal
             if (drop > 0.01f && h <= 1.01f && sh <= 0.01f) frac = (std::max)(frac, 1.5f);
             char b[160]; snprintf(b, sizeof b, "hit %d %.2f %d %.5f %d %.4f %.0f", g.slot, amt, MySlot(), frac, g_round, pdrop, RootYaw(g_me));
-            net::Sure(b);
+            net::Sure(b); g_lastHitSent = net::Now();
             uex::Log(L"fight: hit ghost %d dmg %.1f (%.1f%%) posture %.1f%% round %d", g.slot, amt, frac * 100, pdrop * 100, g_round);
         }
     }
@@ -445,6 +448,7 @@ bool FromBehind(int from, double attackerYaw) {
     return std::fabs(rel) > 100;
 }
 
+void HitStop();
 void ApplyHit(float amt, float frac, int from, float posture, bool back) {
     using namespace uex::attr;
     if (g_dead || !g_me) return;
@@ -462,7 +466,21 @@ void ApplyHit(float amt, float frac, int from, float posture, bool back) {
     g_lastHitter = from; g_lastHitAt = net::Now();
     uex::Log(L"fight: took %.1f (shield %.1f) from %d hp %.1f -> %.1f", d, fromShield, from, h, nh);
     g_lastHitBack = back;
-    if (nh > 1.f && d > 0.01f) HitReaction(back);  // posture only (deflected): no flinch
+    if (nh > 1.f && d > 0.01f) { HitReaction(back); HitStop(); }  // posture only (deflected): no flinch
+}
+
+// hit-stop on the victim: the game freezes only the attacker (CustomTimeDilation ~0.05 for ~70 ms);
+// a networked hit gets the same short freeze on our own pawn. Left alone if the game set one.
+double g_stopUntil;
+void HitStop() {
+    auto d = Field<float>(g_me, L"CustomTimeDilation");
+    if (!d || std::fabs(*d - 1.f) > 1e-3f) return;
+    *d = 0.05f; g_stopUntil = net::Now() + 0.07;
+}
+void HitStopTick() {
+    if (!g_stopUntil || net::Now() < g_stopUntil) return;
+    g_stopUntil = 0;
+    if (auto d = g_me ? Field<float>(g_me, L"CustomTimeDilation") : nullptr; d && std::fabs(*d - 0.05f) < 1e-3f) *d = 1.f;
 }
 
 // victim side: what our own state makes of an incoming hit
@@ -568,57 +586,125 @@ void AttachTree(UObject* c, std::vector<UObject*>& out, int depth) {
         AttachTree(k, out, depth + 1);
     }
 }
-bool IsAlertAsset(const std::wstring& p) {
-    return p.rfind(L"/PBZVFXPack/", 0) == 0 && p.find(L"AttackAlert") != std::wstring::npos && p.find(L'|') == std::wstring::npos;
+// skill VFX on our mesh / weapons: anything from the VFX pack but footsteps and the blood on a body
+// (the victim's: see PublishBlood). Pooled components come back: an activation counts.
+bool IsPackAsset(const std::wstring& p) {
+    return p.rfind(L"/PBZVFXPack/", 0) == 0 && p.size() < 200 && p.find(L'|') == std::wstring::npos &&
+           p.find(L"FootStep") == std::wstring::npos;
 }
+bool IsBodyBlood(const std::wstring& p) { return p.find(L"/Blood") != std::wstring::npos && p.find(L"BloodTrail") == std::wstring::npos; }
+bool IsSyncAsset(const std::wstring& p) { return IsPackAsset(p) && !IsBodyBlood(p); }
 UObject* NiagaraAsset(UObject* c) {
     static UObject* cls = uex::Class(L"Class /Script/Niagara.NiagaraComponent");
-    if (!cls || !c || c->cls != cls) return nullptr;
+    if (!cls || !c || !IsA(c, cls)) return nullptr;
     auto as = Field<UObject*>(c, L"Asset");
     return as ? *as : nullptr;
 }
-std::set<UObject*> g_fxSeen;  // alert components under our mesh last frame
-bool g_fxPrimed;              // the first look only records what is already there
+bool CompActive(UObject* c) {
+    Params p(uex::Fn(c, L"IsActive")); p.Call(c); return p.Get<bool>(L"ReturnValue");
+}
+// blood our hits put on a ghost's body: the victim's own game never shows it. "Y <victim>|<V fields>"
+std::set<UObject*> g_bloodSeen;
+void PublishBlood() {
+    std::set<UObject*> now;
+    for (auto& [slot, g] : g_ghosts) {
+        if (!GhostLive(g)) continue;
+        std::vector<UObject*> tree; AttachTree(MeshOf(g.actor), tree, 0);
+        for (UObject* c : tree) {
+            UObject* sys = NiagaraAsset(c); if (!sys || !CompActive(c)) continue;
+            std::wstring path = PathOf(sys);
+            if (!IsPackAsset(path) || !IsBodyBlood(path)) continue;
+            now.insert(c);
+            if (g_bloodSeen.count(c) || net::Now() - g_lastHitSent > 1.0) continue;  // only right after a hit we sent
+            std::wstring sock; if (auto sn = Field<FName>(c, L"AttachSocketName")) sock = NameOf(*sn);
+            if (sock == L"None") sock.clear();
+            Vec l = kRelLoc.Of<Vec>(c); Rot r = kRelRot.Of<Rot>(c);
+            char nums[128]; snprintf(nums, sizeof nums, "|%.1f %.1f %.1f|%.1f %.1f %.1f", l.x, l.y, l.z, r.pitch, r.yaw, r.roll);
+            net::Sure("Y " + std::to_string(slot) + "|" + uex::Utf8(path) + "|||" + uex::Utf8(sock) + nums);
+        }
+    }
+    g_bloodSeen.swap(now);
+}
+std::map<UObject*, int> g_fxSeen;  // active synced components under our mesh -> id sent
+bool g_fxPrimed;                    // the first look only records what is already there
+int g_fxNext;
 void PublishFx() {
     std::vector<UObject*> tree; AttachTree(MeshOf(g_me), tree, 0);
-    std::set<UObject*> now;
+    std::map<UObject*, int> now;
     for (UObject* c : tree) {
-        UObject* sys = NiagaraAsset(c); if (!sys) continue;
+        UObject* sys = NiagaraAsset(c); if (!sys || !CompActive(c)) continue;
         std::wstring path = PathOf(sys);
-        if (!IsAlertAsset(path)) continue;
-        now.insert(c);
-        if (!g_fxPrimed || g_fxSeen.count(c)) continue;
+        if (!IsSyncAsset(path)) continue;
+        if (auto it = g_fxSeen.find(c); it != g_fxSeen.end()) { now[c] = it->second; continue; }
+        if (!g_fxPrimed) { now[c] = 0; continue; }
+        if (++g_fxNext > 30000) g_fxNext = 1;
+        int id = now[c] = g_fxNext;
         UObject* par = nullptr; if (auto ap = Field<UObject*>(c, L"AttachParent")) par = *ap;
         std::wstring parCls = par && par->outer && par->outer->cls ? NameOf(par->outer->cls) : L"";
         std::wstring parName = par ? NameOf(par) : L"";
         std::wstring sock; if (auto sn = Field<FName>(c, L"AttachSocketName")) sock = NameOf(*sn);
         if (sock == L"None") sock.clear();
         Vec l = kRelLoc.Of<Vec>(c); Rot r = kRelRot.Of<Rot>(c);
-        char nums[128]; snprintf(nums, sizeof nums, "|%.1f %.1f %.1f|%.1f %.1f %.1f", l.x, l.y, l.z, r.pitch, r.yaw, r.roll);
+        char nums[128]; snprintf(nums, sizeof nums, "|%.1f %.1f %.1f|%.1f %.1f %.1f|%d", l.x, l.y, l.z, r.pitch, r.yaw, r.roll, id);
         net::Sure("V " + uex::Utf8(path) + "|" + uex::Utf8(parCls) + "|" + uex::Utf8(parName) + "|" + uex::Utf8(sock) + nums);
-        uex::Log(L"fight: alert fx %s on %s.%s sent", NameOf(sys).c_str(), parCls.c_str(), parName.c_str());
+        uex::Log(L"fight: fx %s on %s.%s sent (%d)", NameOf(sys).c_str(), parCls.c_str(), parName.c_str(), id);
     }
+    for (auto& [c, id] : g_fxSeen)  // gone or deactivated: the copy ends too (looping buffs)
+        if (id && !now.count(c)) net::Sure("X " + std::to_string(id));
     g_fxSeen.swap(now); g_fxPrimed = true;
+    PublishBlood();
 }
-void OnFx(int slot, const std::string& ev) {
-    // asset|parent class|parent comp|socket|x y z|p y r
-    std::vector<std::string> f; size_t b = 0;
+UObject* SpawnFx(const std::wstring& path, UObject* at, const std::wstring& sock, Vec l, Rot r) {
+    auto lib = uex::Lib(L"NiagaraFunctionLibrary /Script/Niagara.Default__NiagaraFunctionLibrary");
+    auto sys = uex::LoadAsset(path.c_str());
+    if (!lib || !sys) return nullptr;
+    Params p(uex::Fn(lib, L"SpawnSystemAttached"));
+    p.Set(L"SystemTemplate", sys); p.Set(L"AttachToComponent", at);
+    p.Set(L"AttachPointName", sock.empty() ? FName{} : uex::Name(sock));
+    p.Set(L"Location", l); p.Set(L"Rotation", r);
+    p.Set<uint8_t>(L"LocationType", 0);  // EAttachLocation::KeepRelativeOffset
+    p.Set<bool>(L"bAutoDestroy", true); p.Set<bool>(L"bAutoActivate", true);
+    p.Set<uint8_t>(L"PoolingMethod", 0); p.Set<bool>(L"bPreCullCheck", false);
+    p.Call(lib);
+    return p.Get<UObject*>(L"ReturnValue");
+}
+// fields of a V / Y event: asset|parent class|parent comp|socket|x y z|p y r[|id]
+bool ParseFx(const std::string& ev, std::vector<std::string>& f, std::wstring& path, Vec& l, Rot& r) {
+    size_t b = 0;
     for (size_t i = 0; i <= ev.size(); ++i) if (i == ev.size() || ev[i] == '|') { f.push_back(ev.substr(b, i - b)); b = i + 1; }
-    std::wstring path = f.empty() ? L"" : uex::Wide(f[0]);
-    Vec l; Rot r;
-    if (f.size() != 6 || !IsAlertAsset(path) || sscanf(f[4].c_str(), "%lf %lf %lf", &l.x, &l.y, &l.z) != 3 ||
-        sscanf(f[5].c_str(), "%lf %lf %lf", &r.pitch, &r.yaw, &r.roll) != 3 ||
-        !std::isfinite(l.x + l.y + l.z + r.pitch + r.yaw + r.roll) || std::fabs(l.x) + std::fabs(l.y) + std::fabs(l.z) > 1e4) {
+    path = f.empty() ? L"" : uex::Wide(f[0]);
+    return f.size() >= 6 && f.size() <= 7 && IsPackAsset(path) && sscanf(f[4].c_str(), "%lf %lf %lf", &l.x, &l.y, &l.z) == 3 &&
+           sscanf(f[5].c_str(), "%lf %lf %lf", &r.pitch, &r.yaw, &r.roll) == 3 &&
+           std::isfinite(l.x + l.y + l.z + r.pitch + r.yaw + r.roll) && std::fabs(l.x) + std::fabs(l.y) + std::fabs(l.z) <= 1e4;
+}
+double g_bloodAt = -100; int g_bloodN;
+// "Y <victim>|..": blood a peer's hit put on its copy of us, shown on our own body
+void OnBlood(int slot, const std::string& ev) {
+    size_t bar = ev.find('|'); if (bar == std::string::npos) return;
+    std::vector<std::string> f; std::wstring path; Vec l; Rot r;
+    if (atoi(ev.c_str()) != MySlot() || !g_me || !ParseFx(ev.substr(bar + 1), f, path, l, r) || !IsBodyBlood(path)) return;
+    double now = net::Now();
+    if (now - g_bloodAt >= 0.5) { g_bloodAt = now; g_bloodN = 0; }
+    if (++g_bloodN > 6) return;
+    UObject* mesh = MeshOf(g_me); if (!mesh) return;
+    try { SpawnFx(path, mesh, uex::Wide(f[3]), l, r); } catch (...) { uex::Log(L"fight: blood fx crashed %s", path.c_str()); }
+}
+void DeactivateFx(UObject* c) { Params p(uex::Fn(c, L"Deactivate")); p.Call(c); }
+void OnFx(int slot, const std::string& ev) {
+    std::vector<std::string> f; std::wstring path; Vec l; Rot r;
+    if (!ParseFx(ev, f, path, l, r) || !IsSyncAsset(path)) {
         static double at = -10;
         if (net::Now() - at > 5) { at = net::Now(); uex::Log(L"fight: slot %d sent a bad fx event, ignored", slot); }
         return;
     }
+    int id = f.size() == 7 ? atoi(f[6].c_str()) : 0;
     auto it = g_ghosts.find(slot);
     if (it == g_ghosts.end() || !GhostLive(it->second)) return;
     Ghost& g = it->second;
     double now = net::Now();
-    if (now - g.fxAt < 0.1) return;  // a peer cannot flood the ghost with systems
-    g.fxAt = now;
+    // a peer cannot flood the ghost with systems: 8 per 0.5 s (dual weapons send one per blade)
+    if (now - g.fxAt >= 0.5) { g.fxAt = now; g.fxN = 0; }
+    if (++g.fxN > 8) return;
     UObject* mesh = MeshOf(g.actor); if (!mesh) return;
     std::wstring parCls = uex::Wide(f[1]), parName = uex::Wide(f[2]), sock = uex::Wide(f[3]);
     UObject* at = mesh;
@@ -627,20 +713,22 @@ void OnFx(int slot, const std::string& ev) {
         if (NameOf(c) == parName && c->outer && c->outer->cls && NameOf(c->outer->cls) == parCls) { at = c; break; }
     if (at == mesh && !parName.empty() && parCls != NameOf(g.actor->cls)) { sock.clear(); l = {}; r = {}; }  // no such part: at the mesh root
     try {
-        auto lib = uex::Lib(L"NiagaraFunctionLibrary /Script/Niagara.Default__NiagaraFunctionLibrary");
-        auto sys = uex::LoadAsset(path.c_str());
-        if (!lib || !sys) return;
-        Params p(uex::Fn(lib, L"SpawnSystemAttached"));
-        p.Set(L"SystemTemplate", sys); p.Set(L"AttachToComponent", at);
-        p.Set(L"AttachPointName", sock.empty() ? FName{} : uex::Name(sock));
-        p.Set(L"Location", l); p.Set(L"Rotation", r);
-        p.Set<uint8_t>(L"LocationType", 0);  // EAttachLocation::KeepRelativeOffset
-        p.Set<bool>(L"bAutoDestroy", true); p.Set<bool>(L"bAutoActivate", true);
-        p.Set<uint8_t>(L"PoolingMethod", 0); p.Set<bool>(L"bPreCullCheck", false);
-        p.Call(lib);
-        uex::Log(L"fight: slot %d alert fx %s on %s -> %s", slot, path.c_str(), NameOf(at).c_str(),
-                 p.Get<UObject*>(L"ReturnValue") ? L"ok" : L"none");
-    } catch (...) { uex::Log(L"fight: alert fx crashed %s", path.c_str()); }
+        UObject* made = SpawnFx(path, at, sock, l, r);
+        if (made && id) {
+            if (g.fx.size() > 64) g.fx.clear();
+            if (auto old = uex::Get(g.fx[id])) DeactivateFx(old);
+            g.fx[id] = uex::Hold(made);
+        }
+        uex::Log(L"fight: slot %d fx %s on %s -> %s", slot, path.c_str(), NameOf(at).c_str(), made ? L"ok" : L"none");
+    } catch (...) { uex::Log(L"fight: fx crashed %s", path.c_str()); }
+}
+void OnFxEnd(int slot, const std::string& ev) {
+    auto it = g_ghosts.find(slot);
+    if (it == g_ghosts.end()) return;
+    auto f = it->second.fx.find(atoi(ev.c_str()));
+    if (f == it->second.fx.end()) return;
+    if (UObject* c = uex::Get(f->second)) DeactivateFx(c);
+    it->second.fx.erase(f);
 }
 
 void Events() {
@@ -667,6 +755,10 @@ void Events() {
             OnOutfit(e.slot, e.text);
         } else if (e.text.size() > 2 && e.text[0] == 'V' && e.text[1] == ' ') {
             OnFx(e.slot, e.text.substr(2));
+        } else if (e.text.size() > 2 && e.text[0] == 'X' && e.text[1] == ' ') {
+            OnFxEnd(e.slot, e.text.substr(2));
+        } else if (e.text.size() > 2 && e.text[0] == 'Y' && e.text[1] == ' ') {
+            OnBlood(e.slot, e.text.substr(2));
         }
     }
 }
@@ -951,13 +1043,14 @@ void Tick(float) {
     UObject* me = uex::Me();
     if (!me) return;
     if (me != g_me) {  // new pawn (respawned by the level): ours again, hostile to the ghosts
-        g_me = me; ResetLocal();
+        g_me = me; g_stopUntil = 0; ResetLocal();
         outfits::Wear(g_me, uex::Wide(outfits::Pick()));
         for (auto& [slot, g] : g_ghosts) if (GhostLive(g)) uex::Hostile(g_me, g.actor, true);
     }
     // a pawn whose attributes were not there yet at Begin (HealthMax 0) gets its reset once they are
     if (!g_resetOk && !g_dead && uex::Attr(g_me, uex::attr::HealthMax) > 0) ResetLocal();
     Events();
+    HitStopTick();
     Publish();
     outfits::Tick();
     net::Room r; bool room = net::GetRoom(r);
