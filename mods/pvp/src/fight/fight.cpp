@@ -27,6 +27,7 @@
 #include "fight.h"
 #include "weapons.h"
 #include "outfits.h"
+#include "houserules.h"
 #include <algorithm>
 #include <set>
 #include <windows.h>
@@ -370,6 +371,7 @@ void DriveGhost(Ghost& g, const net::State& s) {
 
 int DmgPct() { net::Room r; return net::GetRoom(r) && r.dmg > 0 ? r.dmg : 100; }
 int MySlot() { net::Room r; return net::GetRoom(r) ? r.you : 0; }
+rules::Rules RoomRules() { net::Room r; return net::GetRoom(r) ? rules::Parse(r.rules) : rules::Rules{}; }
 
 float ExtShield(const net::State& s) {  // remote Shield as a fraction of its Health_Max
     return s.extLen >= 3 && s.ext[0] == 'S' ? (s.ext[1] | s.ext[2] << 8) / 1000.f : 0.f;
@@ -390,6 +392,8 @@ void GhostHp(Ghost& g, const net::State& s) {
         float drop = (g.shownHp - h) + (g.shownShield - sh);
         float pdrop = smx > 0 && g.shownShachi >= 0 ? (std::max)(0.f, g.shownShachi - sc) / smx : 0.f;
         if (drop > 0.01f || pdrop > 0.01f) {
+            float hs = houserules::OutgoingScale(g_me);  // sd%: Phantom Edge moves
+            drop *= hs; pdrop *= hs;
             float frac = drop / mx;     // as a fraction: the victim's max may differ
             float amt = frac * g.baseMax;
             // the ghost's Health_Min = 1 truncates the drop of a killing blow: make it lethal
@@ -1009,6 +1013,14 @@ bool TestAbility(const wchar_t* n) {
     return ActivateAbility(g_me, s.c_str());
 }
 
+bool GhostAnchor(int slot, float out[3]) {
+    auto it = g_ghosts.find(slot);
+    if (it == g_ghosts.end() || !GhostLive(it->second)) return false;
+    uex::Vec l = uex::Loc(it->second.actor);
+    out[0] = float(l.x); out[1] = float(l.y); out[2] = float(l.z) + 120.f;  // capsule centre + about a head
+    return true;
+}
+
 void Begin(int round) {
     g_me = uex::Me();
     g_round = round; g_dead = false; g_lastHitter = -1; g_nextHp = 0; g_deathMont = {}; g_lastHitBack = false;
@@ -1029,6 +1041,7 @@ void Begin(int round) {
     outfits::Wear(g_me, uex::Wide(outfits::Pick()));     // the lobby pick (no-op when already worn)
     g_sentOutfit.clear(); g_nextOutfitSend = 0;
     ResetLocal();
+    houserules::Begin(RoomRules(), g_me);
     if (uex::World() != g_fightWorld) { RemoveGhosts(); g_fightWorld = uex::World(); }  // the old ones went with their world
     for (auto& [slot, g] : g_ghosts) { g.shownHp = -1; g.shownShachi = -1; g.applied = nullptr; }
     g_spawnAt.clear();
@@ -1038,7 +1051,7 @@ void Begin(int round) {
     uex::Log(L"fight: begin round %d ghosts %zu", round, g_ghosts.size());
 }
 
-void Tick(float) {
+void Tick(float dt) {
     if (!g_on) return;
     UObject* me = uex::Me();
     if (!me) return;
@@ -1049,6 +1062,7 @@ void Tick(float) {
     }
     // a pawn whose attributes were not there yet at Begin (HealthMax 0) gets its reset once they are
     if (!g_resetOk && !g_dead && uex::Attr(g_me, uex::attr::HealthMax) > 0) ResetLocal();
+    houserules::Tick(RoomRules(), g_me, dt);
     Events();
     HitStopTick();
     Publish();
@@ -1115,6 +1129,7 @@ void Tick(float) {
 void End() {
     if (!g_on && g_ghosts.empty()) return;
     g_on = false;
+    houserules::End(g_me && uex::Me() == g_me ? g_me : nullptr);
     RemoveGhosts();
     if (g_me && uex::Me() == g_me) {
         CancelMoves(g_me);

@@ -9,5 +9,6 @@ void MatchOver();        // match left/over: End + restore the hp/posture/shield
 bool LocalDead();
 void Shutdown();         // MatchOver + caches
 bool TestAbility(const wchar_t* gaClassName);  // test hook; '*' in the name = current weapon key (GA_Hun_*_A_C)
+bool GhostAnchor(int slot, float out[3]);  // world cm just above that ghost's head; false = no live ghost
 void TestGhostEdge(const char* id);  // test hook: ghosts show this Phantom Edge (DT ItemId; "" = the remote's own "E")
 }
