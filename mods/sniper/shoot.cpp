@@ -181,7 +181,15 @@ static bool GasAdd(UObject* victim, const wchar_t* name, float delta) {
     if (!blib) blib = uex::Lib(L"PBZBlueprintFunctionLibrary /Script/ProjectPBZ.Default__PBZBlueprintFunctionLibrary");
     if (!setCls) setCls = uex::Class(L"Class /Script/CharacterBasics.BasicAttributeSet");
     if (!ulib || !blib || !setCls) { uex::Log(L"sniper: attribute libs missing %p %p %p", ulib, blib, setCls); return false; }
-    struct GA { uint8_t b[0x38]; };
+    struct GA { uint8_t b[0x38]; };  // FGameplayAttribute, opaque; only its fields below are read
+    static uex::Prop kAttrField{L"ScriptStruct /Script/GameplayAbilities.GameplayAttribute", L"Attribute", 0x10},
+        kAttrOwner{L"ScriptStruct /Script/GameplayAbilities.GameplayAttribute", L"AttributeOwner", 0x30};
+    static bool sized = [] {
+        int n = uex::StructSize(L"ScriptStruct /Script/GameplayAbilities.GameplayAttribute", int(sizeof(GA)));
+        if (n != int(sizeof(GA))) uex::Log(L"sniper: GameplayAttribute is 0x%x bytes now (was 0x%x), attribute writes off", n, int(sizeof(GA)));
+        return n == int(sizeof(GA));
+    }();
+    if (!sized) return false;
     static std::map<std::wstring, GA> attrs;  // FGameplayAttribute per name, made once
     auto it = attrs.find(name);
     if (it == attrs.end()) {
@@ -189,7 +197,7 @@ static bool GasAdd(UObject* victim, const wchar_t* name, float delta) {
         struct FS { const wchar_t* d; int32_t n, m; } nm{name, n, n};
         ue::Params q(uex::Fn(blib, L"MakeAttribute")); q.Set(L"AttributeName", nm); q.Set(L"Set", setCls); q.Call(blib);
         GA a = q.Get<GA>(L"ReturnValue");
-        if (!*reinterpret_cast<void**>(a.b + 0x30) && !*reinterpret_cast<void**>(a.b + 0x10)) { uex::Log(L"sniper: MakeAttribute %s failed", name); return false; }
+        if (!kAttrOwner.Of<void*>(a.b) && !kAttrField.Of<void*>(a.b)) { uex::Log(L"sniper: MakeAttribute %s failed", name); return false; }
         it = attrs.emplace(name, a).first;
     }
     ue::Params p(uex::Fn(ulib, L"ModifyCharacterAttributeValue"));
@@ -270,7 +278,6 @@ static int Damage(UObject* victim, float dmg, ik::V dir, bool* killed) {
 // with AngerDamage arrives through its damage path while Shachi is at the minimum. So the shot that empties the
 // bar also applies such a hit effect (GE_GrabHit) from the player's ASC; the Health that effect would take is
 // held by Health_Min and put back, the shot already did its damage.
-static const int kShachiMin = uex::attr::Shachi + 0x10;  // Shachi_Min (BasicAttributeSet +0x648)
 constexpr float kPostureHead = 1.5f;                  // posture multiplier on a headshot
 static UObject* HitreactOf(UObject* ch) {
     static UObject* cls; if (!cls) cls = uex::Class(L"Class /Script/SGameCombatSystem.HitreactComponent");
@@ -303,7 +310,7 @@ static void PostureBreak(UObject* victim, UObject* me) {
 }
 static void Posture(UObject* victim, UObject* me, float frac) {
     float smx = uex::Attr(victim, uex::attr::ShachiMax); if (smx <= 0 || frac <= 0) return;
-    float sc = uex::Attr(victim, uex::attr::Shachi), smin = uex::Attr(victim, kShachiMin);
+    float sc = uex::Attr(victim, uex::attr::Shachi), smin = uex::Attr(victim, uex::attr::ShachiMin);
     float want = std::max(smin, sc - frac * smx);
     if (want >= sc) return;  // already at the minimum
     bool gas = false;
@@ -328,8 +335,8 @@ void PostureInfo(UObject* victim) {
     if (!victim) { uex::Log(L"sniper: posture: no enemy"); return; }
     uex::Log(L"sniper: posture %s hp %.0f/%.0f (min %.0f) shachi %.0f min %.0f max %.0f regen %.1f cooldown %.1f", ue::NameOf(victim).c_str(),
              uex::Attr(victim, uex::attr::Health), uex::Attr(victim, uex::attr::HealthMax), uex::Attr(victim, uex::attr::HealthMin),
-             uex::Attr(victim, uex::attr::Shachi), uex::Attr(victim, kShachiMin), uex::Attr(victim, uex::attr::ShachiMax),
-             uex::Attr(victim, uex::attr::Shachi + 0x40), uex::Attr(victim, uex::attr::Shachi + 0x50));  // ShachiRegen, ShachiRegenCooldown
+             uex::Attr(victim, uex::attr::Shachi), uex::Attr(victim, uex::attr::ShachiMin), uex::Attr(victim, uex::attr::ShachiMax),
+             uex::Attr(victim, uex::attr::ShachiRegen), uex::Attr(victim, uex::attr::ShachiRegenCooldown));
 }
 
 // ---- characters near the player (refreshed every ~0.5 s, the object array is large) ----
@@ -363,7 +370,8 @@ UObject* NearestEnemy(UObject* me) {
 }
 
 // ---- the bullet ----
-struct HB { uint8_t b[0x100]; };
+struct HB { uint8_t b[0x200]; };  // room for an FHitResult (0x100 in this build, size read at run time)
+static int HitSize() { static int n = (uex::StructSize(L"ScriptStruct /Script/Engine.HitResult", 0x100) + 7) & ~7; return n; }  // array stride
 static bool Invisible(UObject* comp, UObject* actor) {  // collision-only geometry (AI walls, volumes): bullets pass
     bool vis = true;
     if (auto f = uex::Fn(comp, L"IsVisible")) { ue::Params p(f); p.Call(comp); vis = p.Get<bool>(L"ReturnValue"); }
@@ -403,8 +411,10 @@ ShotRes Shoot(UObject* me, const Wpn& w, ik::V eye, ik::V dir, ik::V muzzle, boo
     static UObject* chCls = uex::Class(L"Class /Script/ProjectPBZ.PBZCharacter");
     static UObject* brushCls = uex::Class(L"Class /Script/Engine.BrushComponent");
     double wall = kRange; ik::V wallAt = end, wallN{0, 0, 1}; bool hitWall = false;
+    const int hs = HitSize();
+    if (hs <= 0 || hs > int(sizeof(HB))) { uex::Log(L"sniper: HitResult is 0x%x bytes, shots off", hs); return res; }
     for (int i = 0; i < hits.n && hits.d; ++i) {
-        HB hb; memcpy(hb.b, static_cast<const uint8_t*>(hits.d) + i * 0x100, 0x100);
+        HB hb{}; memcpy(hb.b, static_cast<const uint8_t*>(hits.d) + i * hs, hs);
         ue::Params b(uex::Fn(gs, L"BreakHitResult")); b.Set(L"Hit", hb); b.Call(gs);
         auto comp = b.Get<UObject*>(L"HitComponent"); auto a = b.Get<UObject*>(L"HitActor"); if (!a) a = OwnerOf(comp);
         if (!comp || (brushCls && ue::IsA(comp, brushCls)) || !a || a == me || Invisible(comp, a)) continue;

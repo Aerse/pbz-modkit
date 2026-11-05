@@ -103,6 +103,7 @@ float* walk = uex::Field<float>(cm, L"MaxWalkSpeed");       // 任意对象的�
 | 对象 | `Class`、`Lib`、`ue::FindObject`、`ue::NameOf`、`ue::IsA`、`Alive`、`Hold`/`Get`（安全地长期持有对象） |
 | 世界和玩家 | `Engine`、`World`、`PC`、`Me`、`Loc`、`Teleport`、`Spawn`、`Destroy`、`Trace` |
 | 反射 | `Fn`、`ue::Params`、`Prop`、`Field`、`OffsetOf`、`StructSize` |
+| 容器和资源表 | `EachRow`（DataTable 每一行）、`EachSetElem`（TSet/TMap）、`SoftPath`（软引用路径） |
 | 属性 | `Attr`、`SetAttr`、`AttrSet`、`ASC`、`attr::*` |
 | 界面 | `CreateWidget`、`AddToViewport`、`SetText`、`SetVisible`、`UiMode`、`GameMode` |
 | 其他 | `LoadAsset`、`Console`、`Log`、`SehScope`（把访问冲突变成可捕获的异常） |

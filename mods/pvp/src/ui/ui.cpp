@@ -91,10 +91,13 @@ int FontShared() { return kFontOutline + uex::StructSize(L"ScriptStruct /Script/
 // fixed buffer sizes (FSlateFontInfo, FSlateBrush in this build): a runtime size cannot size an array
 constexpr int kFontInfoBytes = 0x60, kBrushBytes = 0xb0;
 constexpr int kArrNum = 0x8;  // TArray: data +0, num +8
-// Blueprint variables of WB_StartMenu_V2 / W_MenuButton_V2_C (not in the native dump; names from the designer)
-constexpr int kMenuGroup = 0x780, kMenuNewGame = 0x6c8;  // the menu's button group, the NewGame button
-constexpr int kMbDecoOnSelected = 0x1948, kMbSelOpacity = 0x1950, kMbUnselOpacity = 0x1958;
-constexpr int kMbDisabled = 0x1932;  // printed as "dis" by the mbtn hook (name unverified)
+// Blueprint variables, by name on the object's own class (blueprint classes load late and have no
+// native path): WB_StartMenu_V2 ButtonGroup / NewGame, and on its buttons (WB_PBZMenuButton_V2)
+// ChangeTextDecoratorOnSelected (bool), SelectedOpacity / UnselectedOpacity (BP float = double), IsDisabled (bool)
+template <class T> T BpVar(UObject* o, const wchar_t* n) { auto p = o ? uex::Field<T>(o, n) : nullptr; return p ? *p : T{}; }
+template <class T> void BpSet(UObject* o, const wchar_t* n, T v) { if (auto p = o ? uex::Field<T>(o, n) : nullptr) *p = v; }
+UObject* MenuGroup(UObject* menu) { return BpVar<UObject*>(menu, L"ButtonGroup"); }
+UObject* MenuNewGame(UObject* menu) { return BpVar<UObject*>(menu, L"NewGame"); }
 
 const int kRounds[] = {1, 3, 5, 7, 9};
 const int kTimes[] = {0, 60, 90, 120, 180};
@@ -1118,16 +1121,16 @@ void MenuEntry() {
     { Params t(uex::Fn(btn, L"SetButtonText")); t.Set(L"InText", uex::Text(L"多人游戏")); t.Call(btn); }
     // the menu sets these on its own buttons in the designer; a fresh button has the class defaults
     // (UnselectedOpacity 0.6 = the grey text, no text decorator change on select)
-    Put<uint8_t>(btn, kMbDecoOnSelected, At<uint8_t>(ng, kMbDecoOnSelected));   // ChangeTextDecoratorOnSelected
-    Put<double>(btn, kMbSelOpacity, At<double>(ng, kMbSelOpacity));              // SelectedOpacity
-    Put<double>(btn, kMbUnselOpacity, At<double>(ng, kMbUnselOpacity));          // UnselectedOpacity
+    for (auto n : {L"ChangeTextDecoratorOnSelected"}) BpSet<uint8_t>(btn, n, BpVar<uint8_t>(ng, n));
+    for (auto n : {L"SelectedOpacity", L"UnselectedOpacity"}) BpSet<double>(btn, n, BpVar<double>(ng, n));
+    if (!uex::Field<double>(btn, L"UnselectedOpacity")) uex::Log(L"ui: menu button has no UnselectedOpacity (game update?), entry may look grey");
     VSlot qv = ReadSlot(qs), nv = ReadSlot(ns);
     Call1(box, L"RemoveChild", L"Content", quit);
     WriteSlot(Add(box, btn, L"AddChildToVerticalBox"), nv);
     WriteSlot(Add(box, quit, L"AddChildToVerticalBox"), qv);
     // join the menu's button group so selecting another button deselects ours
     g.menuInGroup = false;
-    if (auto grp = At<UObject*>(menu, kMenuGroup)) { Call1(grp, L"AddWidget", L"InWidget", btn); g.menuInGroup = true; } else uex::Log(L"ui: start menu has no button group yet");
+    if (auto grp = MenuGroup(menu)) { Call1(grp, L"AddWidget", L"InWidget", btn); g.menuInGroup = true; } else uex::Log(L"ui: start menu has no button group yet");
     g.menu = menu; g.menuBtn = btn; g.menuFont = nullptr; g.menuWas = false; g.menuFix = 0;
     RefreshActionIcon();
     uex::Log(L"ui: title menu entry added %s", NameOf(btn).c_str());
@@ -1148,7 +1151,7 @@ void PollMenuEntry() {
         }
     }
     // the menu's button group may not exist yet when our button goes in: join it once it does
-    if (!g.menuInGroup) if (auto grp = At<UObject*>(g.menu, kMenuGroup)) {
+    if (!g.menuInGroup) if (auto grp = MenuGroup(g.menu)) {
         Call1(grp, L"AddWidget", L"InWidget", g.menuBtn); g.menuInGroup = true; uex::Log(L"ui: title entry joined the button group");
     }
     // stay lit only while hovered or focused (another button got the pick: the group may not tell us)
@@ -1260,7 +1263,7 @@ void TestHook() {
         }
         else if (c == L"props") { if (auto w = FindUserWidget(a)) DumpProps(o, w->cls); else fwprintf(o, L"no widget %s\n", a.c_str()); }
         else if (c == L"rebuild") g.root = nullptr;
-        else if (c == L"grp") { auto m = FindUserWidget(L"WB_StartMenu_V2"); auto gr = m ? At<UObject*>(m, kMenuGroup) : nullptr; int n = -1;
+        else if (c == L"grp") { auto m = FindUserWidget(L"WB_StartMenu_V2"); auto gr = m ? MenuGroup(m) : nullptr; int n = -1;
             if (gr) { Params p(uex::Fn(gr, L"GetButtonCount")); p.Call(gr); n = p.Get<int32_t>(L"ReturnValue"); }
             int idx = -9;
             if (gr && g.menuBtn) { Params q(uex::Fn(gr, L"FindButtonIndex")); q.Set(L"ButtonToFind", g.menuBtn); q.Call(gr); idx = q.Get<int32_t>(L"ReturnValue"); }
@@ -1269,7 +1272,7 @@ void TestHook() {
                 Params s(uex::Fn(gr, L"SelectButtonAtIndex")); s.Set<int32_t>(L"ButtonIndex", _wtoi(a.c_str())); s.Call(gr);
                 fwprintf(o, L"selected %d, ours selected=%d\n", _wtoi(a.c_str()), int(CallB(g.menuBtn, L"GetSelected"))); } }
         else if (c == L"mdiff") {  // 4-byte words that differ between NewGame and our entry in 0x15c8..0x1960
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? MenuNewGame(menu) : nullptr;
             if (ng && g.menuBtn) for (int off = 0x15c8; off < 0x1960; off += 4) {
                 uint32_t x = At<uint32_t>(ng, off), y = At<uint32_t>(g.menuBtn, off);
                 if (x != y) fwprintf(o, L"  +%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(ng, off), y, At<float>(g.menuBtn, off)); }
@@ -1286,7 +1289,7 @@ void TestHook() {
             }
         }
         else if (c == L"mtree" && g.menuBtn) {  // inner widgets of NewGame vs ours: render offset, opacity, slot padding
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? MenuNewGame(menu) : nullptr;
             for (UObject* b : { ng, g.menuBtn }) { if (!b) continue; auto tr = kWidgetTree.Of<UObject*>(b);
                 fwprintf(o, L" [%s]\n", NameOf(b).c_str());
                 for (int i = 0, n = NumObjects(); tr && i < n; ++i) { auto x = ObjectAt(i);
@@ -1297,7 +1300,7 @@ void TestHook() {
                     fwprintf(o, L"  %s:%s vis=%d clip=%d ds=%.1f,%.1f pad=%.1f,%.1f,%.1f,%.1f\n", NameOf(x).c_str(), NameOf(x->cls).c_str(),
                              int(kVis.Of<uint8_t>(x)), int(kClip.Of<uint8_t>(x)), ds.x, ds.y, pd.l, pd.t, pd.r, pd.b); } } }
         else if (c == L"miaw" && g.menuBtn) {  // InputActionWidget of NewGame vs ours: differing words
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? MenuNewGame(menu) : nullptr;
             auto find = [](UObject* b) -> UObject* { auto tr = kWidgetTree.Of<UObject*>(b);
                 for (int i = 0, n = NumObjects(); tr && i < n; ++i) { auto x = ObjectAt(i);
                     if (x && x->outer == tr && !(x->flags & 0x10) && NameOf(x) == L"InputActionWidget") return x; } return nullptr; };
@@ -1307,15 +1310,15 @@ void TestHook() {
                 for (int off = 0x28; off < 0x600; off += 4) { uint32_t x = At<uint32_t>(ia, off), y = At<uint32_t>(ib, off);
                     if (x != y) fwprintf(o, L"  +%x ng=%08x (%.2f) ours=%08x (%.2f)\n", off, x, At<float>(ia, off), y, At<float>(ib, off)); } } }
         else if ((c == L"mcall" || c == L"ncall") && g.menuBtn) {  // mcall/ncall <fn>: no-arg fn on ours / NewGame
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* t = c == L"mcall" ? g.menuBtn : menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* t = c == L"mcall" ? g.menuBtn : menu ? MenuNewGame(menu) : nullptr;
             if (auto f = t ? uex::Fn(t, a.c_str()) : nullptr) { Params q(f); q.Call(t); fwprintf(o, L"called %s\n", a.c_str()); } else fwprintf(o, L"no fn\n"); }
         else if (c == L"mfont" && g.menuBtn) {  // font of the label of NewGame vs ours (object, typeface, size, style classes)
-            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? At<UObject*>(menu, kMenuNewGame) : nullptr;
+            auto menu = FindUserWidget(L"WB_StartMenu_V2"); UObject* ng = menu ? MenuNewGame(menu) : nullptr;
             for (UObject* b : { ng, g.menuBtn }) { auto tb = b ? kBtnText.Of<UObject*>(b) : nullptr; if (!tb) continue;
                 auto fo = kTbFont.Of<UObject*>(tb); auto st = kCtStyle.Of<UObject*>(tb), ld = kLocDeco.Of<UObject*>(tb);
                 fwprintf(o, L"  %s sel=%d font=%s face=%s size=%.1f style=%s deco=%s decoOn=%d\n", NameOf(b).c_str(), int(CallB(b, L"GetSelected")),
                          fo ? PathOf(fo).c_str() : L"-", NameOf(*reinterpret_cast<const FName*>(reinterpret_cast<const uint8_t*>(tb) + kTbFont + kFontFace)).c_str(), At<float>(tb, kTbFont + kFontSize),
-                         st ? NameOf(st).c_str() : L"-", ld ? NameOf(ld).c_str() : L"-", int(At<uint8_t>(b, kMbDecoOnSelected))); } }
+                         st ? NameOf(st).c_str() : L"-", ld ? NameOf(ld).c_str() : L"-", int(BpVar<uint8_t>(b, L"ChangeTextDecoratorOnSelected"))); } }
         else if (c == L"mtext" && g.menuBtn) {  // mtext <text>: relabel our title entry (layout checks)
             Params t(uex::Fn(g.menuBtn, L"SetButtonText")); t.Set(L"InText", uex::Text(a.c_str())); t.Call(g.menuBtn); }
         else if (c == L"mbtn") {  // menu buttons of the title menu: opacity, enabled flags, text opacity
@@ -1325,7 +1328,7 @@ void TestHook() {
                 if (x->outer != tree && x != g.menuBtn) continue;
                 auto tb = kBtnText.Of<UObject*>(x);
                 fwprintf(o, L"  %s op=%.2f d9=%02x sel=%.2f unsel=%.2f dis=%d tbop=%.2f\n", NameOf(x).c_str(), kOpacity.Of<float>(x), At<uint8_t>(x, kEnabled),
-                         At<float>(x, kMbSelOpacity), At<float>(x, kMbUnselOpacity), int(At<uint8_t>(x, kMbDisabled)), tb ? kOpacity.Of<float>(tb) : -1.f);
+                         BpVar<double>(x, L"SelectedOpacity"), BpVar<double>(x, L"UnselectedOpacity"), int(BpVar<uint8_t>(x, L"IsDisabled")), tb ? kOpacity.Of<float>(tb) : -1.f);
                 // render translation (RenderTransform) of the button and its text, slot padding, parent class
                 auto sl = kSlot.Of<UObject*>(x); auto par = sl ? kSlotParent.Of<UObject*>(sl) : nullptr; Margin pd = sl ? kVsPad.Of<Margin>(sl) : Margin{};
                 int tr = kXform + kXfTrans, sc = kXform + kXfScale;  // Translation x, y (doubles), Scale x
@@ -1558,7 +1561,7 @@ void Shutdown() {
     if (g.menuOff && uex::Get(g.menuOffRef) == g.menuOff) Vis(g.menuOff, g.menuVis);
     if (g_sessionFile) { _wremove(SessionPath().c_str()); g_sessionFile = false; }  // left the room: nothing to resume
     if (MenuEntryOk()) {
-        if (auto grp = At<UObject*>(g.menu, kMenuGroup)) Call1(grp, L"RemoveWidget", L"InWidget", g.menuBtn);
+        if (auto grp = MenuGroup(g.menu)) Call1(grp, L"RemoveWidget", L"InWidget", g.menuBtn);
         uex::RemoveWidget(g.menuBtn);
     }
     if (Valid()) uex::RemoveWidget(g.root);

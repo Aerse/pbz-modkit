@@ -12,8 +12,7 @@
 // BeginSuppressAppearanceSave caches outfit/skin/hat/owned and sets bSuppressAppearanceSave; it does
 // not nest (a second Begin overwrites the cache, any End ends it).
 // EndSuppressAppearanceSave(false) puts the cache back and applies it, without saving.
-// DT_PBZAppearanceTable RowMap (native, not reflected): a TSet<TPair<FName, uint8*>> (TSparseArray),
-//   layout in the kSet* constants; element: key FName, row pointer.
+// DT_PBZAppearanceTable rows: uex::EachRow (the native RowMap, layout in uex::layout).
 // Row = PBZAppearanceStruct : ItemDataBase: ItemId, AppearanceType (Outfit = 4), BodyMeshAsset,
 //   bDefaultHatHidden, bObtainableInGame (kRow*). Probe shows the real thing.
 #include "outfits.h"
@@ -69,12 +68,7 @@ uex::Prop kRowName{kRow, L"AppearanceName", 0x28}, kRowTexture{kRow, L"Appearanc
     kRowHatHidden{kRow, L"bDefaultHatHidden", 0x2a8, 0xff}, kRowObtainable{kRow, L"bObtainableInGame", 0x2a9, 0xff};
 uex::Prop kValueCache{L"ScriptStruct /Script/ProjectPBZ.FlowLocText", L"ValueCache", 0x20};
 constexpr int kOutfitItems = 8;  // OutfitBodyItem .. OutfitBrowLashCardItem: 8 consecutive FNames
-// engine / native layouts (not reflected properties: change only with the engine version)
-constexpr int kRowMap = 0x30;    // UDataTable::RowMap (native TMap<FName, uint8*>)
-constexpr int kSetNum = 0x8, kSetMax = 0xc, kSetBitsInline = 0x10, kSetBitsHeap = 0x20, kSetNumBits = 0x28,
-    kSetNumFree = 0x34;          // TSet / TSparseArray: data +0, num, max, allocation bits, num bits, num free
-constexpr int kRowStride = 0x18, kRowPtr = 0x8;   // TMap<FName, uint8*> element: key +0, row pointer
-constexpr int kSoftPkg = 0x8, kSoftAsset = 0x10;  // TSoftObjectPtr: weak ptr +0, FSoftObjectPath package / asset FName
+using namespace uex::layout;  // kSet*, kSoftPkg / kSoftAsset
 
 double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -94,20 +88,7 @@ UObject* Table() {
 }
 
 // every row: f(key, row); false if the RowMap does not look like one
-template <class F> bool Rows(UObject* dt, F f) {
-    auto m = reinterpret_cast<uint8_t*>(dt) + kRowMap;
-    auto data = At<uint8_t*>(m, 0x0);
-    int num = At<int32_t>(m, kSetNum), max = At<int32_t>(m, kSetMax), nbits = At<int32_t>(m, kSetNumBits), nfree = At<int32_t>(m, kSetNumFree);
-    if (num < 0 || num > 4096 || max < num || (num && !data) || nfree < 0 || nfree > num) return false;
-    auto bits = At<const uint32_t*>(m, kSetBitsHeap);
-    if (!bits) bits = reinterpret_cast<const uint32_t*>(m + kSetBitsInline);
-    for (int k = 0; k < num; ++k) {
-        if (nfree && (k >= nbits || !((bits[k >> 5] >> (k & 31)) & 1))) continue;  // a hole
-        auto e = data + size_t(k) * kRowStride;
-        if (auto row = At<uint8_t*>(e, kRowPtr)) f(*reinterpret_cast<const FName*>(e), row);
-    }
-    return true;
-}
+template <class F> bool Rows(UObject* dt, F f) { return uex::EachRow(dt, f); }
 
 // a type-4 row's ItemId as the table's own FName (text from a peer never becomes a new name)
 bool FindOutfit(const std::wstring& id, FName* out) {
@@ -179,11 +160,7 @@ bool Allowed(UObject* c, const FName& fid) {
 }
 
 // ---- lobby cards ----
-// TSoftObjectPtr -> "/Pkg/Path.Asset", "" if unset
-std::wstring SoftPath(const uint8_t* p) {
-    auto pkg = NameOf(*reinterpret_cast<const FName*>(p + kSoftPkg));
-    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + NameOf(*reinterpret_cast<const FName*>(p + kSoftAsset));
-}
+using uex::SoftPath;  // TSoftObjectPtr -> "/Pkg/Path.Asset"
 // a row's AppearanceName (FlowLocText, its ValueCache FText), "" if none or a key. Once per row (the FString leaks)
 std::wstring RowName(const uint8_t* row) {
     auto lib = uex::Lib(L"KismetTextLibrary /Script/Engine.Default__KismetTextLibrary");
@@ -332,7 +309,7 @@ int Probe(std::wstring* out) {
             }
         auto dt = Table();
         if (!dt) { Add(out, L"no table %s", kTable); return -1; }
-        auto m = reinterpret_cast<uint8_t*>(dt) + kRowMap;
+        auto m = reinterpret_cast<uint8_t*>(dt) + kRowStruct + 8;  // RowMap
         Add(out, L"table %s rowstruct %s rows %d max %d free %d", W(PathOf(dt)), W(NameOf(kRowStruct.Of<UObject*>(dt))),
             At<int32_t>(m, kSetNum), At<int32_t>(m, kSetMax), At<int32_t>(m, kSetNumFree));
         auto ent = Ent(); int n = 0;

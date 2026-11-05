@@ -86,6 +86,42 @@ template <class T> T* Field(UObject* o, const wchar_t* prop) {
     return k < 0 ? nullptr : reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(o) + k);
 }
 
+// ---- engine containers -------------------------------------------------------------------
+// Native layouts (fixed by the engine version, not by game updates), in one place.
+// TSet / TMap: a TSparseArray of elements (data, num slots, max) plus allocation bits; a TMap<K, V>
+// element is the pair then two int32 hash links: MapStride(sizeof K, sizeof V) bytes.
+namespace layout {
+inline constexpr int kSetNum = 0x8, kSetMax = 0xc, kSetBitsInline = 0x10, kSetBitsHeap = 0x20, kSetNumBits = 0x28, kSetNumFree = 0x34;
+inline constexpr int kSoftPkg = 0x8, kSoftAsset = 0x10;  // TSoftObjectPtr: weak ptr, then FSoftObjectPath package / asset FName
+}
+constexpr int MapStride(int key, int value) { return ((key + value + 7) & ~7) + 8; }
+// f(element) for each live element (stride bytes each) of the TSet / TMap at `set`; false (and no
+// calls) if it does not look like one. limit: the most slots it will believe in.
+template <class F> bool EachSetElem(const void* set, int stride, F f, int limit = 65536) {
+    using namespace layout;
+    auto m = static_cast<const uint8_t*>(set);
+    auto data = ue::At<uint8_t*>(m, 0);
+    int num = ue::At<int32_t>(m, kSetNum), max = ue::At<int32_t>(m, kSetMax), nbits = ue::At<int32_t>(m, kSetNumBits),
+        nfree = ue::At<int32_t>(m, kSetNumFree);
+    if (num < 0 || num > limit || max < num || (num && !data) || nfree < 0 || nfree > num || (nfree && nbits < num)) return false;
+    auto bits = ue::At<const uint32_t*>(m, kSetBitsHeap);
+    if (!bits) bits = reinterpret_cast<const uint32_t*>(m + kSetBitsInline);
+    for (int k = 0; k < num; ++k)
+        if (!nfree || ((bits[k >> 5] >> (k & 31)) & 1)) f(data + size_t(k) * stride);  // skip holes
+    return true;
+}
+// a DataTable's rows: f(const FName& rowName, uint8_t* row). RowMap (native TMap<FName, uint8*>)
+// sits right after the reflected RowStruct.
+template <class F> bool EachRow(UObject* dt, F f) {
+    static Prop kRowStruct{L"Class /Script/Engine.DataTable", L"RowStruct", 0x28};
+    if (!dt) return false;
+    return EachSetElem(reinterpret_cast<uint8_t*>(dt) + kRowStruct + 8, MapStride(8, 8), [&](uint8_t* e) {
+        if (auto row = ue::At<uint8_t*>(e, 8)) f(*reinterpret_cast<const ue::FName*>(e), row);
+    });
+}
+// a TSoftObjectPtr / TSoftClassPtr field -> "/Pkg/Path.Asset", "" if unset
+std::wstring SoftPath(const void* field);
+
 // attributes: BasicAttributeSet fields (FGameplayAttributeData: base +8, current +0xC), by name.
 // Use them where an int offset goes: Attr(ch, attr::Health), attr::Shachi + 0x10 (not constexpr).
 namespace attr {

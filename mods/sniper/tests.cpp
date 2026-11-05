@@ -143,11 +143,23 @@ void TestCmds(UObject* me) {
             auto off = ue::FindProp(me->cls, L"PBZInteract").offset; auto ic = off >= 0 ? ue::At<UObject*>(me, off) : nullptr;
             if (!ic) for (int k = 0, N = ue::NumObjects(); k < N && !ic; ++k) { auto o = ue::ObjectAt(k); if (o && o->outer == me && ue::NameOf(o->cls) == L"PBZInteractComponent") ic = o; }
             if (!ic) { uex::Log(L"sniper: icheck: no component"); continue; }
-            if (c == L"icheck search") {  // SearchActors (TSet<AActor*> at +0x2f8): data, num, max
-                for (int off : {0x2f8, 0x348}) {
-                    auto base = reinterpret_cast<uint8_t*>(ic) + off; auto d = *reinterpret_cast<uint8_t**>(base); int n = *reinterpret_cast<int*>(base + 8);
-                    uex::Log(L"sniper: iset +%x n %d", off, n);
-                    for (int i = 0; i < n && i < 32 && d; ++i) { auto a = *reinterpret_cast<UObject**>(d + i * 16); uex::Log(L"sniper: iset  %d %p %s", i, a, a && Live(a) ? ue::NameOf(a).c_str() : L"?"); }
+            if (c == L"icheck search") {  // SearchActors / InteractActors (TMap<AActor*, ...>): the actors
+                for (auto pn : {L"SearchActors", L"InteractActors"}) {
+                    auto mp = ue::FindPropPtr(ic->cls, pn); if (!mp) { uex::Log(L"sniper: iset %s not found", pn); continue; }
+                    // FMapProperty: KeyProp, ValueProp; element = key, value, two hash links
+                    auto kp = ue::At<const uint8_t*>(mp, ue::kProp_Extra), vp = ue::At<const uint8_t*>(mp, ue::kProp_Extra + 8);
+                    if (!kp || !vp) continue;
+                    int off = ue::At<int32_t>(mp, ue::kProp_Offset), stride = uex::MapStride(ue::At<int32_t>(kp, ue::kProp_ElemSize), ue::At<int32_t>(vp, ue::kProp_ElemSize));
+                    auto base = reinterpret_cast<uint8_t*>(ic) + off; int n = ue::At<int32_t>(base, uex::layout::kSetNum), i = 0;
+                    // the actor: the key if it is an object, else the value (after the key, 8-aligned)
+                    bool inKey = PType(kp).find(L"ObjectProperty") != std::wstring::npos;
+                    const uint8_t* ap = inKey ? kp : vp; int aoff = inKey ? 0 : (ue::At<int32_t>(kp, ue::kProp_ElemSize) + 7) & ~7;
+                    bool weak = PType(ap).rfind(L"WeakObjectProperty", 0) == 0;
+                    uex::Log(L"sniper: iset %s +%x n %d key %s value %s stride 0x%x", pn, off, n, PType(kp).c_str(), PType(vp).c_str(), stride);
+                    uex::EachSetElem(base, stride, [&](uint8_t* e) {
+                        // a weak key is {object index, serial}: the object at that index
+                        UObject* a = weak ? ue::ObjectAt(ue::At<int32_t>(e, aoff)) : ue::At<UObject*>(e, aoff);
+                        if (i < 32) uex::Log(L"sniper: iset  %d %p %s", i, a, a && Live(a) ? ue::NameOf(a).c_str() : L"?"); ++i; });
                 }
                 continue;
             }
@@ -324,16 +336,14 @@ void TestCmds(UObject* me) {
             auto key = c.size() > 6 ? c.substr(6) : std::wstring(); bool bosses = key == L"bosses";
             auto dt = uex::LoadAsset(L"/Game/PBZContent/DataTable/DT_CodexEnemyDataTable.DT_CodexEnemyDataTable");
             if (!dt) { uex::Log(L"sniper: codex: no table"); continue; }
-            struct E { ue::FName k; uint8_t* row; int32_t next, hash; };  // TMap<FName, uint8*> RowMap (+0x30) element
-            auto d = ue::At<E*>(dt, 0x30); int n = ue::At<int32_t>(dt, 0x38), shown = 0;
-            for (int i = 0; i < n && d && shown < 120; ++i) {
-                auto r = d[i].row; if (!r) continue;
-                bool boss = r[0xb1] != 0; auto nm = ue::NameOf(d[i].k);
-                if (bosses ? !boss : (!key.empty() && nm.find(key) == std::wstring::npos)) continue;
-                // EnemyClass: TSoftClassPtr = weak ptr (8) + FSoftObjectPath {package, asset, sub path}
-                auto pkg = ue::NameOf(*reinterpret_cast<ue::FName*>(r + 0x10)), as = ue::NameOf(*reinterpret_cast<ue::FName*>(r + 0x18));
-                uex::Log(L"sniper: codex %s boss %d %s.%s", nm.c_str(), boss, pkg.c_str(), as.c_str()); ++shown;
-            }
+            static uex::Prop kBoss{L"ScriptStruct /Script/ProjectPBZ.CodexEnemyRow", L"bIsBoss", 0xb1, 0xff},
+                kEnemyClass{L"ScriptStruct /Script/ProjectPBZ.CodexEnemyRow", L"EnemyClass", 0x8};
+            int n = 0, shown = 0;
+            uex::EachRow(dt, [&](const ue::FName& k, uint8_t* r) {
+                ++n; bool boss = kBoss.Bit(r); auto nm = ue::NameOf(k);
+                if (shown >= 120 || (bosses ? !boss : (!key.empty() && nm.find(key) == std::wstring::npos))) return;
+                uex::Log(L"sniper: codex %s boss %d %s", nm.c_str(), boss, uex::SoftPath(r + kEnemyClass).c_str()); ++shown;
+            });
             uex::Log(L"sniper: codex %d rows", n);
         }
         else if (c == L"posture tags") {  // the aimed (or nearest) enemy's owned gameplay tags

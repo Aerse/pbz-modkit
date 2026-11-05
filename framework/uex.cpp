@@ -70,6 +70,11 @@ int StructSize(const wchar_t* owner, int fallback) {
     if (n != fallback) Log(L"struct %s size 0x%x (was 0x%x)", Short(owner).c_str(), n, fallback);
     return cache[owner] = n;
 }
+std::wstring SoftPath(const void* field) {
+    auto f = static_cast<const uint8_t*>(field);
+    auto pkg = ue::NameOf(At<ue::FName>(f, layout::kSoftPkg));
+    return pkg.empty() || pkg == L"None" ? L"" : pkg + L"." + ue::NameOf(At<ue::FName>(f, layout::kSoftAsset));
+}
 int OffsetOf(UObject* cls, const wchar_t* prop) {
     struct E { uint32_t clsName; int off; };
     static std::map<std::pair<UObject*, std::wstring>, E> cache;  // classes can be freed and reused: name checked
