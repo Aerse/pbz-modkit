@@ -1060,10 +1060,25 @@ void Conf(int rounds, int timeSec, int dmgPct, int maxPlayers) {
     if (maxPlayers >= 0) kv.push_back({"max", std::to_string(maxPlayers)});
     if (!kv.empty()) QueueCmd("conf", kv);
 }
+void Conf(const ConfArgs& c) {
+    LOCK; LOBBY_ONLY;
+    std::vector<std::pair<std::string, std::string>> kv;
+    auto num = [&](const char* k, int v) { if (v >= 0) kv.push_back({k, std::to_string(v)}); };
+    num("rounds", c.rounds); num("time", c.timeSec); num("dmg", c.dmg); num("max", c.max);
+    num("map", c.map); num("maps", c.maps); num("respawn", c.respawn); num("kills", c.kills);
+    if (!c.mode.empty()) kv.push_back({"mode", c.mode});
+    if (c.setRules) kv.push_back({"rules", c.rules});
+    if (!kv.empty()) QueueCmd("conf", kv);
+}
 void ConfMap(int map) { LOCK; LOBBY_ONLY; QueueCmd("conf", {{"map", std::to_string(map)}}); }
 void Start() { LOCK; LOBBY_ONLY; QueueCmd("start", {}); }
 void ArenaReady(int round) { LOCK; LOBBY_ONLY; QueueCmd("arena", {{"round", std::to_string(round)}}); }
-void Dead(int round, int bySlot) { LOCK; LOBBY_ONLY; QueueCmd("dead", {{"round", std::to_string(round)}, {"by", std::to_string(bySlot)}}); }
+void Dead(int round, int bySlot, int life) {
+    LOCK; LOBBY_ONLY;
+    std::vector<std::pair<std::string, std::string>> kv{{"round", std::to_string(round)}, {"by", std::to_string(bySlot)}};
+    if (life >= 0) kv.push_back({"life", std::to_string(life)});
+    QueueCmd("dead", kv);
+}
 void Hp(int round, int permille) {
     LOCK; LOBBY_ONLY;
     SendRaw(0x01, CmdText(0, "hp", {{"round", std::to_string(round)}, {"pct", std::to_string(Clamp(permille, 0, 1000))}}));

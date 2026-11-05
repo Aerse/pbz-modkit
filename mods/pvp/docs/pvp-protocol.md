@@ -1,4 +1,4 @@
-# pbzmp 网络协议 v1
+# pbzmp 网络协议 v2
 
 服务器 `server/pbzmp_server.py`，单个 UDP 端口（默认 27777）。整数一律小端。单个数据报 ≤ 1200 字节。
 
@@ -35,22 +35,23 @@ UTF-8，字段之间一个空格。键值字段写成 `k=v`，v 做百分号编�
 
 | cmd | 参数 | 成功回复字段 | 失败 reason |
 |---|---|---|---|
-| create | name, ver, max（2–4，默认 2），[pw], [pad] | code, slot, token | version, password, value, rate, server_full |
+| create | name, ver, max（2–上限，默认 2），[pw], [pad] | code, slot, token | version, password, value, rate, server_full |
 | join | code, name, ver, [pw], [pad] | code, slot, token | version, password, value, rate, noroom, full, started |
 | leave | | | |
 | set | ready（0/1）、weapon（资源路径）、edge（杀器 ItemId）、mods（启用的 Mod 列表），可只给其中一部分 | | phase |
-| conf | rounds（1/3/5/7/9）、time（0 或 30–300 秒）、dmg（10–500，百分比）、max（2–4）、map（0–15，地图序号），可只给部分 | | nothost, phase, value |
+| mods | slot | slot, mods（该成员的完整 Mod 列表） | value（没有这个成员） |
+| conf | rounds（1/3/5/7/9）、time（0 或 30–600 秒）、dmg（10–500，百分比）、max（2–上限）、map（0–15，地图序号）、maps（0–65535，随机地图位掩码）、mode（duel/ffa/kill）、respawn（1–10 秒）、kills（0 或 1–50）、rules（见“房间规则”），可只给部分 | | nothost, phase, value |
 | start | | | nothost, phase, players, notready |
 | arena | round | | |
-| dead | round, by（击败我的 slot，未知为 -1） | | |
+| dead | round, by（击败我的 slot，未知或自己为 -1），[life]（死时的命数，默认当前） | | |
 | hp | round, pct（0–1000，千分比） | 无（用 req=0 发送） | |
 | ping | t（客户端毫秒时钟） | t（原样返回） | |
 
-- ver 当前为 `1`，不一致回 `version`。
+- ver 当前为 `2`（v1.5 起；v1.4 及以前是 `1`），不一致回 `version`。包头版本号仍是 1。
 - pw：服务器用 `--password` 启动时必须给出且一致，否则回 `password`。服务器没设密码时忽略 pw。客户端 API 是 `net::SetPassword()`。
 - pad：只能由 `-` 组成，服务器忽略内容。create/join 整个数据报（含包头）不足 64 字节时服务器不回复（见“防放大”），客户端用 pad 补到 64 字节。
 - name 最长 24 个字符，超出截断，含控制字符回 `value`；weapon、edge、mods 各最长 200 字节，含控制字符回 `value`。
-- 解析是严格的：CTRL 正文只能是 ASCII（非 ASCII 字节必须百分号编码），键只能是小写字母、不得重复、最多 16 个、必须是该命令认识的键；`%` 后必须是两位十六进制，解码后必须是合法 UTF-8；整数字段只能是十进制数字（可带 `-`），还要在范围内（round 0–99，by -1–3，pct 0–1000，ping 的 t 是 u32）。不合格回 `err reason=bad`（req 解析不出则不回）。
+- 解析是严格的：CTRL 正文只能是 ASCII（非 ASCII 字节必须百分号编码），键只能是小写字母、不得重复、最多 16 个、必须是该命令认识的键；`%` 后必须是两位十六进制，解码后必须是合法 UTF-8；整数字段只能是十进制数字（可带 `-`），还要在范围内（round 0–99，by -1–7，life 0–9999，slot 0–7，pct 0–1000，ping 的 t 是 u32）。不合格回 `err reason=bad`（req 解析不出则不回）。
 - set/conf 只在 lobby 阶段有效，否则回 `phase`。conf 和 start 只有房主能发。
 - start 的条件：人数 ≥ 2，且除房主外所有人 ready（房主视为已准备）。
 - 带 token 的任何包（包括 GAME）都会刷新该成员的最后活动时间和地址，NAT 换了端口也能接上。token 不认识的包直接丢弃，不回复。token=0 只接受 create/join，GAME 必须带有效 token。客户端发的包头 slot 必须为 0。
@@ -63,13 +64,20 @@ UTF-8，字段之间一个空格。键值字段写成 `k=v`，v 做百分号编�
 
 ```
 v=<版本> you=<slot> code=<房间码> phase=<阶段> round=<r> rounds=<n> time=<s> dmg=<pct> map=<i> max=<n>
-host=<slot> left=<本阶段剩余毫秒，0=不限时> winner=<slot|-1> [msg=<通知>] m<slot>=<子字段> ...
+host=<slot> left=<本阶段剩余毫秒，0=不限时> winner=<slot|-1> mode=<duel|ffa|kill> maps=<位掩码>
+respawn=<s> kills=<n> cap=<服务器人数上限> rules=<房间规则> [msg=<通知>] m<slot>=<子字段> ...
 ```
 
 （实际是一行。）
 
 - v：房间状态版本，每次变化加 1。客户端对同一房间只接受更大的 v。
-- `m<slot>` 的值是 `name,ready,weapon,score,alive,conn,edge,mods` 八个子字段（旧服务器没有第 7、8 个，客户端按空值处理；旧服务器对 set 的 edge / mods 键回 `bad`，所以 mods 单独发一条 set）。mods 是 `id:版本:标记` 用 `;` 连起来，标记 `a` = 可联机，`b` = 信息文件写了 `mp=block`；新客户端在房间里会先卸载 `mp=block` 的 Mod、不上报它们；房间里任何人有 `b` 时客户端不让房主开始，版本不同只提示，每个先各自做百分号编码，再用逗号连起来（子字段里的逗号因此会被编码），整体不再编码。ready/alive/conn 为 0/1。
+- STATE 的值（v2 起）只转义这些字节：0x00–0x20、`%`、`,`、`=`、0x7F，写成 `%XX`；其他字节（包括 UTF-8 多字节字符）原样发送。客户端按 `%XX` 解码，其余字节照抄。CTRL 仍然要求全部百分号编码成 ASCII。这样 8 人、24 字中文名的 STATE 也在 1200 字节以内。
+- v2 的 `m<slot>` 是 `name,ready,weapon,score,alive,conn,edge,modh,life,deaths` 十个子字段：
+  - modh：该成员 mods 文本的 FNV-1a 32 位哈希，8 位小写十六进制；mods 为空时为空。客户端发现哈希和缓存的不一样时，用 `mods slot=<n>` 取完整列表（回复 `ok slot=<n> mods=<列表>`），再填进 Member::mods。
+  - life：本回合第几条命，进入 load 时清零，击杀赛每复活一次加 1。
+  - deaths：本场比赛死亡次数（击杀赛用），start 时清零。
+  - score：对决 / 混战是胜场，击杀赛是击杀数。
+- 以下是 v1 的旧格式说明：`m<slot>` 的值是 `name,ready,weapon,score,alive,conn,edge,mods` 八个子字段（旧服务器没有第 7、8 个，客户端按空值处理；旧服务器对 set 的 edge / mods 键回 `bad`，所以 mods 单独发一条 set）。mods 是 `id:版本:标记` 用 `;` 连起来，标记 `a` = 可联机，`b` = 信息文件写了 `mp=block`；新客户端在房间里会先卸载 `mp=block` 的 Mod、不上报它们；房间里任何人有 `b` 时客户端不让房主开始，版本不同只提示，每个先各自做百分号编码，再用逗号连起来（子字段里的逗号因此会被编码），整体不再编码。ready/alive/conn 为 0/1。
 - you 按接收者填写。
 
 ## 阶段
@@ -91,6 +99,47 @@ host=<slot> left=<本阶段剩余毫秒，0=不限时> winner=<slot|-1> [msg=<�
 - end 阶段的 winner 是本回合胜者，over 阶段的 winner 是比赛胜者，其他阶段为 -1。
 - load 到 over 结束算“比赛中”，这期间 join 回 `started`。回到 lobby 时所有人 ready=0。
 
+## 模式（v2）
+
+conf 的 `mode`：
+
+| mode | 人数 | 回合 | 计分 |
+|---|---|---|---|
+| duel（默认） | max 必须是 2 | 同 v1 | 回合胜者 score+1 |
+| ffa（混战） | 2–上限 | 同 duel：存活 ≤ 1 人回合结束，限时到时存活者里 hp 最高的赢 | 回合胜者 score+1，先到 rounds/2+1 赢比赛 |
+| kill（击杀赛） | 2–上限 | 整场只有 1 个回合（round=1），rounds 不用 | score = 击杀数 |
+
+- conf 一次给的字段一起生效，生效后再检查：duel 时 max≠2 回 `value`（conf 只给 `mode=duel` 时服务器把 max 设成 2，房间里人多于 2 回 `value`）；任何 slot ≥ max 回 `value`。
+- 击杀赛：
+  - dead 有效时（fight 阶段、round 对、发送者 alive、给了 life 时 life 等于当前命数）：发送者 alive=0、deaths+1；by 是房间里的另一个成员时，那个成员 score+1；by=-1 或自己（摔死、自杀）不给任何人加分。
+  - 有人 score 达到 kills（kills>0）：本回合结束，winner = 他。
+  - 死后 respawn 秒，服务器把他 alive 置 1、life+1、hp 回 1000，发 STATE。客户端看到自己的 life 变大就在随机出生点复活，并有 1.5 s 无敌（这段时间收到的 hit 忽略）。
+  - 存活人数不会结束回合。限时到：score 最高的人赢，并列 winner=-1。time=0 且 kills=0 时 start 回 `value`。
+  - end 之后直接 over，winner 同 end。
+- maps：随机地图位掩码，bit i 对应地图 i。非 0 时服务器在每次进入 load 时从里面随机选一张写进 map（只有一位时就是那张）；0 时用 map。
+- 进入 load：所有人 alive=1、life=0。start：所有人 score=0、deaths=0。
+
+## 房间规则（rules）
+
+conf 的 `rules` 是 `键:值` 用逗号连起来，只能用 `a-z 0-9 : ,`，最长 200 字节，不合格回 `value`。服务器不解释，原样放进 STATE；客户端不认识的键忽略，缺的键用默认值。所有值都是非负十进制整数。
+
+| 键 | 含义 | 范围 | 默认 |
+|---|---|---|---|
+| hp | 最大生命倍率（%） | 50–500 | 300 |
+| sd | 杀器（杀气技能）伤害倍率（%） | 0–300 | 100 |
+| sr | 杀气回复倍率（%） | 0–300 | 100 |
+| ult | 大招充能倍率（%） | 0–300 | 100 |
+| heal | 回血道具：0 全禁，1 只留酒葫芦，2 不限 | 0–2 | 2 |
+| cimu | 1 = 禁用慈母护符 | 0–1 | 0 |
+| acc | 饰品数量上限，9 = 不限 | 0–9 | 9 |
+| edge | 0 = 禁用杀器 | 0–1 | 1 |
+| wban | 禁用武器位掩码，bit i = fight::Weapons() 第 i+1 项（第 0 项「当前装备」不能禁） | 0–2^30 | 0 |
+| wrand | 1 = 每回合随机武器（各客户端用房间码、回合、slot 算出同一个结果，跳过 wban） | 0–1 | 0 |
+| stun | 连招保护：同一串连击第 N 下以后不再播受击硬直，0 = 关 | 0 或 3–10 | 6 |
+| cdmg | 1 = 连段伤害递减：同一串第 4 下起每下 -10%，最低 40% | 0–1 | 1 |
+
+「同一串」：被打方本地判定，两次命中间隔 < 0.8 s。伤害倍率仍是 conf 的 dmg。
+
 ## 掉线与房间生命周期
 
 - 成员 5 s 没有任何包：conn=0。15 s 没包：移出房间；比赛中（load 到 over）放宽到 120 s，留给崩溃后重启游戏重连。客户端每秒 ping，正常不会触发。
@@ -103,6 +152,7 @@ host=<slot> left=<本阶段剩余毫秒，0=不限时> winner=<slot|-1> [msg=<�
 
 - 服务器把 GAME 包原样转发给同房间其他 conn=1 的成员：type 改为 0x11，slot 填发送者，token 填 0。任何阶段都转发。
 - 负载最多 1192 字节（1200 减包头）。每个成员每秒最多转发 200 个包、128 KB，超出的丢弃。
+- 房间超过 4 人时客户端把状态发送降到 30 Hz（见 pvp-netcode.md），8 人房间服务器上行约 3 Mbps。
 
 ## 服务器限制
 
@@ -141,6 +191,8 @@ python3 -I pbzmp_server.py [--port 27777] [--bind 0.0.0.0] [--password 口令] [
 - 每 60 s 输出一行 `status rooms=<n> players=<n> pps=<收包/秒> ips=<n>`。
 - Ctrl+C（SIGINT）、SIGTERM，以及 Windows 下的 Ctrl+Break 都会干净退出：跑完当前这一轮循环，记一行 `shutting down`，关闭 socket，退出码 0。
 - `--loss/--delay/--jitter` 只用于测试。
+- `--max-players N`（2–8，默认 8）：房间人数上限，STATE 里是 `cap`。create/conf 的 max 超过它回 `value`。
+- `--egress-kb N`：每秒发往同一 IP 的字节上限（KB，默认 512，0 = 不限）。本机多实例测试 8 人时用 0。
 
 ### 部署到 Linux VPS
 
@@ -209,4 +261,4 @@ sudo firewall-cmd --permanent --add-port=27777/udp && sudo firewall-cmd --reload
 
 ## 版本
 
-协议改动不兼容时，包头版本号和 ver 一起加 1。
+协议改动不兼容时 ver 加 1（v2：create/join 的 ver=2，包头版本号保持 1，所以旧客户端能收到 `err reason=version` 并提示版本不匹配）。

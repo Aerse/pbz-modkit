@@ -19,6 +19,10 @@ struct Member {
     bool ready = false, alive = false, conn = false;
     std::string edge;  // Phantom Edge (杀器) ItemId, "" = keep the save's; last: aggregate inits stay valid
     std::string mods;  // enabled client mods "id:ver:flag;..." (flag b = mp=block), "" = unknown / old client
+    // v2 (net fills mods from the STATE "modh" hash + a "mods slot=" query, so mods may lag modh briefly)
+    std::string modh;  // rules::ModHash(mods), "" = none
+    int life = 0;      // this round's life number (kill mode: +1 per respawn, 0 at load)
+    int deaths = 0;    // deaths this match (kill mode)
 };
 struct Room {
     uint32_t v = 0;
@@ -29,7 +33,16 @@ struct Room {
     int leftMs = 0;      // phase time left when the STATE arrived (0 = no limit)
     double recvAt = 0;   // Now() when the STATE arrived
     std::vector<Member> members;  // sorted by slot
+    // v2 (docs/pvp-protocol.md 模式 / 房间规则)
+    std::string mode = "duel";  // duel | ffa | kill
+    int maps = 0;        // random map bitmask (0 = use map); the server writes its pick into map at load
+    int respawn = 5;     // kill mode: seconds dead before the server re-alives a member
+    int kills = 10;      // kill mode: score that ends the match (0 = time only)
+    int cap = 8;         // server's player limit (--max-players)
+    std::string rules;   // raw "k:v,..." (rules::Parse in rules.h)
 };
+constexpr int kProtoVer = 2;   // create/join ver=
+constexpr int kMaxPlayers = 8;
 
 // Starts the I/O thread on first use. host: IPv4 address or name; port 0 means 27777.
 // Resolving happens on the I/O thread; failure shows up as Failed / "resolve".
@@ -66,10 +79,17 @@ void SetWeapon(const std::string& path);
 void SetEdge(const std::string& id);  // member field "edge" (needs a server that knows the key)
 void SetMods(const std::string& list);  // member field "mods" (sent alone: an old server rejects the key)
 void Conf(int rounds, int timeSec, int dmgPct, int maxPlayers);  // -1 keeps a value
+// every room setting in one conf (the server applies them together); -1 / unset keeps a value
+struct ConfArgs {
+    int rounds = -1, timeSec = -1, dmg = -1, max = -1, map = -1, maps = -1, respawn = -1, kills = -1;
+    std::string mode;                        // "" keeps
+    bool setRules = false; std::string rules;
+};
+void Conf(const ConfArgs& c);
 void ConfMap(int map);  // host only, lobby only
 void Start();
 void ArenaReady(int round);
-void Dead(int round, int bySlot);
+void Dead(int round, int bySlot, int life = -1);  // life: Member::life when it died (-1 = not sent)
 void Hp(int round, int permille);  // unreliable; call about 4 times a second during a fight
 
 // ---- game channel -------------------------------------------------------------------------
