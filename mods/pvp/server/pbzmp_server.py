@@ -21,6 +21,11 @@ Spec decisions where the doc is silent:
 - Rate limits use fixed windows (1 s for packets, 60 s for create/join).
 - create with max > 2 makes an ffa room (duel needs max=2).
 - `mods slot=` works in every phase.
+- dead's life check and deaths+1 apply in every mode (life stays 0 outside
+  kill mode). A member removed during a kill-mode fight does not end the round
+  (only one member left still ends the match, as in every mode).
+- kill mode: the round ends at kills with no extra score for the winner;
+  a pending respawn is dropped when the round ends.
 
 Hardening for a public UDP service (see "服务器限制" in the doc):
 - Per-IP limits: packets/s (all types), CTRL/s per address, creates/min,
@@ -761,8 +766,11 @@ class Server:
             return "err reason=players"
         if any(not o.ready for o in room.members.values() if o.slot != room.host):
             return "err reason=notready"
+        if room.mode == "kill" and room.time == 0 and room.kills == 0:
+            return "err reason=value"  # nothing would ever end the round
         for o in room.members.values():
             o.score = 0
+            o.deaths = 0
         room.round = 1
         self.log(f"[{room.code}] match start rounds={room.rounds} time={room.time}")
         self.enter_load(room, now)
@@ -779,12 +787,23 @@ class Server:
         to_int(a.get("round"), 0, 99)
         if "by" in a:
             to_int(a["by"], -1, MAX_SLOTS - 1)
-        if "life" in a:
-            to_int(a["life"], 0, 9999)
-        if room.phase == "fight" and a.get("round") == str(room.round) and m.alive:
+        life = to_int(a["life"], 0, 9999) if "life" in a else m.life
+        if (room.phase == "fight" and a.get("round") == str(room.round) and m.alive
+                and life == m.life):
             m.alive = False
-            self.log(f"[{room.code}] slot {m.slot} dead by {a.get('by', '-1')}")
-            if not self.check_fight(room, now):
+            m.deaths += 1
+            by = int(a.get("by", "-1"))
+            self.log(f"[{room.code}] slot {m.slot} dead by {by} life {m.life}")
+            if room.mode == "kill":
+                k = room.members.get(by) if by != m.slot else None
+                if k:
+                    k.score += 1
+                if k and room.kills and k.score >= room.kills:
+                    self.end_round(room, k, now, add=False)
+                else:
+                    m.respawn_at = now + room.respawn
+                    self.changed(room)
+            elif not self.check_fight(room, now):
                 self.changed(room)
         return "ok"
 
@@ -851,8 +870,12 @@ class Server:
     def enter_load(self, room, now, msg=""):
         for o in room.members.values():
             o.alive = True
+            o.life = 0
+            o.respawn_at = 0.0
             o.arena = False
             o.hp = 1000
+        if room.maps:
+            room.map = self.rng.choice([i for i in range(16) if room.maps >> i & 1])
         self.enter(room, "load", now, self.t.load, msg=msg)
 
     def check_load(self, room, now, msg=""):
@@ -862,25 +885,38 @@ class Server:
         return False
 
     def check_fight(self, room, now, msg=""):
+        if room.mode == "kill":  # the alive count never ends a kill round
+            return False
         alive = [o for o in room.members.values() if o.alive]
         if len(alive) <= 1:
             self.end_round(room, alive[0] if alive else None, now, msg)
             return True
         return False
 
-    def end_round(self, room, win, now, msg=""):
-        if win:
+    def end_round(self, room, win, now, msg="", add=True):
+        if win and add:
             win.score += 1
+        for o in room.members.values():
+            o.respawn_at = 0.0
         self.enter(room, "end", now, self.t.end,
                    winner=win.slot if win else -1, msg=msg)
 
     def time_up(self, room, now):
+        if room.mode == "kill":  # highest score wins, a tie is a draw
+            ms = list(room.members.values())
+            best = max(o.score for o in ms)
+            top = [o for o in ms if o.score == best]
+            self.end_round(room, top[0] if len(top) == 1 else None, now, add=False)
+            return
         alive = [o for o in room.members.values() if o.alive]
         best = max((o.hp for o in alive), default=-1)
         top = [o for o in alive if o.hp == best]
         self.end_round(room, top[0] if len(top) == 1 else None, now)
 
     def after_end(self, room, now):
+        if room.mode == "kill":  # one round only: over with the same winner
+            self.enter(room, "over", now, self.t.over, winner=room.winner)
+            return
         need = room.rounds // 2 + 1
         ms = list(room.members.values())
         clinch = [o for o in ms if o.score >= need]
@@ -920,6 +956,14 @@ class Server:
                     self.log(f"[{code}] slot {m.slot} conn=0")
                     if not (room.phase == "load" and self.check_load(room, now)):
                         self.changed(room)
+            if code in self.rooms and room.phase == "fight":
+                back = [o for o in room.members.values()
+                        if o.respawn_at and now >= o.respawn_at]
+                for o in back:
+                    o.alive, o.life, o.hp, o.respawn_at = True, o.life + 1, 1000, 0.0
+                    self.log(f"[{code}] slot {o.slot} respawn life {o.life}")
+                if back:
+                    self.changed(room)
             if code in self.rooms and now - room.last_change >= self.t.room_idle:
                 self.delete_room(room, "idle, deleted")
             if code not in self.rooms or not room.deadline or now < room.deadline:

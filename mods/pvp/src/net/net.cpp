@@ -49,7 +49,7 @@ namespace {
 constexpr uint8_t kMagic = 0xB7, kProto = 1, kGver = 1;
 constexpr int kMaxDgram = 1200, kMaxPayload = 1192, kEvBudget = 900, kMaxEvent = kEvBudget - 7;
 constexpr int kMinHello = 64;  // smallest create/join datagram the server answers
-constexpr double kSendIv = 1000.0 / 60.0, kSendIdle = 20.0;
+constexpr double kSendIv = 1000.0 / 60.0, kSendIvBig = 1000.0 / 30.0, kSendIdle = 20.0;
 constexpr double kWindowMs = 3000, kExtrapMs = 150, kQuickLateMs = 250;
 
 double NowMs() { return Now() * 1000.0; }
@@ -388,6 +388,11 @@ void EncodeState(W& w, const State& st, uint16_t age) {
 
 void ProcessGame(const uint8_t* d, size_t n, int slot, double tr);
 
+// Rooms with more than 4 members: 30 Hz and no redundant previous sample, so the server's relay
+// egress (every packet goes to every other member) grows about linearly instead of quadratically.
+bool BigRoom() { S& s = g().s; return !s.loop && s.haveRoom && s.room.members.size() > 4; }
+double SendIv() { return BigRoom() ? kSendIvBig : kSendIv; }
+
 void SendGame() {
     S& s = g().s;
     double now = NowMs();
@@ -399,7 +404,7 @@ void SendGame() {
         EncodeState(w, s.local, (uint16_t)Clamp<int64_t>(D32(tSend, sm), 0, 65535));
         // Redundancy: the previously sent sample again (receiver dedups by ts), so a single lost
         // packet leaves no hole in the timeline. Skipped when it would crowd out events.
-        if (s.havePrev && s.prevAt != s.localAt && s.prev.extLen <= 64 && now - s.prevAt < 100)
+        if (s.havePrev && s.prevAt != s.localAt && s.prev.extLen <= 64 && now - s.prevAt < 100 && !BigRoom())
             EncodeState(w, s.prev, (uint16_t)Clamp<int64_t>(D32(tSend, Ms32(s.prevAt)), 0, 65535));
         if (s.prevAt != s.localAt) { s.prev = s.local; s.prevAt = s.localAt; s.havePrev = true; }
     }
@@ -846,13 +851,14 @@ void Tick() {
         s.osure.erase(std::remove_if(s.osure.begin(), s.osure.end(), [&](const OutSure& e) { return (e.acked & peers) == peers && peers; }), s.osure.end());
         if (peers == 0) s.osure.clear();
         // still send (ACKs, re-sent SURE) every 20 ms; queued events go out after 4 ms.
-        // Frames are sent on a 60 Hz grid (average spacing 16.7 ms, never closer than 4 ms), so
-        // game frame jitter does not halve the rate the way a strict per-packet 16.6 ms gap would.
-        double since = now - s.lastSend;
+        // Frames are sent on a 60 Hz grid (30 Hz with more than 4 members; average spacing 16.7 ms,
+        // never closer than 4 ms), so game frame jitter does not halve the rate the way a strict
+        // per-packet 16.6 ms gap would.
+        double since = now - s.lastSend, iv = SendIv(), idle = std::max(kSendIdle, iv);
         bool slot = now >= s.nextSend;
-        if ((s.evPending && since >= 4) || (s.newLocal && slot && since >= 4) || since >= kSendIdle) {
+        if ((s.evPending && since >= 4) || (s.newLocal && slot && since >= 4) || since >= idle) {
             SendGame();
-            if (slot) s.nextSend = std::max(s.nextSend + kSendIv, now - kSendIv);
+            if (slot) s.nextSend = std::max(s.nextSend + iv, now - iv);
         }
     }
 }
@@ -862,7 +868,7 @@ double NextWake() {
     double now = NowMs(), w = now + (s.steam && (s.rs || s.resolved) ? 4 : 20);  // Steam messages have no event: poll
     if (s.loop) for (auto& p : s.lq) w = std::min(w, p.at);
     if (s.active) {
-        w = std::min(w, s.newLocal ? std::max(s.nextSend, s.lastSend + 4) : s.lastSend + kSendIdle);
+        w = std::min(w, s.newLocal ? std::max(s.nextSend, s.lastSend + 4) : s.lastSend + std::max(kSendIdle, SendIv()));
         if (s.evPending) w = std::min(w, s.lastSend + 4);
     }
     for (auto& p : s.pend) w = std::min(w, p.next);

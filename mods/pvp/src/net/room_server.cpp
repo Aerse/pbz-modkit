@@ -583,7 +583,8 @@ struct Server::Impl {
         if (room.phase != "lobby") return "err reason=phase";
         if (room.members.size() < 2) return "err reason=players";
         for (auto& o : room.members) if (o->slot != room.host && !o->ready) return "err reason=notready";
-        for (auto& o : room.members) o->score = 0;
+        if (room.mode == "kill" && room.time == 0 && room.kills == 0) return "err reason=value";  // nothing would end it
+        for (auto& o : room.members) o->score = 0, o->deaths = 0;
         room.round = 1;
         Log("[" + room.code + "] match start rounds=" + std::to_string(room.rounds) + " time=" + std::to_string(room.time));
         EnterLoad(room);
@@ -601,12 +602,22 @@ struct Server::Impl {
 
     std::string CmdDead(Room& room, Member& m, const Args& a) {
         ToInt(Get(a, "round"), 0, 99);
-        if (auto by = Get(a, "by")) ToInt(by, -1, kMaxSlots - 1);
-        if (auto life = Get(a, "life")) ToInt(life, 0, 9999);
-        if (room.phase == "fight" && *Get(a, "round") == std::to_string(room.round) && m.alive) {
+        int by = -1, life = m.life;
+        if (auto v = Get(a, "by")) by = ToInt(v, -1, kMaxSlots - 1);
+        if (auto v = Get(a, "life")) life = ToInt(v, 0, 9999);
+        if (room.phase == "fight" && *Get(a, "round") == std::to_string(room.round) && m.alive && life == m.life) {
             m.alive = false;
-            Log("[" + room.code + "] slot " + std::to_string(m.slot) + " dead by " + GetOr(a, "by", "-1"));
-            if (!CheckFight(room)) Changed(room);
+            m.deaths++;
+            Log("[" + room.code + "] slot " + std::to_string(m.slot) + " dead by " + std::to_string(by) + " life " +
+                std::to_string(m.life));
+            if (room.mode == "kill") {
+                Member* k = by != m.slot ? room.At(by) : nullptr;
+                if (k) k->score++;
+                if (k && room.kills && k->score >= room.kills) EndRound(room, k, "", false);
+                else m.respawn_at = now + room.respawn, Changed(room);
+            } else if (!CheckFight(room)) {
+                Changed(room);
+            }
         }
         return "ok";
     }
@@ -675,7 +686,12 @@ struct Server::Impl {
     }
 
     void EnterLoad(Room& room, const std::string& msg = "") {
-        for (auto& o : room.members) o->alive = true, o->arena = false, o->hp = 1000;
+        for (auto& o : room.members) o->alive = true, o->life = 0, o->respawn_at = 0, o->arena = false, o->hp = 1000;
+        if (room.maps) {  // a random map from the mask
+            std::vector<int> pick;
+            for (int i = 0; i < 16; i++) if (room.maps >> i & 1) pick.push_back(i);
+            room.map = pick[std::uniform_int_distribution<size_t>(0, pick.size() - 1)(rng)];
+        }
         Enter(room, "load", t.load, -1, msg);
     }
 
@@ -686,6 +702,7 @@ struct Server::Impl {
     }
 
     bool CheckFight(Room& room, const std::string& msg = "") {
+        if (room.mode == "kill") return false;  // the alive count never ends a kill round
         Member* alive = nullptr;
         int n = 0;
         for (auto& o : room.members) if (o->alive && !n++) alive = o.get();
@@ -694,11 +711,21 @@ struct Server::Impl {
         return true;
     }
 
-    void EndRound(Room& room, Member* win, const std::string& msg = "") {
-        if (win) win->score++;
+    void EndRound(Room& room, Member* win, const std::string& msg = "", bool add = true) {
+        if (win && add) win->score++;
+        for (auto& o : room.members) o->respawn_at = 0;
         Enter(room, "end", t.end, win ? win->slot : -1, msg);
     }
     void TimeUp(Room& room) {  // highest hp among the living wins the round; a tie is a draw
+        if (room.mode == "kill") {  // kill: highest score wins, a tie is a draw
+            int best = INT_MIN, top = 0;
+            Member* first = nullptr;
+            for (auto& o : room.members) best = std::max(best, o->score);
+            for (auto& o : room.members)
+                if (o->score == best && !top++) first = o.get();
+            EndRound(room, top == 1 ? first : nullptr, "", false);
+            return;
+        }
         int best = -1, top = 0;
         Member* first = nullptr;
         for (auto& o : room.members) if (o->alive) best = std::max(best, o->hp);
@@ -708,6 +735,7 @@ struct Server::Impl {
     }
 
     void AfterEnd(Room& room) {
+        if (room.mode == "kill") { Enter(room, "over", t.over, room.winner); return; }  // one round only
         int need = room.rounds / 2 + 1;
         bool clinch = false;
         for (auto& o : room.members) clinch |= o->score >= need;
@@ -787,6 +815,15 @@ struct Server::Impl {
                     Log(s + " conn=0");
                     if (!(room.phase == "load" && CheckLoad(room))) Changed(room);
                 }
+            }
+            if (live() && room.phase == "fight") {  // kill mode respawns
+                bool back = false;
+                for (auto& o : room.members)
+                    if (o->respawn_at && now >= o->respawn_at) {
+                        o->alive = true, o->life++, o->hp = 1000, o->respawn_at = 0, back = true;
+                        Log("[" + room.code + "] slot " + std::to_string(o->slot) + " respawn life " + std::to_string(o->life));
+                    }
+                if (back) Changed(room);
             }
             if (live() && now - room.last_change >= t.room_idle) DeleteRoom(room, "idle, deleted");
             if (!live() || !room.deadline || now < room.deadline) continue;
