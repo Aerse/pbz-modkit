@@ -266,8 +266,8 @@ int Client(int port, const std::string& code, double seconds) {
 void LobbyTest() {
     std::string root = RepoRoot(), srv = root + "\\mods\\pvp\\server\\pbzmp_server.py";
     if (GetFileAttributesA(srv.c_str()) == INVALID_FILE_ATTRIBUTES) { printf("lobby: %s not found, UNTESTED\n", srv.c_str()); return; }
-    std::mt19937 rng(GetTickCount());
-    int port = 30000 + (int)(rng() % 20000);
+    const char* pe = getenv("PBZMP_TEST_PORT");  // fixed port for the spawned server, default 27802
+    int port = pe && atoi(pe) > 0 ? atoi(pe) : 27802;
     printf("lobby: server on port %d\n", port);
     PROCESS_INFORMATION ps = Spawn("python -I \"" + srv + "\" --port " + std::to_string(port) + " --password \"" + kTestPw + "\"");
     SleepMs(1500);

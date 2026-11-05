@@ -16,12 +16,14 @@
 namespace rsrv {
 namespace {
 
-constexpr uint8_t kMagic = 0xB7, kVer = 1;
+constexpr uint8_t kMagic = 0xB7, kVer = 1;  // header version; create/join ver= is kProtoVer
+const char* const kProtoVer = "2";
+constexpr int kMaxSlots = 8;  // protocol limit: slot / by ranges
 constexpr uint8_t T_CTRL = 0x01, T_REPLY = 0x02, T_STATE = 0x03, T_GAME_IN = 0x10, T_GAME_OUT = 0x11;
 constexpr size_t kHdr = 8, kMaxDgram = 1200;
 constexpr size_t kMinHello = 64;  // token=0 CTRL shorter than this is dropped: no reply can outgrow its request
 constexpr size_t kMaxArgs = 16, kCachePerMember = 64;
-const char* const kCmds[] = {"create", "join", "leave", "set", "conf", "start", "arena", "dead", "hp", "ping"};
+const char* const kCmds[] = {"create", "join", "leave", "set", "conf", "start", "arena", "dead", "hp", "ping", "mods"};
 
 // Thrown for malformed input. req != 0: the parse got far enough to answer "err reason=bad".
 struct Bad { uint64_t req = 0; };
@@ -116,6 +118,30 @@ std::string PctEnc(const std::string& s) {
     }
     return r;
 }
+// STATE v2 value escaping: only 0x00-0x20 % , = 0x7F become %XX; UTF-8 stays raw.
+std::string StateEnc(const std::string& s) {
+    static const char* hx = "0123456789ABCDEF";
+    std::string r;
+    for (unsigned char c : s) {
+        if (c <= 0x20 || c == '%' || c == ',' || c == '=' || c == 0x7F) r += '%', r += hx[c >> 4], r += hx[c & 15];
+        else r += (char)c;
+    }
+    return r;
+}
+// FNV-1a 32 of the mods text as 8 lowercase hex digits, "" for "" (same as rules::ModHash).
+std::string ModHash(const std::string& s) {
+    if (s.empty()) return "";
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) h = (h ^ c) * 16777619u;
+    char b[9];
+    snprintf(b, sizeof b, "%08x", h);
+    return b;
+}
+bool ReRules(const std::string& s) {
+    if (s.size() > 200) return false;
+    for (char c : s) if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ':' || c == ',')) return false;
+    return true;
+}
 using Args = std::map<std::string, std::string>;
 struct Ctrl { uint64_t req; std::string cmd; Args args; };
 
@@ -153,8 +179,10 @@ Ctrl ParseCtrl(const uint8_t* b, size_t n) {
 void CheckKeys(const std::string& cmd, const Args& a) {
     static const std::map<std::string, std::vector<std::string>> keys = {
         {"create", {"name", "ver", "max", "pw", "pad"}}, {"join", {"code", "name", "ver", "pw", "pad"}},
-        {"leave", {}}, {"start", {}}, {"set", {"ready", "weapon", "edge", "mods"}}, {"conf", {"rounds", "time", "dmg", "max", "map"}},
-        {"arena", {"round"}}, {"dead", {"round", "by"}}, {"hp", {"round", "pct"}}, {"ping", {"t"}}};
+        {"leave", {}}, {"start", {}}, {"set", {"ready", "weapon", "edge", "mods"}},
+        {"conf", {"rounds", "time", "dmg", "max", "map", "maps", "mode", "respawn", "kills", "rules"}},
+        {"arena", {"round"}}, {"dead", {"round", "by", "life"}}, {"hp", {"round", "pct"}}, {"ping", {"t"}},
+        {"mods", {"slot"}}};
     const auto& ks = keys.at(cmd);
     for (const auto& [k, v] : a) if (std::find(ks.begin(), ks.end(), k) == ks.end()) throw Bad{};
     auto p = a.find("pad");
@@ -200,6 +228,8 @@ struct Member {
     std::string weapon, edge;  // lobby picks (edge = Phantom Edge / 杀器), opaque text
     std::string mods;          // enabled client mods "id:ver:flag;...", opaque text
     int score = 0, hp = 1000;
+    int life = 0, deaths = 0;  // this round's life number (kill: +1 per respawn), deaths this match
+    double respawn_at = 0;     // kill mode: when a dead member is re-alived (0 = not pending)
     double last = 0;
     std::deque<std::pair<uint64_t, std::string>> replies;  // req -> packet, oldest first
     double gwin = 0;
@@ -209,6 +239,8 @@ struct Member {
 struct Room {
     std::string code;
     int max = 2, rounds = 3, time = 90, dmg = 100, map = 0;
+    int maps = 0, respawn = 5, kills = 10;  // random map bitmask (0 = use map); kill-mode respawn seconds / target
+    std::string mode = "duel", rules;       // create with max > 2 makes an ffa room
     std::string phase = "lobby";
     int round = 0, winner = -1, host = 0;
     long long v = 0;
@@ -265,7 +297,7 @@ struct Server::Impl {
         if (it != ips.end()) {  // egress cap per destination ip (bounds token-spoof redirects)
             Win& w = it->second.out;
             if (now - w.start >= 1.0) w.start = now, w.n = 0;
-            if (w.n + (long long)d.size() > lim.egress_bytes) return;
+            if (lim.egress_bytes && w.n + (long long)d.size() > lim.egress_bytes) return;
             w.n += d.size();
         }
         if (sendFn) sendFn(addr, (const uint8_t*)d.data(), d.size());
@@ -403,6 +435,7 @@ struct Server::Impl {
         if (cmd == "arena") return CmdArena(room, *m, a);
         if (cmd == "dead") return CmdDead(room, *m, a);
         if (cmd == "hp") return CmdHp(room, *m, a);
+        if (cmd == "mods") return CmdMods(room, a);
         return CmdPing(a);
     }
 
@@ -433,7 +466,7 @@ struct Server::Impl {
     // Checks shared by create/join; returns the error text ("" = fine) and fills name.
     std::string HelloCommon(const Args& a, std::string& name) {
         auto ver = Get(a, "ver");
-        if (!ver || *ver != "1") return "err reason=version";
+        if (!ver || *ver != kProtoVer) return "err reason=version";
         if (!password.empty() && !SameConstTime(GetOr(a, "pw", ""), password)) return "err reason=password";
         try { name = CleanText(GetOr(a, "name", ""), 24, SIZE_MAX); } catch (const Bad&) { return "err reason=value"; }
         return "";
@@ -442,7 +475,7 @@ struct Server::Impl {
         std::string name, err = HelloCommon(a, name);
         if (!err.empty()) return err;
         int mx;
-        try { std::string v = GetOr(a, "max", "2"); mx = ToInt(&v, 2, 4); } catch (const Bad&) { return "err reason=value"; }
+        try { std::string v = GetOr(a, "max", "2"); mx = ToInt(&v, 2, lim.max_players); } catch (const Bad&) { return "err reason=value"; }
         if (!st.create.Hit(now, 60.0, lim.creates_per_min)) return "err reason=rate";
         auto rb = roomsByIp.find(ip);
         if ((rb == roomsByIp.end() ? 0 : rb->second) >= lim.rooms_per_ip) return "err reason=rate";
@@ -455,6 +488,7 @@ struct Server::Impl {
         } while (rooms.count(code));
         auto room = std::make_shared<Room>();
         room->code = code, room->max = mx, room->owner_ip = ip;
+        if (mx > 2) room->mode = "ffa";
         rooms[code] = room;
         roomsByIp[ip]++;
         Member& m = AddMember(room, name, addr, ip);
@@ -516,19 +550,30 @@ struct Server::Impl {
     std::string CmdConf(Room& room, Member& m, const Args& a) {
         if (m.slot != room.host) return "err reason=nothost";
         if (room.phase != "lobby") return "err reason=phase";
-        for (const auto& [k, v] : a) if (!ReInt(v)) return "err reason=value";
+        for (const auto& [k, v] : a) if (k != "mode" && k != "rules" && !ReInt(v)) return "err reason=value";
         auto num = [&](const char* k, int& out) { auto v = Get(a, k); if (v) out = std::stoi(*v); return v != nullptr; };
         int rounds = room.rounds, time = room.time, dmg = room.dmg, map = room.map, mx = room.max;
+        int maps = room.maps, respawn = room.respawn, kills = room.kills;
+        std::string mode = room.mode, rules = room.rules;
+        auto md = Get(a, "mode"), rl = Get(a, "rules");
+        if (md) { if (*md != "duel" && *md != "ffa" && *md != "kill") return "err reason=value"; mode = *md; }
+        if (rl) { if (!ReRules(*rl)) return "err reason=value"; rules = *rl; }
+        if (num("maps", maps) && !(maps >= 0 && maps <= 65535)) return "err reason=value";
+        if (num("respawn", respawn) && !(respawn >= 1 && respawn <= 10)) return "err reason=value";
+        if (num("kills", kills) && !(kills >= 0 && kills <= 50)) return "err reason=value";
         if (num("rounds", rounds) && !(rounds == 1 || rounds == 3 || rounds == 5 || rounds == 7 || rounds == 9))
             return "err reason=value";
-        if (num("time", time) && !(time == 0 || (time >= 30 && time <= 300))) return "err reason=value";
+        if (num("time", time) && !(time == 0 || (time >= 30 && time <= 600))) return "err reason=value";
         if (num("dmg", dmg) && !(dmg >= 10 && dmg <= 500)) return "err reason=value";
         if (num("map", map) && !(map >= 0 && map <= 15)) return "err reason=value";
-        if (num("max", mx)) {
-            if (mx < 2 || mx > 4) return "err reason=value";
-            for (auto& o : room.members) if (o->slot >= mx) return "err reason=value";
-        }
+        bool maxGiven = num("max", mx);
+        if (maxGiven && (mx < 2 || mx > lim.max_players)) return "err reason=value";
+        // all given fields take effect together, then the result is checked
+        if (md && *md == "duel" && !maxGiven) mx = 2;
+        if (mode == "duel" && mx != 2) return "err reason=value";
+        for (auto& o : room.members) if (o->slot >= mx) return "err reason=value";
         room.rounds = rounds, room.time = time, room.dmg = dmg, room.map = map, room.max = mx;
+        room.maps = maps, room.respawn = respawn, room.kills = kills, room.mode = mode, room.rules = rules;
         Changed(room);
         return "ok";
     }
@@ -556,7 +601,8 @@ struct Server::Impl {
 
     std::string CmdDead(Room& room, Member& m, const Args& a) {
         ToInt(Get(a, "round"), 0, 99);
-        if (auto by = Get(a, "by")) ToInt(by, -1, 3);
+        if (auto by = Get(a, "by")) ToInt(by, -1, kMaxSlots - 1);
+        if (auto life = Get(a, "life")) ToInt(life, 0, 9999);
         if (room.phase == "fight" && *Get(a, "round") == std::to_string(room.round) && m.alive) {
             m.alive = false;
             Log("[" + room.code + "] slot " + std::to_string(m.slot) + " dead by " + GetOr(a, "by", "-1"));
@@ -570,6 +616,13 @@ struct Server::Impl {
         int pct = ToInt(Get(a, "pct"), 0, 1000);
         if (*Get(a, "round") == std::to_string(room.round)) m.hp = pct;
         return "ok";
+    }
+
+    std::string CmdMods(const Room& room, const Args& a) {
+        int slot = ToInt(Get(a, "slot"), 0, kMaxSlots - 1);
+        const Member* o = room.At(slot);
+        if (!o) return "err reason=value";
+        return "ok slot=" + std::to_string(slot) + " mods=" + PctEnc(o->mods);
     }
 
     std::string CmdPing(const Args& a) {
@@ -693,15 +746,19 @@ struct Server::Impl {
                         " rounds=" + std::to_string(room.rounds) + " time=" + std::to_string(room.time) +
                         " dmg=" + std::to_string(room.dmg) + " map=" + std::to_string(room.map) +
                         " max=" + std::to_string(room.max) + " host=" + std::to_string(room.host) +
-                        " left=" + std::to_string(left) + " winner=" + std::to_string(room.winner);
-        if (!room.msg.empty()) s += " msg=" + PctEnc(room.msg);
+                        " left=" + std::to_string(left) + " winner=" + std::to_string(room.winner) +
+                        " mode=" + room.mode + " maps=" + std::to_string(room.maps) +
+                        " respawn=" + std::to_string(room.respawn) + " kills=" + std::to_string(room.kills) +
+                        " cap=" + std::to_string(lim.max_players) + " rules=" + StateEnc(room.rules);
+        if (!room.msg.empty()) s += " msg=" + StateEnc(room.msg);
         std::vector<const Member*> ms;
         for (auto& o : room.members) ms.push_back(o.get());
         std::sort(ms.begin(), ms.end(), [](const Member* a, const Member* b) { return a->slot < b->slot; });
         for (const Member* o : ms)
-            s += " m" + std::to_string(o->slot) + "=" + PctEnc(o->name) + "," + (o->ready ? "1" : "0") + "," +
-                 PctEnc(o->weapon) + "," + std::to_string(o->score) + "," + (o->alive ? "1" : "0") + "," +
-                 (o->conn ? "1" : "0") + "," + PctEnc(o->edge) + "," + PctEnc(o->mods);
+            s += " m" + std::to_string(o->slot) + "=" + StateEnc(o->name) + "," + (o->ready ? "1" : "0") + "," +
+                 StateEnc(o->weapon) + "," + std::to_string(o->score) + "," + (o->alive ? "1" : "0") + "," +
+                 (o->conn ? "1" : "0") + "," + StateEnc(o->edge) + "," + ModHash(o->mods) + "," +
+                 std::to_string(o->life) + "," + std::to_string(o->deaths);
         return s;
     }
 

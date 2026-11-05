@@ -1,4 +1,4 @@
-// pbzmp room/relay server: a C++ port of server/pbzmp_server.py (protocol v1, docs/pvp-protocol.md).
+// pbzmp room/relay server: a C++ port of server/pbzmp_server.py (protocol v2, docs/pvp-protocol.md).
 // Transport-agnostic, so the host's game can run it for Steam P2P play (net.cpp) and _rsrv_main.cpp can wrap
 // it in a UDP exe for server/test_server.py. Not thread-safe: the caller serialises every call, and the
 // send/log callbacks run inside Handle/Tick (they must not call back into the Server).
@@ -30,8 +30,9 @@ struct Limits {
     int game_pkts = 200, game_bytes = 128 * 1024;   // GAME forwarded per member per second
     int badjoin_per_10min = 10;                     // joins with an unknown code
     int badtok_per_min = 30;                        // CTRL with an unknown token
-    int egress_bytes = 512 * 1024;                  // bytes/s sent to one ip
+    int egress_bytes = 512 * 1024;                  // bytes/s sent to one ip, 0 = no limit
     int max_ips = 65536;                            // tracked ips before forced pruning
+    int max_players = 8;                            // room size cap 2..8 (--max-players), STATE cap=
 };
 struct Stats { size_t rooms = 0, players = 0, ips = 0, owner_ips = 0; uint64_t rx = 0; };  // rx: datagrams ever
 

@@ -170,7 +170,7 @@ class Client:
         raise AssertionError(f"phase {phase} not reached, last={self.fail_state}")
 
     def create(self, name="host", **kw):
-        r = self.ctrl("create", name=name, ver=1, **kw)
+        r = self.ctrl("create", name=name, ver=2, **kw)
         if r and r[0]:
             self.token = int(r[1]["token"])
             self.slot = int(r[1]["slot"])
@@ -182,7 +182,7 @@ class Client:
         self.raw(srv.T_CTRL, b"0 ping t=0")
         self.pump(0.03)
 
-    def join(self, code, name="guest", ver=1):
+    def join(self, code, name="guest", ver=2):
         r = self.ctrl("join", code=code, name=name, ver=ver)
         if r and r[0]:
             self.token = int(r[1]["token"])
@@ -305,12 +305,14 @@ class TestLobby(Base):
         self.assertEqual(st["host"], "0")
         self.assertEqual(st["m0"].split(",")[0], "Alice%20Smith")
         self.assertEqual(st["m1"].split(",")[0], "B" * 24)
-        self.assertEqual(st["m1"], "B" * 24 + ",0,,0,1,1,,")
+        self.assertEqual(st["m1"], "B" * 24 + ",0,,0,1,1,,,0,0")
+        self.assertEqual((st["mode"], st["maps"], st["respawn"], st["kills"], st["cap"], st["rules"]),
+                         ("duel", "0", "5", "10", "8", ""))
         self.assertEqual(g.state()["you"], "1")
 
     def test_join_errors(self):
         h = self.client()
-        self.assertEqual(h.ctrl("create", name="x", ver=2), (False, {"reason": "version"}))
+        self.assertEqual(h.ctrl("create", name="x", ver=1), (False, {"reason": "version"}))
         ok, r = h.create(max=2)
         code = r["code"]
         g = self.client()
@@ -319,7 +321,8 @@ class TestLobby(Base):
         self.assertTrue(g.join(code)[0])
         x = self.client()
         self.assertEqual(x.join(code)[1]["reason"], "full")
-        self.assertTrue(h.ctrl("conf", max=3)[0])
+        self.assertEqual(h.ctrl("conf", max=3)[1]["reason"], "value")  # duel needs max=2
+        self.assertTrue(h.ctrl("conf", mode="ffa", max=3)[0])
         self.assertTrue(x.join(code)[0])
 
     def test_server_full(self):
@@ -332,19 +335,21 @@ class TestLobby(Base):
         h, g, _ = self.room2()
         self.assertTrue(g.ctrl("set", weapon="/Game/W/a b,c")[0])
         g.pump(0.1)
-        self.assertEqual(g.states[-1]["m1"], "guest,0,%2FGame%2FW%2Fa%20b%2Cc,0,1,1,,")
+        self.assertEqual(g.states[-1]["m1"], "guest,0,/Game/W/a%20b%2Cc,0,1,1,,,0,0")
         self.assertEqual(g.ctrl("set", weapon="x" * 201)[1]["reason"], "value")
         # edge (Phantom Edge pick): 7th member subfield, same text rules, leaves weapon alone
         self.assertTrue(g.ctrl("set", edge="Hu Pao,1")[0])
         g.pump(0.1)
-        self.assertEqual(g.states[-1]["m1"], "guest,0,%2FGame%2FW%2Fa%20b%2Cc,0,1,1,Hu%20Pao%2C1,")
+        self.assertEqual(g.states[-1]["m1"], "guest,0,/Game/W/a%20b%2Cc,0,1,1,Hu%20Pao%2C1,,0,0")
         self.assertTrue(g.ctrl("set", edge="x" * 200, ready=1)[0])
         g.pump(0.1)
-        self.assertEqual(g.states[-1]["m1"].split(","), ["guest", "1", "%2FGame%2FW%2Fa%20b%2Cc", "0", "1", "1", "x" * 200, ""])
-        # mods (enabled client mods): 8th member subfield, same text rules
+        self.assertEqual(g.states[-1]["m1"].split(","),
+                         ["guest", "1", "/Game/W/a%20b%2Cc", "0", "1", "1", "x" * 200, "", "0", "0"])
+        # mods (enabled client mods): STATE carries only the hash (8th subfield), "mods slot=" the list
         self.assertTrue(g.ctrl("set", mods="mp:1.0:a;evil.x:2:b")[0])
         g.pump(0.1)
-        self.assertEqual(g.states[-1]["m1"].split(",")[7], "mp%3A1.0%3Aa%3Bevil.x%3A2%3Ab")
+        self.assertEqual(g.states[-1]["m1"].split(",")[7], srv.mod_hash("mp:1.0:a;evil.x:2:b"))
+        self.assertEqual(h.ctrl("mods", slot=1), (True, {"slot": "1", "mods": "mp:1.0:a;evil.x:2:b"}))
         self.assertEqual(g.ctrl("set", mods="x" * 201)[1]["reason"], "value")
         self.assertEqual(g.ctrl("set", edge="x" * 201)[1]["reason"], "value")
         self.assertEqual(g.ctrl("set", edge="x" * 201, ready=0)[1]["reason"], "value")
@@ -353,10 +358,10 @@ class TestLobby(Base):
         g.pump(0.1)
         self.assertEqual(g.states[-1]["m1"].split(",")[6], "")
         self.assertEqual(g.ctrl("conf", rounds=3)[1]["reason"], "nothost")
-        for kw in ({"rounds": 2}, {"time": 20}, {"time": 301}, {"dmg": 9},
-                   {"dmg": 501}, {"max": 5}, {"max": 1}):
+        for kw in ({"rounds": 2}, {"time": 20}, {"time": 601}, {"dmg": 9},
+                   {"dmg": 501}, {"max": 9}, {"max": 1}, {"mode": "ffa", "max": 9}):
             self.assertEqual(h.ctrl("conf", **kw)[1]["reason"], "value", kw)
-        self.assertTrue(h.ctrl("conf", rounds=5, time=0, dmg=250, max=4)[0])
+        self.assertTrue(h.ctrl("conf", rounds=5, time=0, dmg=250, max=4, mode="ffa")[0])
         st = h.state()
         self.assertEqual((st["rounds"], st["time"], st["dmg"], st["max"]), ("5", "0", "250", "4"))
 
@@ -404,8 +409,8 @@ class TestLobby(Base):
 
     def test_bad_magic_version_dropped(self):
         h = self.client()
-        h.raw(srv.T_CTRL, b"1 create name=a ver=1", magic=0xB6)
-        h.raw(srv.T_CTRL, b"2 create name=a ver=1", ver=2)
+        h.raw(srv.T_CTRL, b"1 create name=a ver=2", magic=0xB6)
+        h.raw(srv.T_CTRL, b"2 create name=a ver=2", ver=2)
         h.pump(0.2)
         self.assertEqual(h.replies, {})
         self.assertEqual(self.n_rooms(), 0)
@@ -414,8 +419,8 @@ class TestLobby(Base):
 class TestDedupeRate(Base):
     def test_create_dedupe(self):
         h = self.client()
-        a = h.ctrl("create", req=1, name="a", ver=1)
-        b = h.ctrl("create", req=1, name="a", ver=1)
+        a = h.ctrl("create", req=1, name="a", ver=2)
+        b = h.ctrl("create", req=1, name="a", ver=2)
         self.assertEqual(a, b)
         self.assertEqual(self.n_rooms(), 1)
 
@@ -746,13 +751,13 @@ class TestHardening(Base):
     def test_no_amplification(self):
         c = self.client()
         # tiny unauthenticated create: no reply at all
-        c.raw(srv.T_CTRL, b"1 create name=a ver=1")
+        c.raw(srv.T_CTRL, b"1 create name=a ver=2")
         c.pump(0.2)
         self.assertEqual(c.replies, {})
         self.assertEqual(self.n_rooms(), 0)
         # padded: reply is no bigger than the request
         sizes = self.spy_send()
-        req = hello(2, "create", name="a", ver=1)
+        req = hello(2, "create", name="a", ver=2)
         c.raw(srv.T_CTRL, req)
         c.pump(0.2)
         self.assertIn(2, c.replies)
@@ -773,7 +778,7 @@ class TestHardening(Base):
         h = self.client()
         code = h.create()[1]["code"]
         g = self.client()
-        g.raw(srv.T_CTRL, hello(1, "join", code=code, name="spoof", ver=1))
+        g.raw(srv.T_CTRL, hello(1, "join", code=code, name="spoof", ver=2))
         g.pump(0.15)
         self.assertIn(1, g.replies)
         self.assertEqual(g.states, [])
@@ -906,7 +911,7 @@ class TestPassword(unittest.TestCase):
         d = Client(self.server.port)
         try:
             self.assertEqual(d.join(r["code"])[1]["reason"], "password")
-            ok2 = d.ctrl("join", code=r["code"], name="g", ver=1, pw="s3cret")
+            ok2 = d.ctrl("join", code=r["code"], name="g", ver=2, pw="s3cret")
             self.assertTrue(ok2[0])
         finally:
             d.close()
@@ -918,7 +923,7 @@ class TestProcess(unittest.TestCase):
     def test_cli_shutdown(self):
         import subprocess
         import tempfile
-        port = 27901 + os.getpid() % 90
+        port = int(os.environ.get("PBZMP_TEST_PORT", "27801"))  # a fixed port: the CLI has no "port=" line
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pbzmp_server.py")
         with tempfile.TemporaryDirectory() as d:
             lf = os.path.join(d, "srv.log")
@@ -931,7 +936,7 @@ class TestProcess(unittest.TestCase):
                 c = Client(port)
                 r = None
                 for _ in range(40):
-                    r = c.ctrl("create", wait=0.25, name="a", ver=1, pw="pw1")
+                    r = c.ctrl("create", wait=0.25, name="a", ver=2, pw="pw1")
                     if r:
                         break
                 c.close()
@@ -960,7 +965,7 @@ class TestNetSim(unittest.TestCase):
         th.start()
         c = Client(s.port)
         try:
-            self.assertIsNone(c.ctrl("create", wait=0.3, name="a", ver=1))
+            self.assertIsNone(c.ctrl("create", wait=0.3, name="a", ver=2))
         finally:
             c.close(); s.stop(); th.join(2)
         s = srv.Server("127.0.0.1", 0, delay=200, jitter=50, quiet=True)
@@ -969,7 +974,7 @@ class TestNetSim(unittest.TestCase):
         c = Client(s.port)
         try:
             t0 = time.monotonic()
-            self.assertTrue(c.ctrl("create", wait=1.0, name="a", ver=1)[0])
+            self.assertTrue(c.ctrl("create", wait=1.0, name="a", ver=2)[0])
             self.assertGreaterEqual(time.monotonic() - t0, 0.19)
         finally:
             c.close(); s.stop(); th.join(2)

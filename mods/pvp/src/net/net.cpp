@@ -8,6 +8,7 @@
 
 #include "net.h"
 #include "room_server.h"
+#include "rules.h"
 #include "steam.h"
 
 #include <algorithm>
@@ -176,6 +177,9 @@ struct S {
     bool resuming = false;  // Resume: a ping with the old token is out, InRoom once it is answered
     std::vector<Pending> pend;
     double lastPing = -1e18, lastSrvRecv = 0; int srvRtt = -1;
+    // Member::mods comes from "mods slot=" queries: slot -> (modh, mods) answers, slot -> modh asked for
+    std::map<int, std::pair<std::string, std::string>> modsCache;
+    std::map<int, std::string> modsAsked;
     // loopback
     bool loop = false; int lDelay = 0, lJit = 0; float lLoss = 0;
     std::vector<LPkt> lq;
@@ -333,6 +337,8 @@ void ResetRoom() {
     s.room = Room{};
     s.haveRoom = false;
     s.pend.clear();
+    s.modsCache.clear();
+    s.modsAsked.clear();
     s.active = false;
     s.rem.clear();
     s.osure.clear();
@@ -652,25 +658,64 @@ void HandleState(const std::string& text) {
     rm.max = ToInt(kv, "max", 2);
     rm.winner = ToInt(kv, "winner", -1);
     rm.leftMs = ToInt(kv, "left", 0);
+    Room def;
+    rm.mode = kv.count("mode") ? ToStr(kv, "mode") : def.mode;
+    rm.maps = ToInt(kv, "maps", def.maps);
+    rm.respawn = ToInt(kv, "respawn", def.respawn);
+    rm.kills = ToInt(kv, "kills", def.kills);
+    rm.cap = ToInt(kv, "cap", def.cap);
+    rm.rules = ToStr(kv, "rules");
     rm.recvAt = Now();
     for (auto& [k, val] : kv) {
         if (k.size() < 2 || k[0] != 'm' || !isdigit((unsigned char)k[1])) continue;
+        // v2: name,ready,weapon,score,alive,conn,edge,modh,life,deaths (STATE escaping: %XX, other bytes raw)
         auto f = Split(val, ',');
+        auto F = [&](size_t i) { return i < f.size() ? PctDec(f[i]) : std::string(); };
         Member m;
         m.slot = atoi(k.c_str() + 1);
-        if (f.size() > 0) m.name = PctDec(f[0]);
-        if (f.size() > 1) m.ready = PctDec(f[1]) == "1";
-        if (f.size() > 2) m.weapon = PctDec(f[2]);
-        if (f.size() > 3) m.score = atoi(PctDec(f[3]).c_str());
-        if (f.size() > 4) m.alive = PctDec(f[4]) == "1";
-        if (f.size() > 5) m.conn = PctDec(f[5]) == "1";
-        if (f.size() > 6) m.edge = PctDec(f[6]);  // absent from servers older than the edge key
-        if (f.size() > 7) m.mods = PctDec(f[7]);
+        m.name = F(0);
+        m.ready = F(1) == "1";
+        m.weapon = F(2);
+        m.score = atoi(F(3).c_str());
+        m.alive = F(4) == "1";
+        m.conn = F(5) == "1";
+        m.edge = F(6);
+        m.modh = F(7);
+        m.life = atoi(F(8).c_str());
+        m.deaths = atoi(F(9).c_str());
+        if (m.modh.empty()) {
+            s.modsCache.erase(m.slot);
+        } else {
+            auto c = s.modsCache.find(m.slot);
+            if (c != s.modsCache.end() && c->second.first == m.modh) {
+                m.mods = c->second.second;
+            } else {
+                // keep the old list until the answer is in (net.h: mods may lag modh briefly)
+                for (auto& o : s.room.members) if (o.slot == m.slot && o.name == m.name) m.mods = o.mods;
+                auto a = s.modsAsked.find(m.slot);
+                if (a == s.modsAsked.end() || a->second != m.modh) {
+                    s.modsAsked[m.slot] = m.modh;
+                    QueueCmd("mods", {{"slot", std::to_string(m.slot)}});
+                }
+            }
+        }
         rm.members.push_back(std::move(m));
     }
     std::sort(rm.members.begin(), rm.members.end(), [](const Member& a, const Member& b) { return a.slot < b.slot; });
     s.room = std::move(rm);
     s.haveRoom = true;
+}
+
+// Answer to "mods slot=": cache it under its own hash, so a STATE whose modh moved on asks again.
+void HandleMods(const KV& kv) {
+    S& s = g().s;
+    int slot = ToInt(kv, "slot", -1);
+    if (slot < 0) return;
+    std::string mods = ToStr(kv, "mods"), h = rules::ModHash(mods);
+    s.modsCache[slot] = {h, mods};
+    auto a = s.modsAsked.find(slot);
+    if (a != s.modsAsked.end() && a->second == h) s.modsAsked.erase(a);
+    for (auto& m : s.room.members) if (m.slot == slot && m.modh == h) m.mods = mods;
 }
 
 void HandleReply(const std::string& text) {
@@ -684,6 +729,11 @@ void HandleReply(const std::string& text) {
     if (it == s.pend.end()) return;
     std::string cmd = it->cmd;
     s.pend.erase(it);
+    if (cmd == "mods") {  // never touches s.err: the ui does not wait for it
+        if (ok) HandleMods(kv);
+        else s.modsAsked.clear();  // the slot was empty (member left): the next STATE asks again if needed
+        return;
+    }
     if (cmd == "create" || cmd == "join") {
         if (s.st != Status::Connecting) return;
         if (ok) {
@@ -692,6 +742,8 @@ void HandleReply(const std::string& text) {
             s.room.code = ToStr(kv, "code");
             s.room.you = ToInt(kv, "slot", -1);
             s.haveRoom = false;
+            s.modsCache.clear();
+            s.modsAsked.clear();
             s.st = Status::InRoom;
             s.lastSrvRecv = NowMs();
             s.lastPing = -1e18;
@@ -760,6 +812,7 @@ void Tick() {
                     else if (p.cmd == "ping" && s.resuming && s.st == Status::Connecting) {  // token unknown by now
                         ResetRoom(); s.st = Status::Failed; s.err = "expired";
                     }
+                    else if (p.cmd == "mods") s.modsAsked.clear();  // the next STATE asks again
                     else if (p.cmd != "ping") s.err = "timeout";
                     s.pend.erase(s.pend.begin() + i);
                     continue;
@@ -958,7 +1011,8 @@ void Create(const std::string& name, int maxPlayers) {
         s.hostId = me;
         s.resolved = true;
     }
-    std::vector<std::pair<std::string, std::string>> kv{{"name", name}, {"ver", "1"}, {"max", std::to_string(maxPlayers)}};
+    std::vector<std::pair<std::string, std::string>> kv{
+        {"name", name}, {"ver", std::to_string(kProtoVer)}, {"max", std::to_string(maxPlayers)}};
     if (!s.password.empty()) kv.push_back({"pw", s.password});
     QueueCmd("create", kv);
 }
@@ -969,7 +1023,7 @@ void Join(const std::string& code, const std::string& name) {
     s.st = Status::Connecting;
     s.err.clear();
     if (s.steam) { s.findCode = code; s.hostId = 0; s.resolved = false; }  // SteamPump finds the host first
-    std::vector<std::pair<std::string, std::string>> kv{{"code", code}, {"name", name}, {"ver", "1"}};
+    std::vector<std::pair<std::string, std::string>> kv{{"code", code}, {"name", name}, {"ver", std::to_string(kProtoVer)}};
     if (!s.password.empty()) kv.push_back({"pw", s.password});
     QueueCmd("join", kv, s.steam ? 60 : 20);  // the first P2P datagrams wait for a session (relay) to come up
 }

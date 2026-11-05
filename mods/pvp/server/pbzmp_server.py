@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pbzmp lobby + relay server (protocol v1, see docs/pvp-protocol.md).
+"""pbzmp lobby + relay server (protocol v2, see docs/pvp-protocol.md).
 
 Standard library only, single UDP port.
 
@@ -19,6 +19,8 @@ Spec decisions where the doc is silent:
 - Dedupe cache keeps the last 64 replies per member (and per address for
   create/join, expiring after 10 s).
 - Rate limits use fixed windows (1 s for packets, 60 s for create/join).
+- create with max > 2 makes an ffa room (duel needs max=2).
+- `mods slot=` works in every phase.
 
 Hardening for a public UDP service (see "服务器限制" in the doc):
 - Per-IP limits: packets/s (all types), CTRL/s per address, creates/min,
@@ -48,7 +50,8 @@ import sys
 import time
 
 MAGIC = 0xB7
-VERSION = 1
+VERSION = 1    # packet header version
+PROTO_VER = 2  # create/join ver=
 T_CTRL, T_REPLY, T_STATE, T_GAME_IN, T_GAME_OUT = 0x01, 0x02, 0x03, 0x10, 0x11
 HDR = struct.Struct("<BBBBI")
 MAX_DGRAM = 1200
@@ -80,7 +83,8 @@ class Limits:
     game_bytes = 128 * 1024
     badjoin_per_10min = 10  # join attempts with an unknown code
     badtok_per_min = 30     # CTRL with an unknown token (resent leave lookups)
-    egress_bytes = 512 * 1024  # bytes/s sent to one IP (bounds token-spoof redirects)
+    egress_bytes = 512 * 1024  # bytes/s sent to one IP (bounds token-spoof redirects), 0 = no limit
+    max_players = 8         # room size cap (--max-players), STATE cap=
     max_ips = 65536         # tracked IPs before forced pruning
 
 
@@ -91,8 +95,11 @@ RE_KEY = re.compile(r"[a-z]{1,16}\Z")
 RE_INT = re.compile(r"-?[0-9]{1,6}\Z")
 RE_REQ = re.compile(r"[0-9]{1,10}\Z")
 RE_CODE = re.compile(r"[0-9]{6}\Z")
+RE_RULES = re.compile(r"[a-z0-9:,]{0,200}\Z")
 CMDS = {"create", "join", "leave", "set", "conf", "start", "arena", "dead",
-        "hp", "ping"}
+        "hp", "ping", "mods"}
+MODES = ("duel", "ffa", "kill")
+MAX_SLOTS = 8  # protocol limit; slot/by ranges
 
 
 # allowed argument keys per command
@@ -101,9 +108,10 @@ KEYS = {
     "join": {"code", "name", "ver", "pw", "pad"},
     "leave": set(), "start": set(),
     "set": {"ready", "weapon", "edge", "mods"},
-    "conf": {"rounds", "time", "dmg", "max", "map"},
-    "arena": {"round"}, "dead": {"round", "by"}, "hp": {"round", "pct"},
-    "ping": {"t"},
+    "conf": {"rounds", "time", "dmg", "max", "map", "maps", "mode", "respawn",
+             "kills", "rules"},
+    "arena": {"round"}, "dead": {"round", "by", "life"},
+    "hp": {"round", "pct"}, "ping": {"t"}, "mods": {"slot"},
 }
 
 
@@ -190,6 +198,27 @@ def pct_enc(s) -> str:
     return "".join(chr(c) if c in SAFE else "%%%02X" % c for c in b)
 
 
+def state_enc(s: str) -> str:
+    """STATE v2 value escaping: only 0x00-0x20 % , = 0x7F; UTF-8 stays raw."""
+    out = bytearray()
+    for c in s.encode("utf-8"):
+        if c <= 0x20 or c in b"%,=\x7f":
+            out += b"%%%02X" % c
+        else:
+            out.append(c)
+    return out.decode("utf-8")
+
+
+def mod_hash(s: str) -> str:
+    """FNV-1a 32 of the mods text, 8 lowercase hex digits ("" for "")."""
+    if not s:
+        return ""
+    h = 2166136261
+    for c in s.encode("utf-8"):
+        h = ((h ^ c) * 16777619) & 0xFFFFFFFF
+    return "%08x" % h
+
+
 def pct_dec(s: str) -> str:
     out = bytearray()
     raw = s.encode("utf-8")
@@ -245,6 +274,9 @@ class Member:
         self.edge = ""  # Phantom Edge (杀器) pick, same rules as weapon
         self.mods = ""  # enabled client mods "id:ver:flag;...", opaque text, same rules
         self.score = 0
+        self.life = 0    # this round's life number (kill mode: +1 per respawn)
+        self.deaths = 0  # deaths this match
+        self.respawn_at = 0.0  # kill mode: when a dead member is re-alived (0 = not pending)
         self.alive = True
         self.conn = True
         self.last = now
@@ -266,6 +298,11 @@ class Room:
         self.time = 90
         self.dmg = 100
         self.map = 0
+        self.maps = 0       # random map bitmask, 0 = use map
+        self.mode = "duel" if max_ <= 2 else "ffa"
+        self.respawn = 5
+        self.kills = 10
+        self.rules = ""
         self.phase = "lobby"
         self.round = 0
         self.winner = -1
@@ -325,7 +362,7 @@ class Server:
             w = st.out
             if self.mono() - w.start >= 1.0:
                 w.start, w.n = self.mono(), 0
-            if w.n + len(data) > self.lim.egress_bytes:
+            if self.lim.egress_bytes and w.n + len(data) > self.lim.egress_bytes:
                 return
             w.n += len(data)
         if self.loss and self.rng.random() * 100 < self.loss:
@@ -548,7 +585,7 @@ class Server:
 
     def hello_common(self, a):
         """Checks shared by create/join; returns (error_text, name)."""
-        if a.get("ver") != str(VERSION):
+        if a.get("ver") != str(PROTO_VER):
             return "err reason=version", ""
         if self.password and not hmac.compare_digest(
                 a.get("pw", "").encode(), self.password.encode()):
@@ -564,7 +601,7 @@ class Server:
         if err:
             return err
         try:
-            mx = to_int(a.get("max", "2"), 2, 4)
+            mx = to_int(a.get("max", "2"), 2, self.lim.max_players)
         except Bad:
             return "err reason=value"
         ip = addr[0]
@@ -649,8 +686,31 @@ class Server:
         new = {}
         try:
             for k in a:
-                if not RE_INT.match(a[k]):
+                if k not in ("mode", "rules") and not RE_INT.match(a[k]):
                     raise ValueError
+            if "mode" in a:
+                if a["mode"] not in MODES:
+                    raise ValueError
+                new["mode"] = a["mode"]
+            if "rules" in a:
+                if not RE_RULES.match(a["rules"]):
+                    raise ValueError
+                new["rules"] = a["rules"]
+            if "maps" in a:
+                v = int(a["maps"])
+                if not 0 <= v <= 65535:
+                    raise ValueError
+                new["maps"] = v
+            if "respawn" in a:
+                v = int(a["respawn"])
+                if not 1 <= v <= 10:
+                    raise ValueError
+                new["respawn"] = v
+            if "kills" in a:
+                v = int(a["kills"])
+                if not 0 <= v <= 50:
+                    raise ValueError
+                new["kills"] = v
             if "rounds" in a:
                 v = int(a["rounds"])
                 if v not in (1, 3, 5, 7, 9):
@@ -658,7 +718,7 @@ class Server:
                 new["rounds"] = v
             if "time" in a:
                 v = int(a["time"])
-                if not (v == 0 or 30 <= v <= 300):
+                if not (v == 0 or 30 <= v <= 600):
                     raise ValueError
                 new["time"] = v
             if "dmg" in a:
@@ -673,9 +733,18 @@ class Server:
                 new["map"] = v
             if "max" in a:
                 v = int(a["max"])
-                if not 2 <= v <= 4 or any(s >= v for s in room.members):
+                if not 2 <= v <= self.lim.max_players:
                     raise ValueError
                 new["max"] = v
+            # all given fields take effect together, then the result is checked
+            if new.get("mode") == "duel" and "max" not in new:
+                new["max"] = 2
+            mode = new.get("mode", room.mode)
+            mx = new.get("max", room.max)
+            if mode == "duel" and mx != 2:
+                raise ValueError
+            if any(s >= mx for s in room.members):
+                raise ValueError
         except ValueError:
             return "err reason=value"
         for k, v in new.items():
@@ -709,7 +778,9 @@ class Server:
     def cmd_dead(self, room, m, a, now):
         to_int(a.get("round"), 0, 99)
         if "by" in a:
-            to_int(a["by"], -1, 3)
+            to_int(a["by"], -1, MAX_SLOTS - 1)
+        if "life" in a:
+            to_int(a["life"], 0, 9999)
         if room.phase == "fight" and a.get("round") == str(room.round) and m.alive:
             m.alive = False
             self.log(f"[{room.code}] slot {m.slot} dead by {a.get('by', '-1')}")
@@ -723,6 +794,13 @@ class Server:
         if a.get("round") == str(room.round):
             m.hp = pct
         return "ok"
+
+    def cmd_mods(self, room, m, a, now):
+        slot = to_int(a.get("slot"), 0, MAX_SLOTS - 1)
+        o = room.members.get(slot)
+        if not o:
+            return "err reason=value"
+        return f"ok slot={slot} mods={pct_enc(o.mods)}"
 
     def cmd_ping(self, room, m, a, now):
         t = a.get("t", "")
@@ -887,14 +965,17 @@ class Server:
              f"phase={room.phase}", f"round={room.round}",
              f"rounds={room.rounds}", f"time={room.time}", f"dmg={room.dmg}", f"map={room.map}",
              f"max={room.max}", f"host={room.host}", f"left={left}",
-             f"winner={room.winner}"]
+             f"winner={room.winner}", f"mode={room.mode}", f"maps={room.maps}",
+             f"respawn={room.respawn}", f"kills={room.kills}",
+             f"cap={self.lim.max_players}", "rules=" + state_enc(room.rules)]
         if room.msg:
-            f.append("msg=" + pct_enc(room.msg))
+            f.append("msg=" + state_enc(room.msg))
         for s in sorted(room.members):
             o = room.members[s]
             sub = [o.name, str(int(o.ready)), o.weapon, str(o.score),
-                   str(int(o.alive)), str(int(o.conn)), o.edge, o.mods]
-            f.append(f"m{s}=" + ",".join(pct_enc(x) for x in sub))
+                   str(int(o.alive)), str(int(o.conn)), o.edge,
+                   mod_hash(o.mods), str(o.life), str(o.deaths)]
+            f.append(f"m{s}=" + ",".join(state_enc(x) for x in sub))
         return " ".join(f)
 
     def send_state(self, room, m):
@@ -914,12 +995,23 @@ def main():
     ap.add_argument("--loss", type=float, default=0.0, help="send loss %%")
     ap.add_argument("--delay", type=float, default=0.0, help="send delay ms")
     ap.add_argument("--jitter", type=float, default=0.0, help="extra 0..N ms")
+    ap.add_argument("--max-players", type=int, default=8,
+                    help="room size cap, 2-8 (STATE cap=)")
+    ap.add_argument("--egress-kb", type=int, default=512,
+                    help="KB/s sent to one IP, 0 = no limit")
     a = ap.parse_args()
     if len(a.password.encode()) > 64 or has_ctl(a.password):
         ap.error("--password: at most 64 bytes, no control chars")
+    if not 2 <= a.max_players <= MAX_SLOTS:
+        ap.error("--max-players: 2-8")
+    if a.egress_kb < 0:
+        ap.error("--egress-kb: 0 or more")
+    lim = Limits()
+    lim.max_players = a.max_players
+    lim.egress_bytes = a.egress_kb * 1024
     lf = open(a.log_file, "a", encoding="utf-8") if a.log_file else None
     s = Server(a.bind, a.port, a.loss, a.delay, a.jitter,
-               quiet=a.quiet, password=a.password, log_file=lf)
+               quiet=a.quiet, password=a.password, limits=lim, log_file=lf)
 
     def on_signal(_sig, _frm):
         s.stop()

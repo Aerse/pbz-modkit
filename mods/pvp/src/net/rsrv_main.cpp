@@ -1,6 +1,7 @@
 // Test-only UDP wrapper around rsrv::Server (room_server.cpp), so server/test_server.py can run against the
 // C++ port: set PBZMP_CPP_SERVER=<path to out_rsrv\rsrv.exe>. Same CLI as pbzmp_server.py minus the net sim,
 // plus --timing/--limits overrides and --control (line commands on stdin, for the tests that poke internals).
+// --max-players / --egress-kb as in pbzmp_server.py.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
@@ -79,7 +80,8 @@ bool SetLimit(rsrv::Limits& l, const std::string& k, const std::string& v) {
         {"pps_per_ip", &rsrv::Limits::pps_per_ip}, {"ctrl_per_addr", &rsrv::Limits::ctrl_per_addr},
         {"game_pkts", &rsrv::Limits::game_pkts}, {"game_bytes", &rsrv::Limits::game_bytes},
         {"badjoin_per_10min", &rsrv::Limits::badjoin_per_10min}, {"badtok_per_min", &rsrv::Limits::badtok_per_min},
-        {"egress_bytes", &rsrv::Limits::egress_bytes}, {"max_ips", &rsrv::Limits::max_ips}};
+        {"egress_bytes", &rsrv::Limits::egress_bytes}, {"max_ips", &rsrv::Limits::max_ips},
+        {"max_players", &rsrv::Limits::max_players}};
     for (auto& f : fs) if (k == f.n) { l.*f.f = atoi(v.c_str()); return true; }
     return false;
 }
@@ -158,6 +160,7 @@ void Control(rsrv::Server& srv, const std::string& l, double now) {
 
 int Usage() {
     fprintf(stderr, "usage: rsrv [--port N] [--bind IP] [--password PW] [--log-file PATH] [--quiet]\n"
+                    "            [--max-players N] [--egress-kb N]\n"
                     "            [--timing k=v,...] [--limits k=v,...] [--control]\n");
     return 2;
 }
@@ -180,6 +183,15 @@ int main(int argc, char** argv) {
         else if (a == "--bind") bind = v;
         else if (a == "--password") password = v;
         else if (a == "--log-file") logPath = v;
+        else if (a == "--max-players") {
+            lim.max_players = atoi(v);
+            if (lim.max_players < 2 || lim.max_players > 8) { fprintf(stderr, "--max-players: 2-8\n"); return 2; }
+        }
+        else if (a == "--egress-kb") {
+            int kb = atoi(v);
+            if (kb < 0 || kb > 1 << 20) { fprintf(stderr, "--egress-kb: 0 or more\n"); return 2; }
+            lim.egress_bytes = kb * 1024;
+        }
         else if (a == "--timing") { if (!KvList(v, [&](const auto& k, const auto& x) { return SetTiming(t, k, x); })) return Usage(); }
         else if (a == "--limits") { if (!KvList(v, [&](const auto& k, const auto& x) { return SetLimit(lim, k, x); })) return Usage(); }
         else return Usage();
