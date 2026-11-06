@@ -136,7 +136,7 @@ struct G {
     std::wstring hudTop, rankText, resultList;  // HUD state as last shown (test hook dump)
     UObject* root = nullptr;  // UserWidget
     UObject* tree = nullptr;
-    UObject *canvas = nullptr, *corner = nullptr, *connect = nullptr, *lobby = nullptr, *hud = nullptr, *result = nullptr,
+    UObject *canvas = nullptr, *promo = nullptr, *corner = nullptr, *connect = nullptr, *lobby = nullptr, *hud = nullptr, *result = nullptr,
             *count = nullptr;
     UObject *myBar = nullptr, *oppBar = nullptr;
     UObject* rows[kMaxRows]{};  // lobby member texts mem<i>
@@ -707,6 +707,15 @@ void Build() {
     VAdd(v, Line(560), {0, 6, 0, 6}, 2);
     VAdd(v, MkButton(L"close", L"关闭", 24), {0, 4, 0, 0}, 2);
 
+    // promo card, top right of the room page: QR code (maps\qr.png) and two lines
+    g.promo = Frame({1, 0}, {1, 0}, {-30, 30}, &v, {0, 0, 0, 0.9f});  // ink panel, as the room page
+    Call1(g.promo, L"SetPadding", L"InPadding", Margin{18, 14, 18, 14});
+    if (auto ps = uex::Field<UObject*>(g.promo, L"Slot"); ps && *ps) Call1<int32_t>(*ps, L"SetZOrder", L"InZOrder", 10);  // above the room panel
+    VAdd(v, Center(MkFileImg(L"qr.png", 104, 104)), {0, 0, 0, 6}, 2);
+    VAdd(v, Center(MkText(L"promo1", L"SoonPlay 轻游平台", 19, kGold)), {0, 0, 0, 2}, 2);
+    VAdd(v, Center(MkText(L"promo2", L"一段话、一张图，就能变成游戏", 16, kInk)), {0, 0, 0, 1}, 2);
+    VAdd(v, Center(MkText(L"promo3", L"扫码创作，拉上伙伴一起玩", 16, kDim)), {0, 0, 0, 0}, 2);
+
     // lobby panel
     g.lobby = Frame({0.5, 0.5}, {0.5, 0.5}, {0, 0}, &v);
     VAdd(v, Heading(L"code", L"房间", 44), {0, 0, 0, 4}, 2);
@@ -964,7 +973,7 @@ void Build() {
     VAdd(v, Center(MkText(L"eschint", L"按 Esc 返回游戏，离开比赛算作认输", 20, kDim), 420), {0, 10, 0, 0}, 2);
     Vis(g.esc, kCollapsed);
     Vis(g.hud, kHitTestInvisible); Vis(g.result, kHitTestInvisible);
-    for (auto w : {g.corner, g.connect, g.lobby, g.cfg}) Vis(w, kCollapsed);
+    for (auto w : {g.corner, g.connect, g.lobby, g.cfg, g.promo}) Vis(w, kCollapsed);
     Vis(g.hud, kCollapsed); Vis(g.result, kCollapsed);
 
     uex::AddToViewport(g.root, 200);
@@ -1969,6 +1978,7 @@ void Tick(float) {
     Vis(g.connect, g.open && !inRoom && !cfg ? kSelfHitTestInvisible : kCollapsed);
     Vis(g.lobby, g.open && inRoom && !match && !cfg ? kSelfHitTestInvisible : kCollapsed);
     Vis(g.cfg, cfg ? kSelfHitTestInvisible : kCollapsed);
+    Vis(g.promo, g.open && inRoom && !match && !cfg ? kHitTestInvisible : kCollapsed);
     if (cfg) UpdateCfg(r, inRoom);
     Vis(g.hud, match ? kHitTestInvisible : kCollapsed);
     Vis(g.result, match && (r.phase == "end" || r.phase == "over") ? kHitTestInvisible : kCollapsed);
