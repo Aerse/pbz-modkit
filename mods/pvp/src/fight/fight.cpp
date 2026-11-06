@@ -606,11 +606,15 @@ void ApplyHit(float amt, float frac, int from, float posture, bool back) {
         float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, ShachiMin);
         uex::SetAttr(g_me, Shachi, (std::max)(smin, uex::Attr(g_me, Shachi) - posture * smx));
     }
+    double gap = now - g_lastHitAt;  // measure (v1.5): gap to the previous hit
     g_lastHitter = from; g_lastHitAt = now;
     bool noStun = g_rules.stun > 0 && g_chainN >= g_rules.stun;
     uex::Log(L"fight: took %.1f (raw %.1f, chain %d x%.2f%s) (shield %.1f) from %d hp %.1f -> %.1f / %.0f", d, raw, g_chainN, scale,
              noStun ? L", no stun" : L"", fromShield, from, h, nh, mx);
     g_lastHitBack = back;
+    auto ai0 = AnimOf(g_me); UObject* held = ai0 ? CurMontage(ai0) : nullptr;  // what already holds the pawn
+    uex::Log(L"fight: chain n=%d gap=%.3f held=%s ourReact=%d", g_chainN, gap < 99 ? gap : -1.0,
+             held ? NameOf(held).c_str() : L"-", int(nh > 1.f && d > 0.01f && !noStun && !held));
     if (nh > 1.f && d > 0.01f) {  // posture only (deflected): no flinch
         if (!noStun) { HitReaction(back); HitStop(); }
         else if (auto ai = AnimOf(g_me)) {
@@ -664,6 +668,7 @@ void ResolveHit(float amt, float frac, int from, float posture, int round, doubl
         char b[96]; snprintf(b, sizeof b, "res %d %d %s %d", from, MySlot(), res, round);
         net::Sure(b);
         uex::Log(L"fight: hit from %d (%.1f) -> %S", from, amt, res);
+        uex::Log(L"fight: measure res=%S gap=%.3f", res, net::Now() - g_lastHitAt);
         return;
     }
     ApplyHit(amt, frac, from, posture, FromBehind(from, attackerYaw));

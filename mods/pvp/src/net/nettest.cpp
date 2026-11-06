@@ -633,6 +633,12 @@ int Spar(int port, const std::string& pw, const std::string& what, double second
                 if (victim != r.you || r.phase != "fight" || rnd != r.round || dead || now < invulnTill) { printf("spar: ignored %s\n", e.text.c_str()); continue; }
                 hp -= frac > 0 ? frac : amt / 1000; ++got;
                 printf("spar: %6.1f took %s -> hp %.2f\n", now - t0, e.text.c_str(), hp);
+                // measure (v1.5): hits < 0.8 s apart form one chain
+                static double lastTook = -100, chainT0 = 0; static int chainN = 0, chainMax = 0;
+                if (now - lastTook >= 0.8) { chainN = 0; chainT0 = now; }
+                ++chainN; chainMax = std::max(chainMax, chainN);
+                printf("spar: chain n=%d gap=%.3f len=%.3f max=%d\n", chainN, now - lastTook < 99 ? now - lastTook : -1.0, now - chainT0, chainMax);
+                lastTook = now;
                 if (hp <= 0.001) {
                     hp = 0; dead = true;
                     net::Dead(r.round, from, r.mode == "kill" ? myLife : -1);
