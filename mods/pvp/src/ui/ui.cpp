@@ -8,16 +8,32 @@
 // Esc (our window in front, read with GetAsyncKeyState, never sent) closes the panel.
 // Test hook: <loader root>\ui_cmd.txt lines "open" "close" "set <id> <text>" "click <id>" "dump";
 // results go to ui_test.txt. Checked every 30 ticks, file deleted after reading.
+// Room settings (panel "cfg"; opened by "cfg" in the lobby (host) / "hostcfg" on the connect panel (kept for
+// the next create), closed by "cfgback"; pages "pgbasic" / "pgmore"). Every option <id> has the value
+// button <id> (click = next) and the arrows <id>- / <id>+; "set <id> <value>" sets it directly.
+//   基本: gmode (duel|ffa|kill) players (2..Room::cap) rounds time (seconds, 0 = none) mapsel (map index | rand)
+//         dmg (10..500) hp (50..500) preset (0..2 | 标准|快速|硬核)
+//   更多: sd sr ult (0..300) heal (0..2) cimu (0|1) acc (0..9) edgeon (0|1) wrand (0|1) stun (0 | 3..10) cdmg (0|1)
+//         respawn kills (kill mode only); weapon bans wb<i> (toggle, bit i = fight::Weapons()[i + 1]),
+//         "wbclear"; "set wban <mask>". Texts: cfgtitle cfgsum cfgnote, rows row_<id>.
+// Lobby: "cfg" button, member texts mem0..mem7, "cardnote" (bans / random weapon), "settings" (summary line).
+// HUD: "hudtop" (score / survivors / my kills and deaths), "rankbox" (ranktitle, rank0..rank7), head bars
+// (dump "head" lines), result "resultlist". "hudtest duel|ffa|kill|0" shows the HUD with a fake room.
+// dump adds: cfg room/saved (every setting + rules text + summary), cfg open/page/note/violation, hud, head, result.
 #include "ui.h"
 #include <windows.h>
 #include <cstdio>
 
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <map>
+#include <string>
 #include <vector>
 #include "uex.h"
 #include "../net/net.h"
+#include "../net/rules.h"
+#include "../fight/houserules.h"
 #include "../fight/fight.h"
 #include "../fight/weapons.h"
 #include "../fight/outfits.h"
@@ -38,7 +54,8 @@ struct Btn { UObject* o = nullptr; UObject* label = nullptr; bool was = false; }
 struct SlateColor { Color c; uint8_t rule = 0, pad[3]{}; };  // 0x14 in this build (rule 0 = specified)
 
 constexpr uint8_t kVisible = 0, kCollapsed = 1, kHidden = 2, kHitTestInvisible = 3, kSelfHitTestInvisible = 4;
-constexpr int kMaxRows = 4;  // server max players
+constexpr int kMaxRows = net::kMaxPlayers;  // lobby member texts
+constexpr int kHeads = net::kMaxPlayers - 1;  // head hp bars (every opponent)
 
 // reflected fields (by name; the number is this build's offset, used only if the field is gone)
 constexpr const wchar_t* kWidget = L"Class /Script/UMG.Widget";
@@ -100,28 +117,40 @@ UObject* MenuGroup(UObject* menu) { return BpVar<UObject*>(menu, L"ButtonGroup")
 UObject* MenuNewGame(UObject* menu) { return BpVar<UObject*>(menu, L"NewGame"); }
 
 const int kRounds[] = {1, 3, 5, 7, 9};
-const int kTimes[] = {0, 60, 90, 120, 180};
-const int kDmgs[] = {50, 75, 100, 150, 200};
+const int kTimes[] = {0, 60, 90, 120, 180, 300};
+const int kStuns[] = {0, 3, 4, 5, 6, 7, 8, 9, 10};
+const int kRespawns[] = {3, 5, 8, 10, 15};
+const int kKills[] = {0, 5, 10, 15, 20, 30};
 
 // palette
 constexpr Color kInk{0.93f, 0.9f, 0.84f, 1}, kDim{0.62f, 0.6f, 0.56f, 1}, kGold{0.98f, 0.78f, 0.38f, 1},
     kRed{0.92f, 0.3f, 0.25f, 1}, kGreen{0.45f, 0.85f, 0.45f, 1}, kWarn{1, 0.68f, 0.35f, 1};
 
+struct Head {  // an opponent's name + hp bar over its head (fight::GhostAnchor projected to the screen)
+    UObject *box = nullptr, *name = nullptr, *bar = nullptr;
+    int slot = -1; bool shown = false; double x = 0, y = 0; float hp = -1;
+};
 struct G {
     UObject* world = nullptr;
+    Head head[kHeads];
+    std::wstring hudTop, rankText, resultList;  // HUD state as last shown (test hook dump)
     UObject* root = nullptr;  // UserWidget
     UObject* tree = nullptr;
     UObject *canvas = nullptr, *corner = nullptr, *connect = nullptr, *lobby = nullptr, *hud = nullptr, *result = nullptr,
             *count = nullptr;
     UObject *myBar = nullptr, *oppBar = nullptr;
-    UObject* rows[kMaxRows]{};
+    UObject* rows[kMaxRows]{};  // lobby member texts mem<i>
+    UObject *cfg = nullptr, *heads = nullptr;  // room settings panel, head bar canvas
+    bool cfgOpen = false; int cfgPage = 0;
+    std::wstring cfgNote;       // last refusal on the settings panel
+    std::wstring violation; double violAt = -10, unreadyAt = -10;  // houserules::Violation, checked once a second
     std::map<std::wstring, Btn> btn;
     std::map<std::wstring, UObject*> edit, text;
     std::map<UObject*, float> pct;    // last SetPercent
     std::map<UObject*, Color> color;  // last SetColorAndOpacity
     std::map<UObject*, uint8_t> vis;  // last SetVisibility
     uint8_t font[kFontInfoBytes]{}; bool haveFont = false;
-    bool open = false, uiMode = false, hudTest = false;
+    bool open = false, uiMode = false, hudTest = false; std::string hudMode = "duel";
     bool steamMode = false;  // connect panel: Steam P2P instead of the relay server
     int weapon = 0, tick = 0; double weaponAt = -10; double modsAt = -10;  // last local weapon click (server echo may lag)
     int edge = 0; double edgeAt = -10;                // last local Phantom Edge click (same echo rule)
@@ -430,6 +459,164 @@ UObject* Canvas(UObject* parent, V2 amin, V2 amax, V2 align, Margin off, UObject
     return child;
 }
 
+static std::wstring g_conn[4];  // ip, port, name, pw as last saved (a settings change rewrites the file with them)
+// ---- room settings ------------------------------------------------------------------------
+// Cfg is everything the host sets; every change goes out as one net::Conf(ConfArgs) with the rules
+// text from rules::Format. The host's last settings are kept in mp_settings.txt (room= / rules=)
+// and sent once after a create.
+struct Cfg {
+    std::string mode = "duel";
+    int max = 2, rounds = 3, time = 120, map = 0, dmg = 100, respawn = 5, kills = 10;
+    bool rand = false;  // maps = every map
+    rules::Rules rr;
+};
+static Cfg g_saved;           // the host's last settings (mp_settings.txt), also edited before a create
+static bool g_applyRoom;      // a create is pending: send g_saved once we host the room
+struct Preset { const wchar_t* name; int rounds, time, dmg, hp, sd, sr, ult, heal, cimu, acc, stun, cdmg; };
+const Preset kPresets[] = {
+    {L"标准", 3, 120, 100, 300, 100, 100, 100, 2, 0, 9, 6, 1},
+    {L"快速", 3, 60, 150, 150, 100, 150, 150, 1, 0, 9, 5, 1},
+    {L"硬核", 5, 90, 100, 100, 100, 100, 100, 0, 1, 3, 0, 0}};
+int PresetOf(const Cfg& c) {
+    for (int i = 0; i < 3; ++i) {
+        auto& p = kPresets[i]; auto& R = c.rr;
+        if (c.rounds == p.rounds && c.time == p.time && c.dmg == p.dmg && R.hp == p.hp && R.sd == p.sd && R.sr == p.sr && R.ult == p.ult &&
+            R.heal == p.heal && R.cimu == p.cimu && R.acc == p.acc && R.stun == p.stun && R.cdmg == p.cdmg) return i;
+    }
+    return -1;
+}
+void ApplyPreset(Cfg& c, int i) {
+    auto& p = kPresets[i]; auto& R = c.rr;
+    c.rounds = p.rounds; c.time = p.time; c.dmg = p.dmg; R.hp = p.hp; R.sd = p.sd; R.sr = p.sr; R.ult = p.ult;
+    R.heal = p.heal; R.cimu = p.cimu; R.acc = p.acc; R.stun = p.stun; R.cdmg = p.cdmg;
+}
+int AllMaps() { return (1 << arena::MapCount()) - 1; }
+Cfg FromRoom(const net::Room& r) {
+    Cfg c; c.mode = r.mode; c.max = r.max; c.rounds = r.rounds; c.time = r.timeSec; c.map = r.map; c.rand = r.maps != 0;
+    c.dmg = r.dmg; c.respawn = r.respawn; c.kills = r.kills; c.rr = rules::Parse(r.rules);
+    return c;
+}
+void SendCfg(const Cfg& c) {
+    net::ConfArgs a;
+    a.mode = c.mode; a.max = c.mode == "duel" ? 2 : c.max; a.rounds = c.rounds; a.timeSec = c.time; a.dmg = c.dmg;
+    a.map = c.map; a.maps = c.rand ? AllMaps() : 0; a.respawn = c.respawn; a.kills = c.kills;
+    a.setRules = true; a.rules = rules::Format(c.rr);
+    net::Conf(a);
+}
+std::wstring ModeLabel(const std::string& m) { return m == "ffa" ? L"混战" : m == "kill" ? L"击杀赛" : L"对决"; }
+bool Banned(const rules::Rules& R, int weapon) { return weapon >= 1 && weapon <= 30 && (R.wban >> (weapon - 1)) & 1; }
+const wchar_t* kBasicOpts[] = {L"gmode", L"players", L"rounds", L"time", L"mapsel", L"dmg", L"hp", L"preset"};
+const wchar_t* kMoreOpts[] = {L"sd", L"sr", L"ult", L"heal", L"cimu", L"acc", L"edgeon", L"wrand", L"stun", L"cdmg", L"respawn", L"kills"};
+template <size_t N> int Step(const int (&a)[N], int cur, int dir) {
+    if (dir > 0) { for (size_t i = 0; i < N; ++i) if (a[i] > cur) return a[i]; return a[0]; }
+    for (size_t i = N; i-- > 0;) if (a[i] < cur) return a[i]; return a[N - 1];
+}
+int Wrap(int v, int lo, int hi, int) { return v > hi ? lo : v < lo ? hi : v; }  // arrows wrap around
+// one arrow step (dir +1 / -1) on option `id`; cap = the server's player limit. false = unknown id
+bool CfgStep(Cfg& c, const std::wstring& id, int dir, int cap) {
+    auto& R = c.rr;
+    if (id == L"gmode") { const char* m[] = {"duel", "ffa", "kill"}; int i = c.mode == "ffa" ? 1 : c.mode == "kill" ? 2 : 0;
+        c.mode = m[(i + dir + 3) % 3]; if (c.mode == "duel") c.max = 2; else if (c.max < 3 && cap >= 3) c.max = (std::min)(cap, 4); }
+    else if (id == L"players") { if (c.mode != "duel") c.max = Wrap(c.max + dir, 2, (std::max)(2, cap), 1); }
+    else if (id == L"rounds") c.rounds = Step(kRounds, c.rounds, dir);
+    else if (id == L"time") c.time = Step(kTimes, c.time, dir);
+    else if (id == L"mapsel") { int n = arena::MapCount(), i = c.rand ? n : c.map; i = (i + dir + n + 1) % (n + 1);
+        c.rand = i == n; if (!c.rand) c.map = i; }
+    else if (id == L"dmg") c.dmg = Wrap(c.dmg + 10 * dir, 10, 500, 10);
+    else if (id == L"hp") R.hp = Wrap(R.hp + 10 * dir, 50, 500, 10);
+    else if (id == L"preset") { int p = PresetOf(c); ApplyPreset(c, p < 0 ? (dir > 0 ? 0 : 2) : (p + dir + 3) % 3); }
+    else if (id == L"sd") R.sd = Wrap(R.sd + 10 * dir, 0, 300, 10);
+    else if (id == L"sr") R.sr = Wrap(R.sr + 10 * dir, 0, 300, 10);
+    else if (id == L"ult") R.ult = Wrap(R.ult + 10 * dir, 0, 300, 10);
+    else if (id == L"heal") R.heal = (R.heal + dir + 3) % 3;
+    else if (id == L"cimu") R.cimu ^= 1;
+    else if (id == L"acc") R.acc = Wrap(R.acc + dir, 0, 9, 1);
+    else if (id == L"edgeon") R.edge ^= 1;
+    else if (id == L"wrand") R.wrand ^= 1;
+    else if (id == L"stun") R.stun = Step(kStuns, R.stun, dir);
+    else if (id == L"cdmg") R.cdmg ^= 1;
+    else if (id == L"respawn") c.respawn = Step(kRespawns, c.respawn, dir);
+    else if (id == L"kills") c.kills = Step(kKills, c.kills, dir);
+    else return false;
+    return true;
+}
+// "set <id> <value>" on an option: the value as shown (numbers without "%"/"秒"), see the file header
+bool CfgSet(Cfg& c, const std::wstring& id, const std::wstring& v, int cap) {
+    auto& R = c.rr; long n = wcstol(v.c_str(), nullptr, 10);
+    auto num = [&](int lo, int hi, int step) { int x = rules::Clamp(n, lo, hi); return step > 1 ? (x - lo) / step * step + lo : x; };
+    if (id == L"gmode") { std::string m = uex::Utf8(v); if (m != "duel" && m != "ffa" && m != "kill") return false;
+        c.mode = m; if (m == "duel") c.max = 2; else if (c.max < 3 && cap >= 3) c.max = (std::min)(cap, 4); }
+    else if (id == L"players") { if (c.mode != "duel") c.max = num(2, (std::max)(2, cap), 1); }
+    else if (id == L"rounds") c.rounds = num(1, 9, 1);
+    else if (id == L"time") c.time = num(0, 600, 1);
+    else if (id == L"mapsel") { if (v == L"rand") c.rand = true; else { c.rand = false; c.map = num(0, arena::MapCount() - 1, 1); } }
+    else if (id == L"dmg") c.dmg = num(10, 500, 10);
+    else if (id == L"hp") R.hp = num(50, 500, 10);
+    else if (id == L"preset") { int p = v == L"标准" ? 0 : v == L"快速" ? 1 : v == L"硬核" ? 2 : num(0, 2, 1); ApplyPreset(c, p); }
+    else if (id == L"sd") R.sd = num(0, 300, 10);
+    else if (id == L"sr") R.sr = num(0, 300, 10);
+    else if (id == L"ult") R.ult = num(0, 300, 10);
+    else if (id == L"heal") R.heal = num(0, 2, 1);
+    else if (id == L"cimu") R.cimu = num(0, 1, 1);
+    else if (id == L"acc") R.acc = num(0, 9, 1);
+    else if (id == L"edgeon") R.edge = num(0, 1, 1);
+    else if (id == L"wrand") R.wrand = num(0, 1, 1);
+    else if (id == L"stun") { R.stun = num(0, 10, 1); if (R.stun && R.stun < 3) R.stun = 3; }
+    else if (id == L"cdmg") R.cdmg = num(0, 1, 1);
+    else if (id == L"respawn") c.respawn = num(1, 60, 1);
+    else if (id == L"kills") c.kills = num(0, 99, 1);
+    else if (id == L"wban") R.wban = (uint32_t)wcstoul(v.c_str(), nullptr, 10) & 0x3FFFFFFFu;
+    else return false;
+    return true;
+}
+std::wstring Pct(int v) { return std::to_wstring(v) + L"%"; }
+std::wstring OnOff(int v) { return v ? L"开" : L"关"; }
+std::wstring CfgValue(const Cfg& c, const std::wstring& id) {
+    auto& R = c.rr;
+    if (id == L"gmode") return ModeLabel(c.mode);
+    if (id == L"players") return std::to_wstring(c.mode == "duel" ? 2 : c.max) + L" 人";
+    if (id == L"rounds") return c.mode == "kill" ? L"1 回合" : std::to_wstring(c.rounds) + L" 回合";
+    if (id == L"time") return c.time ? std::to_wstring(c.time) + L" 秒" : L"不限";
+    if (id == L"mapsel") return c.rand ? L"随机" : c.map >= 0 && c.map < arena::MapCount() ? arena::Maps()[c.map].name : L"?";
+    if (id == L"dmg") return Pct(c.dmg);
+    if (id == L"hp") return Pct(R.hp);
+    if (id == L"preset") { int p = PresetOf(c); return p < 0 ? L"自定义" : kPresets[p].name; }
+    if (id == L"sd") return Pct(R.sd);
+    if (id == L"sr") return Pct(R.sr);
+    if (id == L"ult") return Pct(R.ult);
+    if (id == L"heal") return R.heal == 0 ? L"全禁" : R.heal == 1 ? L"只留酒葫芦" : L"不限";
+    if (id == L"cimu") return R.cimu ? L"禁用" : L"允许";
+    if (id == L"acc") return R.acc >= 9 ? L"不限" : std::to_wstring(R.acc) + L" 件";
+    if (id == L"edgeon") return OnOff(R.edge);
+    if (id == L"wrand") return OnOff(R.wrand);
+    if (id == L"stun") return R.stun ? L"第 " + std::to_wstring(R.stun) + L" 下后" : L"关";
+    if (id == L"cdmg") return OnOff(R.cdmg);
+    if (id == L"respawn") return std::to_wstring(c.respawn) + L" 秒";
+    if (id == L"kills") return c.kills ? std::to_wstring(c.kills) + L" 杀" : L"不限";
+    return L"";
+}
+// one line for everyone (lobby): mode, players, map, the numbers that differ from the defaults
+std::wstring CfgSummary(const Cfg& c) {
+    rules::Rules d; auto& R = c.rr;
+    std::wstring s = ModeLabel(c.mode) + L"  " + CfgValue(c, L"players") + L"  地图 " + CfgValue(c, L"mapsel");
+    if (c.mode == "kill") s += L"  复活 " + CfgValue(c, L"respawn") + L"  目标 " + CfgValue(c, L"kills");
+    else s += L"  " + CfgValue(c, L"rounds");
+    s += L"  时限 " + CfgValue(c, L"time") + L"  伤害 " + Pct(c.dmg) + L"  血量 " + Pct(R.hp);
+    if (R.sd != d.sd) s += L"  杀器伤害 " + Pct(R.sd);
+    if (R.sr != d.sr) s += L"  杀气回复 " + Pct(R.sr);
+    if (R.ult != d.ult) s += L"  大招 " + Pct(R.ult);
+    if (R.heal != d.heal) s += L"  回血 " + CfgValue(c, L"heal");
+    if (R.cimu) s += L"  禁慈母";
+    if (R.acc < 9) s += L"  饰品≤" + std::to_wstring(R.acc);
+    if (!R.edge) s += L"  无杀器";
+    if (R.wban) { int n = 0; for (uint32_t b = R.wban; b; b &= b - 1) ++n; s += L"  禁用武器 " + std::to_wstring(n); }
+    if (R.wrand) s += L"  随机武器";
+    if (R.stun != d.stun) s += L"  硬直递减 " + CfgValue(c, L"stun");
+    if (R.cdmg != d.cdmg) s += L"  连段递减 " + OnOff(R.cdmg);
+    int p = PresetOf(c); if (p >= 0) s += L"  [" + std::wstring(kPresets[p].name) + L"]";
+    return s;
+}
+
 // connect settings remembered across runs: <mod dir>mp_settings.txt, UTF-8 "key=value" lines
 // (ip, port, name, pw, mode). Read when the panel is built (from the root if an old flat install
 // left it there), written on create/join (always to the mod folder).
@@ -446,16 +633,35 @@ void LoadSettings() {
         auto eq = s.find(L'='); if (eq == std::wstring::npos) continue;
         std::wstring k = s.substr(0, eq), v = s.substr(eq + 1);
         if (k == L"mode") g.steamMode = v == L"steam";
-        else if ((k == L"ip" || k == L"port" || k == L"name" || k == L"pw") && !v.empty() && v.size() < 128) WriteEdit(k.c_str(), v);
+        else if (k == L"room") {  // mode,max,rounds,time,map,rand,dmg,respawn,kills
+            wchar_t m[16]{}; int x[8]{};
+            if (swscanf(v.c_str(), L"%15[a-z],%d,%d,%d,%d,%d,%d,%d,%d", m, x, x + 1, x + 2, x + 3, x + 4, x + 5, x + 6, x + 7) == 9) {
+                std::string ms = uex::Utf8(m); if (ms != "ffa" && ms != "kill") ms = "duel";
+                g_saved.mode = ms; g_saved.max = rules::Clamp(x[0], 2, net::kMaxPlayers); g_saved.rounds = rules::Clamp(x[1], 1, 9);
+                g_saved.time = rules::Clamp(x[2], 0, 600); g_saved.map = rules::Clamp(x[3], 0, arena::MapCount() - 1); g_saved.rand = x[4] != 0;
+                g_saved.dmg = rules::Clamp(x[5] / 10 * 10, 10, 500); g_saved.respawn = rules::Clamp(x[6], 1, 60); g_saved.kills = rules::Clamp(x[7], 0, 99);
+                if (ms == "duel") g_saved.max = 2;
+            }
+        }
+        else if (k == L"rules") g_saved.rr = rules::Parse(uex::Utf8(v));
+        else if ((k == L"ip" || k == L"port" || k == L"name" || k == L"pw") && !v.empty() && v.size() < 128) {
+            WriteEdit(k.c_str(), v);
+            g_conn[k == L"ip" ? 0 : k == L"port" ? 1 : k == L"name" ? 2 : 3] = v;
+        }
     }
     fclose(f);
 }
 void SaveSettings(const std::wstring& ip, const std::wstring& port, const std::wstring& name, const std::wstring& pw) {
+    g_conn[0] = ip; g_conn[1] = port; g_conn[2] = name; g_conn[3] = pw;
     auto p = SettingsPath(); if (p.empty()) return;
     FILE* f = _wfopen(p.c_str(), L"w, ccs=UTF-8"); if (!f) return;
     fwprintf(f, L"ip=%s\nport=%s\nname=%s\npw=%s\nmode=%s\n", ip.c_str(), port.c_str(), name.c_str(), pw.c_str(), g.steamMode ? L"steam" : L"relay");
+    auto& c = g_saved;
+    fwprintf(f, L"room=%S,%d,%d,%d,%d,%d,%d,%d,%d\nrules=%S\n", c.mode.c_str(), c.max, c.rounds, c.time, c.map, int(c.rand), c.dmg, c.respawn, c.kills,
+             rules::Format(c.rr).c_str());
     fclose(f);
 }
+void SaveCfg(const Cfg& c) { g_saved = c; if (!g_conn[0].empty()) SaveSettings(g_conn[0], g_conn[1], g_conn[2], g_conn[3]); }
 
 void Build() {
     g = G{.world = uex::World(), .open = g.open, .weapon = g.weapon, .edge = g.edge, .outfit = g.outfit, .status = g.status};
@@ -493,7 +699,8 @@ void Build() {
         VAdd(v, Row(L"名字", MkEdit(L"name", pn.empty() ? L"玩家" : uex::Wide(pn))));
     }
     LoadSettings();
-    VAdd(v, MkButton(L"create", L"创建房间"), {0, 16, 0, 8}, 2);
+    { auto h = HBox(); HAdd(h, MkButton(L"create", L"创建房间"), {0, 0, 12, 0}); HAdd(h, MkButton(L"hostcfg", L"房间设置", 24), {0, 0, 0, 0});
+      VAdd(v, h, {0, 16, 0, 8}, 2); }
     { auto h = HBox(); auto l = MkText(L"房间码", 26, kDim); Put<float>(l, kTbMinW, 130); HAdd(h, l, {0, 0, 16, 0});
       HAdd(h, MkEdit(L"code", L"", 160), {0, 0, 16, 0}); HAdd(h, MkButton(L"join", L"加入房间")); VAdd(v, h); }
     VAdd(v, Center(MkText(L"cstatus", L"", 24, kWarn)), {0, 10, 0, 4}, 2);
@@ -504,7 +711,15 @@ void Build() {
     g.lobby = Frame({0.5, 0.5}, {0.5, 0.5}, {0, 0}, &v);
     VAdd(v, Heading(L"code", L"房间", 44), {0, 0, 0, 4}, 2);
     VAdd(v, Line(900), {0, 0, 0, 8}, 2);
-    VAdd(v, MkText(L"members", L"", 26), {0, 4, 0, 10}, 2);
+    {   // one text per member (8 at most), two columns so 8 fit at 1280x720
+        auto h = HBox(); UObject* col[2] = {VBox(), VBox()};
+        for (int i = 0; i < kMaxRows; ++i) {
+            g.rows[i] = MkText((L"mem" + std::to_wstring(i)).c_str(), L"", 22);
+            VAdd(col[i / 4], g.rows[i], {0, 1, 0, 1});
+        }
+        HAdd(h, col[0], {0, 0, 40, 0}); HAdd(h, col[1], {0, 0, 0, 0});
+        VAdd(v, h, {0, 4, 0, 8}, 2);
+    }
     {   // tabs 武器 / 杀器 / 外观 ("wtab" / "etab" / "otab"): one card row is shown at a time (same height, fits 1280x720)
         auto tabs = HBox();
         const wchar_t* tab[][2] = {{L"wtab", L"武器"}, {L"etab", L"杀器"}, {L"otab", L"外观"}};
@@ -600,8 +815,24 @@ void Build() {
     // "weapon" / "edge" cycle to the next card (test hook / e2e); the cards replace them on screen
     { auto w = MkButton(L"weapon", L"武器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, kVis, kCollapsed); }
     { auto w = MkButton(L"edge", L"杀器", 22); VAdd(v, w, {0, 0, 0, 0}, 2); Put<uint8_t>(w, kVis, kCollapsed); }
-    {   // host settings: rows of the settings menu (T_SettingsDefaultBar) with the start menu arrows
-        auto rows = VBox();
+    VAdd(v, Center(MkText(L"settings", L"", 24, kDim), 900), {0, 4, 0, 4}, 2);
+    VAdd(v, Center(MkText(L"cardnote", L"", 22, kWarn)), {0, 0, 0, 0}, 2);
+    VAdd(v, Line(900), {0, 6, 0, 6}, 2);
+    { auto h = HBox(); HAdd(h, MkButton(L"ready", L"准备"), {0, 0, 12, 0}); HAdd(h, MkButton(L"start", L"开始"), {0, 0, 12, 0});
+      HAdd(h, MkButton(L"cfg", L"房间设置"), {0, 0, 12, 0});
+      HAdd(h, MkButton(L"leave", L"离开"), {0, 0, 12, 0}); HAdd(h, MkButton(L"hide", L"隐藏"), {0, 0, 0, 0});
+      VAdd(v, h, {0, 4, 0, 4}, 2); }
+    VAdd(v, Center(MkText(L"lstatus", L"", 24, kWarn)), {0, 4, 0, 0}, 2);
+
+    // room settings panel (host; also before a create from the connect panel): pages 基本 / 更多,
+    // rows of the settings menu (T_SettingsDefaultBar) with the start menu arrows
+    g.cfg = Frame({0.5, 0.5}, {0.5, 0.5}, {0, 0}, &v);
+    VAdd(v, Heading(L"cfgtitle", L"房间设置", 40), {0, 0, 0, 4}, 2);
+    { auto h = HBox(); HAdd(h, MkButton(L"pgbasic", L"基本", 24), {0, 0, 12, 0}); HAdd(h, MkButton(L"pgmore", L"更多", 24), {0, 0, 0, 0});
+      VAdd(v, h, {0, 0, 0, 6}, 2); }
+    VAdd(v, Line(760), {0, 0, 0, 6}, 2);
+    {
+        UObject* rows = nullptr;
         auto opt = [&](const wchar_t* id, const wchar_t* label) {
             auto bar = New(L"Border", g.tree);
             MakeBrush(reinterpret_cast<uint8_t*>(bar) + kBorderBg, art::kBar, 3, {1, 1, 1, 1});
@@ -620,17 +851,38 @@ void Build() {
             HAdd(h, b, {0, 0, 4, 0});
             HAdd(h, arrow(std::wstring(id) + L"+", art::kRight), {0, 0, 0, 0});
             Add(bar, h);
-            VAdd(rows, bar, {0, 3, 0, 3}, 2);
+            VAdd(rows, bar, {0, 1, 0, 1}, 2);
+            g.text[std::wstring(L"row_") + id] = bar;
         };
-        opt(L"rounds", L"回合数"); opt(L"time", L"回合时限"); opt(L"dmg", L"伤害倍率");
-        VAdd(v, rows, {0, 4, 0, 4}, 2); g.text[L"hostrow"] = rows;
+        const wchar_t* basic[][2] = {{L"gmode", L"模式"}, {L"players", L"人数"}, {L"rounds", L"回合数"}, {L"time", L"限时"},
+                                     {L"mapsel", L"地图"}, {L"dmg", L"伤害倍率"}, {L"hp", L"血量倍率"}, {L"preset", L"预设"}};
+        const wchar_t* more[][2] = {{L"sd", L"杀器伤害"}, {L"sr", L"杀气回复"}, {L"ult", L"大招充能"}, {L"heal", L"回血道具"},
+                                    {L"cimu", L"慈母护符"}, {L"acc", L"饰品上限"}, {L"edgeon", L"杀器"}, {L"wrand", L"随机武器"},
+                                    {L"stun", L"硬直递减"}, {L"cdmg", L"连段伤害递减"}, {L"respawn", L"复活等待"}, {L"kills", L"目标击杀"}};
+        rows = VBox(); for (auto& o : basic) opt(o[0], o[1]);
+        VAdd(v, rows, {0, 2, 0, 2}, 2); g.text[L"pagebasic"] = rows;
+        auto page2 = VBox();
+        auto two = HBox();
+        rows = VBox(); for (int i = 0; i < 6; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 12, 0});
+        rows = VBox(); for (int i = 6; i < 12; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 0, 0});
+        VAdd(page2, two, {0, 0, 0, 4}, 2);
+        // weapon bans: a toggle per weapon (wb<i>, bit i = Weapons()[i + 1]), 7 per line
+        VAdd(page2, Center(MkText(L"wbtitle", L"禁用武器（点击切换）", 22, kDim)), {0, 2, 0, 2}, 2);
+        auto& ws = fight::Weapons(); UObject* line = nullptr;
+        for (int i = 0; i + 1 < int(ws.size()) && i < 30; ++i) {
+            if (i % 7 == 0) { line = HBox(); VAdd(page2, line, {0, 1, 0, 1}, 2); }
+            auto b = New(L"Button", g.tree); if (!b) break;
+            SkinButton(b, art::kBar, art::kBarHi, {1, 1, 1, 0.8f}, {1, 1, 1, 0.6f});
+            auto t = Center(MkText(ws[i + 1].label, 20, kInk), 120);
+            if (auto s = Add(b, t)) Call1(s, L"SetPadding", L"InPadding", Margin{6, 3, 6, 3});
+            g.btn[L"wb" + std::to_wstring(i)] = {b, t, false}; HAdd(line, b, {2, 0, 2, 0});
+        }
+        VAdd(page2, MkButton(L"wbclear", L"全部解禁", 20), {0, 4, 0, 0}, 2);
+        VAdd(v, page2, {0, 2, 0, 2}, 2); g.text[L"pagemore"] = page2;
     }
-    VAdd(v, Center(MkText(L"settings", L"", 24, kDim)), {0, 4, 0, 4}, 2);
-    VAdd(v, Line(900), {0, 6, 0, 6}, 2);
-    { auto h = HBox(); HAdd(h, MkButton(L"ready", L"准备"), {0, 0, 12, 0}); HAdd(h, MkButton(L"start", L"开始"), {0, 0, 12, 0});
-      HAdd(h, MkButton(L"leave", L"离开"), {0, 0, 12, 0}); HAdd(h, MkButton(L"hide", L"隐藏"), {0, 0, 0, 0});
-      VAdd(v, h, {0, 4, 0, 4}, 2); }
-    VAdd(v, Center(MkText(L"lstatus", L"", 24, kWarn)), {0, 4, 0, 0}, 2);
+    VAdd(v, Center(MkText(L"cfgsum", L"", 20, kDim), 760), {0, 4, 0, 2}, 2);
+    VAdd(v, Center(MkText(L"cfgnote", L"", 22, kWarn)), {0, 2, 0, 2}, 2);
+    VAdd(v, MkButton(L"cfgback", L"返回", 24), {0, 4, 0, 0}, 2);
 
     // HUD: fighting-game layout. Me top left, opponent top right (bar fills toward the centre plaque),
     // round / timer plaque in the middle. Bars use the game's hp bar textures (bar_hp back, bar_hphud fill).
@@ -670,10 +922,38 @@ void Build() {
         Call1(nf, L"SetPadding", L"InPadding", Margin{20, 4, 20, 6});
         VAdd(nv, MkText(L"hudnote", L"", 22, kWarn), {0, 0, 0, 0}, 2);
         g.text[L"hudnotebox"] = nf; Put<uint8_t>(nf, kVis, kCollapsed);
+        // ffa / kill: the top line (survivors, or my kills / deaths) and the kill ranking on the right
+        VAdd(pv, Center(MkText(L"hudtop", L"", 22, kGold), 180), {0, 2, 0, 0}, 2);
+        UObject* rv; auto rb = Frame({1, 0}, {1, 0}, {-40, 140}, &rv, {0, 0, 0, 0.45f}, g.hud);
+        Call1(rb, L"SetPadding", L"InPadding", Margin{20, 8, 20, 10});
+        VAdd(rv, Title(MkText(L"ranktitle", L"击杀排行", 24, kGold), 40), {0, 0, 0, 4}, 1);
+        for (int i = 0; i < net::kMaxPlayers; ++i) VAdd(rv, MkText((L"rank" + std::to_wstring(i)).c_str(), L"", 22, kInk), {0, 0, 0, 0}, 1);
+        g.text[L"rankbox"] = rb; Put<uint8_t>(rb, kVis, kCollapsed);
     }
+    // head bars: one per opponent on a full-screen canvas, moved every frame to the projected GhostAnchor
+    g.heads = Canvas(g.canvas, {0, 0}, {1, 1}, {0, 0}, Margin{0, 0, 0, 0});
+    for (int i = 0; i < kHeads; ++i) {
+        auto& hd = g.head[i];
+        auto col = VBox();
+        hd.name = Center(MkText(L"", 20, kInk), 160); VAdd(col, hd.name, {0, 0, 0, 2}, 2);
+        auto sb = New(L"SizeBox", g.tree); auto bar = New(L"ProgressBar", g.tree);
+        Call1<float>(sb, L"SetWidthOverride", L"InWidthOverride", 140.f);
+        Call1<float>(sb, L"SetHeightOverride", L"InHeightOverride", 10.f);
+        auto st = reinterpret_cast<uint8_t*>(bar) + kBarStyle;
+        MakeBrush(st + kPbBack, art::kHpBack, 3, {0.25f, 0.22f, 0.2f, 0.85f});
+        MakeBrush(st + kPbFill, art::kHpFill, 3, {1, 1, 1, 1});
+        Put(bar, kBarPad, V2{0, 0});
+        Call1(bar, L"SetFillColorAndOpacity", L"InColor", Color{0.86f, 0.18f, 0.14f, 1});
+        Call1<float>(bar, L"SetPercent", L"InPercent", 1.f);
+        Add(sb, bar); VAdd(col, sb, {0, 0, 0, 0}, 2); hd.bar = bar;
+        hd.box = Canvas(g.heads, {0, 0}, {0, 0}, {0.5, 1}, Margin{0, 0, 0, 0}, col, true);
+        Put<uint8_t>(col, kVis, kCollapsed);
+    }
+    Put<uint8_t>(g.heads, kVis, kHitTestInvisible);
     g.result = Frame({0.5, 0.4}, {0.5, 0.5}, {0, 0}, &v, {0, 0, 0, 0.7f});
     VAdd(v, MkText(L"result", L"", 34, {1, 0.85f, 0.5f, 1}), {0, 0, 0, 0}, 2);
     VAdd(v, MkText(L"result2", L"", 20), {0, 6, 0, 0}, 2);
+    VAdd(v, MkText(L"resultlist", L"", 24, kInk), {0, 8, 0, 0}, 2);
     // in-match menu (Esc): the game's pause menu is blocked during a match, this replaces it
     g.esc = Frame({0.5, 0.5}, {0.5, 0.5}, {0, 0}, &v);
     VAdd(v, Heading(nullptr, L"多人游戏", 40), {0, 0, 0, 4}, 2);
@@ -684,7 +964,7 @@ void Build() {
     VAdd(v, Center(MkText(L"eschint", L"按 Esc 返回游戏，离开比赛算作认输", 20, kDim), 420), {0, 10, 0, 0}, 2);
     Vis(g.esc, kCollapsed);
     Vis(g.hud, kHitTestInvisible); Vis(g.result, kHitTestInvisible);
-    for (auto w : {g.corner, g.connect, g.lobby, g.hud, g.result}) if (w != g.hud && w != g.result) Vis(w, kCollapsed);
+    for (auto w : {g.corner, g.connect, g.lobby, g.cfg}) Vis(w, kCollapsed);
     Vis(g.hud, kCollapsed); Vis(g.result, kCollapsed);
 
     uex::AddToViewport(g.root, 200);
@@ -721,11 +1001,10 @@ std::wstring WeaponLabel(const std::string& id) { int i = WeaponIndex(id); retur
 int EdgeIndex(const std::string& id) { auto& es = fight::Edges(); for (int i = 0; i < int(es.size()); ++i) if (id == es[i].id) return i; return -1; }
 std::wstring EdgeLabel(const std::string& id) { int i = EdgeIndex(id); return i >= 0 ? fight::Edges()[i].label : uex::Wide(id); }
 std::wstring OutfitLabel(const std::string& id) { for (auto& o : fight::outfits::List()) if (o.id == id) return o.label; return uex::Wide(id); }
-template <size_t N> int Next(const int (&a)[N], int cur) { for (size_t i = 0; i < N; ++i) if (a[i] > cur) return a[i]; return a[0]; }
-template <size_t N> int Prev(const int (&a)[N], int cur) { for (size_t i = N; i-- > 0;) if (a[i] < cur) return a[i]; return a[N - 1]; }
 std::wstring TimeLabel(int s) { return s ? std::to_wstring(s) + L" 秒" : L"不限"; }
 const net::Member* Find(const net::Room& r, int slot) { for (auto& m : r.members) if (m.slot == slot) return &m; return nullptr; }
 std::wstring NameOfSlot(const net::Room& r, int slot) { auto m = Find(r, slot); return m ? uex::Wide(m->name) : L"?"; }
+
 
 // the cursor / UI input mode is on while the panel or the in-match menu is open (in the world only)
 void ApplyCursor() {
@@ -736,6 +1015,7 @@ void ApplyCursor() {
 void SetOpen(bool on) { g.open = on; ApplyCursor(); }
 void SetEsc(bool on) { g.escMenu = on; ApplyCursor(); }
 
+bool CfgClick(const net::Room& r, bool inRoom, const std::wstring& id);
 void OnClick(const std::wstring& id) {
     uex::Log(L"ui: click %s", id.c_str());
     net::Room r; bool inRoom = net::GetRoom(r);
@@ -760,21 +1040,39 @@ void OnClick(const std::wstring& id) {
             if (!net::SteamAvailable()) { g.status = L"Steam 不可用（请从 Steam 启动游戏并登录）"; g.failed = true; return; }
             net::UseSteam();
         } else net::SetServer(uex::Utf8(ip), _wtoi(port.c_str()));
-        if (id == L"create") { net::Create(uex::Utf8(name), 2); g.status = L"正在创建房间..."; g.failed = false; }
+        if (id == L"create") {
+            int n = g_saved.mode == "duel" ? 2 : std::clamp(g_saved.max, 2, net::kMaxPlayers);
+            net::Create(uex::Utf8(name), n); g_applyRoom = true; g.status = L"正在创建房间..."; g.failed = false;
+        }
         else if (code.empty()) { g.status = L"请输入房间码"; g.failed = true; }
         else { net::Join(uex::Utf8(code), uex::Utf8(name)); g.status = L"正在加入房间 " + code + L"..."; g.failed = false; }
-    } else if (!inRoom) return;
+    } else if (id == L"hostcfg") { if (!inRoom) { g.cfgOpen = true; g.cfgNote.clear(); } }
+    else if (id == L"cfgback") g.cfgOpen = false;
+    else if (id == L"pgbasic" || id == L"pgmore") g.cfgPage = id == L"pgmore";
+    else if (g.cfgOpen && (!inRoom || r.you == r.host) && CfgClick(r, inRoom, id)) {}
+    else if (!inRoom) return;
     else if (id == L"leave") { net::Leave(); g.status.clear(); }
-    else if (id == L"ready") { if (auto m = Find(r, r.you)) net::SetReady(!m->ready); }
+    else if (id == L"ready") {
+        if (auto m = Find(r, r.you)) {
+            if (!m->ready && !g.violation.empty()) { g.status = L"不能准备: " + g.violation; return; }
+            net::SetReady(!m->ready);
+        }
+    }
+    else if (id == L"cfg") { if (r.you == r.host) { g.cfgOpen = true; g.cfgNote.clear(); } }
     else if (id == L"weapon") {
         auto m = Find(r, r.you); int i = m && net::Now() - g.weaponAt > 2 ? WeaponIndex(m->weapon) : g.weapon; g.weaponAt = net::Now();
-        g.weapon = (i + 1) % int(fight::Weapons().size());
+        auto R = rules::Parse(r.rules); int n = int(fight::Weapons().size());
+        if (R.wrand) return;
+        for (int s = 0; s < n; ++s) { i = (i + 1) % n; if (!Banned(R, i)) break; }
+        g.weapon = i;
         net::SetWeapon(fight::Weapons()[g.weapon].id);
     } else if (id == L"wpg-" || id == L"wpg+") {
         int n = Pages(int(k.wc.card.size())); k.wc.page = (k.wc.page + (id == L"wpg+" ? 1 : n - 1)) % n;
     } else if (id.size() >= 2 && id[0] == L'w' && iswdigit(id[1])) {  // weapon card w<i>
         int i = _wtoi(id.c_str() + 1);
         if (i < 0 || i >= int(fight::Weapons().size())) return;
+        auto R = rules::Parse(r.rules);
+        if (R.wrand || Banned(R, i)) { g.status = R.wrand ? L"本房间每回合随机武器" : L"这把武器被房主禁用了"; return; }
         g.weapon = i; g.weaponAt = net::Now();
         net::SetWeapon(fight::Weapons()[i].id);
     } else if (id == L"wtab" || id == L"etab" || id == L"otab") {
@@ -803,15 +1101,33 @@ void OnClick(const std::wstring& id) {
     else if (id == L"map-") net::ConfMap((r.map - 1 + arena::MapCount()) % arena::MapCount());
     else if (id.size() >= 2 && id[0] == L'm' && iswdigit(id[1])) {  // map card m<i>
         int i = _wtoi(id.c_str() + 1);
-        if (i >= 0 && i < arena::MapCount()) net::ConfMap(i);
+        if (i >= 0 && i < arena::MapCount()) { Cfg c = FromRoom(r); c.map = i; c.rand = false; SendCfg(c); SaveCfg(c); }
     }
-    else if (id == L"rounds" || id == L"rounds+") net::Conf(Next(kRounds, r.rounds), -1, -1, -1);
-    else if (id == L"time" || id == L"time+") net::Conf(-1, Next(kTimes, r.timeSec), -1, -1);
-    else if (id == L"dmg" || id == L"dmg+") net::Conf(-1, -1, Next(kDmgs, r.dmg), -1);
-    else if (id == L"rounds-") net::Conf(Prev(kRounds, r.rounds), -1, -1, -1);
-    else if (id == L"time-") net::Conf(-1, Prev(kTimes, r.timeSec), -1, -1);
-    else if (id == L"dmg-") net::Conf(-1, -1, Prev(kDmgs, r.dmg), -1);
     else if (id == L"start") net::Start();
+}
+// an option button / arrow / weapon ban on the settings panel. In the room: sent to the server
+// (the lobby shows the echo) and remembered; before a create: only remembered (sent after the create)
+bool CfgClick(const net::Room& r, bool inRoom, const std::wstring& id) {
+    Cfg c = inRoom ? FromRoom(r) : g_saved;
+    int cap = inRoom ? r.cap : net::kMaxPlayers;
+    std::wstring base = id; int dir = 1;
+    if (!base.empty() && (base.back() == L'+' || base.back() == L'-')) { dir = base.back() == L'-' ? -1 : 1; base.pop_back(); }
+    if (base.size() >= 3 && base[0] == L'w' && base[1] == L'b' && iswdigit(base[2])) {
+        int i = _wtoi(base.c_str() + 2); if (i < 0 || i >= 30) return true;
+        c.rr.wban ^= 1u << i;
+        if (int(fight::Weapons().size()) > 1) {  // keep one weapon pickable
+            uint32_t all = (int(fight::Weapons().size()) - 1 >= 30) ? 0x3FFFFFFFu : (1u << (int(fight::Weapons().size()) - 1)) - 1;
+            if ((c.rr.wban & all) == all) { c.rr.wban ^= 1u << i; g.cfgNote = L"至少要留一把武器"; return true; }
+        }
+    } else if (base == L"wbclear") c.rr.wban = 0;
+    else if (!CfgStep(c, base, dir, cap)) return false;
+    if (inRoom && c.mode == "duel" && r.members.size() > 2) { g.cfgNote = L"房间里超过 2 人，不能改成对决"; return true; }
+    if (inRoom && c.mode != "duel") for (auto& m : r.members) if (m.slot >= c.max) { g.cfgNote = L"有玩家的位置超出人数，不能再减"; return true; }
+    if (c.mode == "kill" && c.time == 0 && c.kills == 0) { g.cfgNote = L"击杀赛要有限时或目标击杀"; return true; }
+    g.cfgNote.clear();
+    if (inRoom) SendCfg(c);
+    SaveCfg(c);
+    return true;
 }
 
 // Enabled mods (autorun.txt, the loader's list) as "id:ver:flag;..." for the member field "mods".
@@ -915,19 +1231,39 @@ void UpdateCards(Cards& cs, int sel, const wchar_t* pageId) {
 }
 
 void UpdateLobby(const net::Room& r) {
-    uex::SetText(g.text[L"code"], L"房间码  " + uex::Wide(r.code));
-    std::wstring s;
-    for (auto& m : r.members) {
-        wchar_t b[512];  // name 24 chars + weapon / edge labels (an unknown id is shown raw, up to 200 bytes each)
-        std::wstring edge = m.edge.empty() ? L"" : L"  杀器 " + EdgeLabel(m.edge);
-        swprintf(b, 512, L"%s%s    %s%s    %s    胜场 %d%s\n", m.slot == r.host ? L"【房主】" : L"",
-                 uex::Wide(m.name).c_str(), WeaponLabel(m.weapon).c_str(), edge.c_str(), m.ready ? L"已准备" : L"未准备", m.score,
-                 m.slot == r.you ? L"  （你）" : (m.conn ? L"" : L"  （掉线）"));
-        s += b;
+    uex::SetText(g.text[L"code"], L"房间码  " + uex::Wide(r.code) + L"    " + std::to_wstring(r.members.size()) + L" / " + std::to_wstring(r.max) + L" 人");
+    auto R = rules::Parse(r.rules);
+    for (int i = 0; i < kMaxRows; ++i) {
+        const net::Member* m = i < int(r.members.size()) ? &r.members[i] : nullptr;
+        std::wstring s;
+        if (m) {
+            wchar_t b[512];  // name 24 chars + weapon / edge labels (an unknown id is shown raw, up to 200 bytes each)
+            std::wstring edge = m->edge.empty() || !R.edge ? L"" : L"  杀器 " + EdgeLabel(m->edge);
+            swprintf(b, 512, L"%s%s  %s%s  %s%s", m->slot == r.host ? L"【房主】" : L"", uex::Wide(m->name).c_str(),
+                     R.wrand ? L"随机武器" : WeaponLabel(m->weapon).c_str(), edge.c_str(), m->ready ? L"已准备" : L"未准备",
+                     m->slot == r.you ? L"（你）" : (m->conn ? L"" : L"（掉线）"));
+            s = b;
+        }
+        uex::SetText(g.rows[i], s);
+        Vis(g.rows[i], i < r.max || m ? kHitTestInvisible : kCollapsed);
+        if (m) TextColor(g.rows[i], m->ready || m->slot == r.host ? kInk : kDim);
     }
-    if (!s.empty()) s.pop_back();
-    uex::SetText(g.text[L"members"], s);
     auto me = Find(r, r.you);
+    // weapon cards: banned ones disabled and dimmed; random weapons: one note, cards off
+    for (int i = 0; i < int(k.wc.card.size()); ++i) {
+        bool ok = !R.wrand && !Banned(R, i);
+        Call1<bool>(k.wc.card[i], L"SetIsEnabled", L"bInIsEnabled", ok);
+    }
+    std::wstring cardNote = R.wrand ? L"随机武器：每回合由系统分配武器" : R.wban ? L"灰色武器被房主禁用" : L"";
+    if (me && !R.wrand && Banned(R, WeaponIndex(me->weapon))) cardNote = L"你选的武器被禁用了，请换一把";
+    uex::SetText(g.text[L"cardnote"], cardNote);
+    // houserules check of the loadout, once a second: refuses ready, and takes it back if already ready
+    if (net::Now() - g.violAt > 1) {
+        g.violAt = net::Now();
+        g.violation = houserules::Violation(R, uex::Me());
+        if (me && !R.wrand && Banned(R, WeaponIndex(me->weapon))) g.violation = L"所选武器被禁用";
+        if (me && me->ready && !g.violation.empty() && r.you != r.host && net::Now() - g.unreadyAt > 3) { net::SetReady(false); g.unreadyAt = net::Now(); }
+    }
     auto& es = fight::Edges();
     uex::SetText(g.btn[L"ready"].label, me && me->ready ? L"取消准备" : L"准备");
     uex::SetText(g.btn[L"weapon"].label, L"武器: " + WeaponLabel(me ? me->weapon : fight::Weapons()[g.weapon].id) + L"  >");
@@ -945,7 +1281,7 @@ void UpdateLobby(const net::Room& r) {
         TextColor(g.btn[L"otab"].label, k.tab == 2 ? kGold : kDim);
         k.tabShown = k.tab;
     }
-    int mi = r.map >= 0 && r.map < arena::MapCount() ? r.map : 0;
+    int mi = r.maps ? -1 : r.map >= 0 && r.map < arena::MapCount() ? r.map : 0;  // random: no card picked
     if (mi != k.mapShown) {
         for (int i = 0; i < int(k.mapSel.size()); ++i) {
             Vis(k.mapSel[i], i == mi ? kHitTestInvisible : kCollapsed);
@@ -953,22 +1289,47 @@ void UpdateLobby(const net::Room& r) {
         }
         k.mapShown = mi;
     }
-    uex::SetText(g.btn[L"rounds"].label, std::to_wstring(r.rounds) + L" 回合");
-    uex::SetText(g.btn[L"time"].label, TimeLabel(r.timeSec));
-    uex::SetText(g.btn[L"dmg"].label, std::to_wstring(r.dmg) + L"%");
     bool host = r.you == r.host;
-    Vis(g.text[L"hostrow"], host ? kSelfHitTestInvisible : kCollapsed);
     Vis(g.btn[L"start"].o, host ? kVisible : kCollapsed);
+    Vis(g.btn[L"cfg"].o, host ? kVisible : kCollapsed);
+    if (!host) g.cfgOpen = false;
+    Call1<bool>(g.btn[L"ready"].o, L"SetIsEnabled", L"bInIsEnabled", g.violation.empty() || (me && me->ready));
     if (me && me->mods != LocalMods() && net::Now() - g.modsAt > 3) { net::SetMods(LocalMods()); g.modsAt = net::Now(); }
     bool modBlock; std::wstring modNote = ModProblem(r, &modBlock);
     bool canStart = host && AllReady(r) && !modBlock;
     Call1<bool>(g.btn[L"start"].o, L"SetIsEnabled", L"bInIsEnabled", canStart);
-    uex::SetText(g.text[L"settings"], L"地图 " + std::wstring(arena::Maps()[mi].name) + L"  回合 " + std::to_wstring(r.rounds) + L"  时限 " + TimeLabel(r.timeSec) +
-                 L"  伤害 " + std::to_wstring(r.dmg) + L"%" + (host ? (canStart ? L"" : L"   (全员准备后可开始)") : L"   (房主设置)"));
+    uex::SetText(g.text[L"settings"], CfgSummary(FromRoom(r)) + (host ? (canStart ? L"" : L"   (全员准备后可开始)") : L"   (房主设置)"));
     std::wstring st = r.msg.empty() ? g.status : uex::Wide(r.msg);
     if (!modNote.empty()) st = modNote;
+    if (!g.violation.empty()) st = L"不能准备: " + g.violation;
     if (auto e = net::LastError(); !e.empty()) st = L"错误: " + ErrText(e);
     uex::SetText(g.text[L"lstatus"], st); g.lobbyStatus = st;
+}
+
+// settings panel: values of the shown page; rows that do not apply are hidden (duel: players fixed,
+// kill: rounds unused, respawn / kills only in kill mode)
+void UpdateCfg(const net::Room& r, bool inRoom) {
+    Cfg c = inRoom ? FromRoom(r) : g_saved;
+    for (auto id : kBasicOpts) uex::SetText(g.btn[id].label, CfgValue(c, id));
+    for (auto id : kMoreOpts) uex::SetText(g.btn[id].label, CfgValue(c, id));
+    Vis(g.text[L"pagebasic"], g.cfgPage == 0 ? kSelfHitTestInvisible : kCollapsed);
+    Vis(g.text[L"pagemore"], g.cfgPage == 1 ? kSelfHitTestInvisible : kCollapsed);
+    TextColor(g.btn[L"pgbasic"].label, g.cfgPage == 0 ? kGold : kDim);
+    TextColor(g.btn[L"pgmore"].label, g.cfgPage == 1 ? kGold : kDim);
+    bool kill = c.mode == "kill";
+    Vis(g.text[L"row_rounds"], kill ? kCollapsed : kSelfHitTestInvisible);
+    Vis(g.text[L"row_respawn"], kill ? kSelfHitTestInvisible : kCollapsed);
+    Vis(g.text[L"row_kills"], kill ? kSelfHitTestInvisible : kCollapsed);
+    for (auto id : {L"players-", L"players+", L"players"}) Call1<bool>(g.btn[id].o, L"SetIsEnabled", L"bInIsEnabled", c.mode != "duel");
+    for (int i = 0; i < 30; ++i) {
+        auto it = g.btn.find(L"wb" + std::to_wstring(i)); if (it == g.btn.end()) break;
+        bool ban = (c.rr.wban >> i) & 1;
+        TextColor(it->second.label, ban ? kRed : kInk);
+        Call1<float>(it->second.o, L"SetRenderOpacity", L"InOpacity", ban ? 1.f : 0.75f);
+    }
+    uex::SetText(g.text[L"cfgtitle"], inRoom ? L"房间设置" : L"房间设置（创建后生效）");
+    uex::SetText(g.text[L"cfgsum"], CfgSummary(c));
+    uex::SetText(g.text[L"cfgnote"], g.cfgNote);
 }
 
 // round wins as filled / empty diamonds: a best-of-N needs N/2+1
@@ -977,11 +1338,84 @@ std::wstring Pips(const net::Room& r, int score) {
     for (int i = 0; i < need; ++i) p += i < score ? L"◆ " : L"◇ ";
     return p;
 }
+// world cm -> slate units of our root canvas (PlayerController::ProjectWorldLocationToScreen gives
+// viewport pixels; WidgetLayoutLibrary::GetViewportScale converts). false = behind the camera
+bool Project(const float w[3], double& x, double& y) {
+    auto pc = uex::PC(); if (!pc) return false;
+    auto f = uex::Fn(pc, L"ProjectWorldLocationToScreen"); if (!f) return false;
+    Params p(f); p.Set(L"WorldLocation", uex::Vec{w[0], w[1], w[2]}); p.Set<bool>(L"bPlayerViewportRelative", true); p.Call(pc);
+    if (!p.Get<bool>(L"ReturnValue")) return false;
+    auto s = p.Get<V2>(L"ScreenLocation");
+    double scale = 1;
+    if (auto lib = uex::Lib(L"WidgetLayoutLibrary /Script/UMG.Default__WidgetLayoutLibrary")) {
+        Params q(uex::Fn(lib, L"GetViewportScale")); q.Set(L"WorldContextObject", uex::World()); q.Call(lib);
+        float v = q.Get<float>(L"ReturnValue"); if (v > 0.05f) scale = v;
+    }
+    x = s.x / scale; y = s.y / scale; return true;
+}
+// members ordered for the ranking / result: score high to low, then fewer deaths, then slot
+std::vector<const net::Member*> Ranked(const net::Room& r) {
+    std::vector<const net::Member*> v; for (auto& m : r.members) v.push_back(&m);
+    std::stable_sort(v.begin(), v.end(), [](auto a, auto b) { return a->score != b->score ? a->score > b->score : a->deaths < b->deaths; });
+    return v;
+}
+void UpdateHeads(const net::Room& r) {
+    int n = 0;
+    for (auto& m : r.members) {
+        if (m.slot == r.you || n >= kHeads) continue;
+        auto& hd = g.head[n++];
+        float w[3]; double x, y; net::State st;
+        bool have = fight::GhostAnchor(m.slot, w) && Project(w, x, y);
+        if (g.hudTest && !have) { have = true; x = 500 + 220 * n; y = 420; st.hp = 1.f - 0.15f * n; }
+        else if (!net::Sample(m.slot, st)) st.hp = m.alive ? 1.f : 0.f;
+        bool show = have && (m.alive || g.hudTest);
+        if (show != hd.shown) { Vis(hd.box, show ? kHitTestInvisible : kCollapsed); hd.shown = show; }
+        hd.slot = m.slot;
+        if (!show) continue;
+        uex::SetText(hd.name, uex::Wide(m.name));
+        if (std::abs(hd.x - x) > 0.5 || std::abs(hd.y - y) > 0.5) {
+            if (auto s = kSlot.Of<UObject*>(hd.box)) Call1(s, L"SetPosition", L"InPosition", V2{x, y});
+            hd.x = x; hd.y = y;
+        }
+        float f = std::clamp(st.hp, 0.f, 1.f);
+        if (std::abs(hd.hp - f) > 0.002f) { Call1<float>(hd.bar, L"SetPercent", L"InPercent", f); hd.hp = f; }
+    }
+    for (; n < kHeads; ++n) if (g.head[n].shown) { Vis(g.head[n].box, kCollapsed); g.head[n].shown = false; g.head[n].slot = -1; }
+}
 void UpdateFight(const net::Room& r) {
     std::wstring score;
-    for (auto& m : r.members) {
+    for (auto m : Ranked(r)) {
         if (!score.empty()) score += L"  :  ";
-        score += uex::Wide(m.name) + L" " + std::to_wstring(m.score);
+        score += uex::Wide(m->name) + L" " + std::to_wstring(m->score);
+    }
+    bool duel = r.mode == "duel", kill = r.mode == "kill";
+    Vis(g.heads, r.phase == "fight" || r.phase == "count" ? kHitTestInvisible : kCollapsed);
+    UpdateHeads(r);
+    {   // top line by mode: duel the score, ffa the survivors, kill my kills / deaths and the ranking
+        auto me = Find(r, r.you);
+        std::wstring top;
+        if (duel) top = score;
+        else if (!kill) { int a = 0; for (auto& m : r.members) a += m.alive; top = L"存活 " + std::to_wstring(a) + L" / " + std::to_wstring(r.members.size()); }
+        else top = L"击杀 " + std::to_wstring(me ? me->score : 0) + L"  死亡 " + std::to_wstring(me ? me->deaths : 0) +
+                   (r.kills ? L"  目标 " + std::to_wstring(r.kills) : L"");
+        uex::SetText(g.text[L"hudtop"], top); g.hudTop = top;
+        Vis(g.text[L"rankbox"], !duel ? kHitTestInvisible : kCollapsed);
+        uex::SetText(g.text[L"ranktitle"], kill ? L"击杀排行" : L"比分");
+        auto rk = Ranked(r); std::wstring all;
+        for (int i = 0; i < net::kMaxPlayers; ++i) {
+            std::wstring s;
+            if (i < int(rk.size())) {
+                auto m = rk[i];
+                s = std::to_wstring(i + 1) + L". " + uex::Wide(m->name) + L"  " + std::to_wstring(m->score) +
+                    (kill ? L" 杀 " + std::to_wstring(m->deaths) + L" 死" : L" 分") + (m->alive ? L"" : L"  ✕");
+                TextColor(g.text[L"rank" + std::to_wstring(i)], m->slot == r.you ? kGold : m->alive ? kInk : kDim);
+            }
+            uex::SetText(g.text[L"rank" + std::to_wstring(i)], s);
+            if (!s.empty()) all += s + L"; ";
+        }
+        g.rankText = all;
+        Vis(g.text[L"opppips"], duel ? kHitTestInvisible : kCollapsed);
+        Vis(g.text[L"mypips"], duel ? kHitTestInvisible : kCollapsed);
     }
     int left = r.leftMs ? int(r.leftMs - (net::Now() - r.recvAt) * 1000) : -1;
     if (left < 0 && r.leftMs) left = 0;
@@ -1005,10 +1439,10 @@ void UpdateFight(const net::Room& r) {
         if (hp >= 0) pct(g.oppBar, st.hp);
         uex::SetText(g.text[L"oppname"], uex::Wide(m.name)); uex::SetText(g.text[L"opppips"], Pips(r, m.score));
         uex::SetText(g.text[L"opphp"], hp >= 0 ? std::to_wstring(hp) + L"%" : std::wstring(L"--"));
-        break;  // 2 players: the bar shows the one opponent
+        break;  // the big right bar: the first opponent (duel); every opponent also has a head bar
     }
     // plaque: "第 N 回合" over the time left (∞ without a limit), or the phase
-    uex::SetText(g.text[L"hudround"], L"第 " + std::to_wstring(r.round) + L" / " + std::to_wstring(r.rounds) + L" 回合");
+    uex::SetText(g.text[L"hudround"], kill ? std::wstring(L"击杀赛") : ModeLabel(r.mode) + L"  第 " + std::to_wstring(r.round) + L" / " + std::to_wstring(r.rounds) + L" 回合");
     std::wstring h = left >= 0 ? std::to_wstring((left + 999) / 1000) : std::wstring(L"∞");
     if (r.phase == "load") h = L"载入中";
     if (r.phase == "count") h = L"准备 " + std::to_wstring(left >= 0 ? (left + 999) / 1000 : 3);
@@ -1030,7 +1464,14 @@ void UpdateFight(const net::Room& r) {
     if (r.phase == "end" || r.phase == "over") {
         std::wstring w = r.winner < 0 ? L"平局" : (r.winner == r.you ? L"你赢了" : NameOfSlot(r, r.winner) + L" 获胜");
         uex::SetText(g.text[L"result"], (r.phase == "over" ? L"比赛结束  " : L"本回合  ") + w);
-        uex::SetText(g.text[L"result2"], score + (left >= 0 ? L"    " + std::to_wstring((left + 999) / 1000) + L" 秒后" + (r.phase == "over" ? L"返回房间" : L"下一回合") : L""));
+        uex::SetText(g.text[L"result2"], left >= 0 ? std::to_wstring((left + 999) / 1000) + L" 秒后" + (r.phase == "over" ? L"返回房间" : L"下一回合") : L"");
+        std::wstring list; int i = 0;
+        for (auto m : Ranked(r)) {
+            list += std::to_wstring(++i) + L".  " + uex::Wide(m->name) + L"    " + std::to_wstring(m->score) + (kill ? L" 杀  " + std::to_wstring(m->deaths) + L" 死" : L" 分") +
+                    (m->slot == r.winner ? L"  ★" : L"") + (m->slot == r.you ? L"  （你）" : L"") + L"\n";
+        }
+        if (!list.empty()) list.pop_back();
+        uex::SetText(g.text[L"resultlist"], list); g.resultList = list;
     }
 }
 
@@ -1066,6 +1507,26 @@ void Dump(FILE* f) {
         fwprintf(f, L"lobby outfit page=%d/%d sel=%d pick='%S' denied=%d (%d outfits)\n", k.oc.page + 1, Pages(int(k.oc.card.size())), k.oc.shown,
                  fight::outfits::Pick().c_str(), int(fight::outfits::PickDenied()), int(fight::outfits::List().size()) - 1);
     } else fwprintf(f, L"no room, status=%d err=%S\n", int(net::GetStatus()), net::LastError().c_str());
+    {   // settings: the room's (in a room) and the remembered ones
+        auto dumpCfg = [&](const wchar_t* tag, const Cfg& c) {
+            fwprintf(f, L"cfg %s", tag);
+            for (auto id : kBasicOpts) fwprintf(f, L" %s=%s", id, CfgValue(c, id).c_str());
+            for (auto id : kMoreOpts) fwprintf(f, L" %s=%s", id, CfgValue(c, id).c_str());
+            fwprintf(f, L" wban=%u maps=%d rules='%S'\n", c.rr.wban, c.rand ? AllMaps() : 0, rules::Format(c.rr).c_str());
+            fwprintf(f, L"cfg %s summary='%s'\n", tag, CfgSummary(c).c_str());
+        };
+        net::Room r2;
+        if (net::GetRoom(r2)) {
+            dumpCfg(L"room", FromRoom(r2));
+            fwprintf(f, L"room mode=%S max=%d cap=%d maps=%d respawn=%d kills=%d\n", r2.mode.c_str(), r2.max, r2.cap, r2.maps, r2.respawn, r2.kills);
+            for (auto& m : r2.members) fwprintf(f, L"  m%d alive=%d life=%d deaths=%d\n", m.slot, int(m.alive), m.life, m.deaths);
+        }
+        dumpCfg(L"saved", g_saved);
+        fwprintf(f, L"cfg open=%d page=%d note='%s' violation='%s'\n", int(g.cfgOpen), g.cfgPage, g.cfgNote.c_str(), g.violation.c_str());
+        fwprintf(f, L"hud top='%s' rank='%s'\n", g.hudTop.c_str(), g.rankText.c_str());
+        for (auto& hd : g.head) if (hd.slot >= 0) fwprintf(f, L"head slot=%d shown=%d x=%.0f y=%.0f hp=%.2f\n", hd.slot, int(hd.shown), hd.x, hd.y, hd.hp);
+        fwprintf(f, L"result list='%s'\n", g.resultList.c_str());
+    }
     fwprintf(f, L"ui status='%s' failed=%d\n", g.status.c_str(), int(g.failed));
     fwprintf(f, L"steam mode=%d avail=%d net=%d persona=%s\n", int(g.steamMode), int(net::SteamAvailable()), int(net::SteamMode()),
              uex::Wide(net::SteamPersona()).c_str());
@@ -1204,7 +1665,17 @@ void TestHook() {
         if (c == L"open") SetOpen(true);
         else if (c == L"close") SetOpen(false);
         else if (c == L"click") { if (g.btn.count(a)) OnClick(a); else fwprintf(o, L"no button %s\n", a.c_str()); }
-        else if (c == L"set") { auto p = a.find(L' '); WriteEdit(a.substr(0, p).c_str(), p == std::wstring::npos ? L"" : a.substr(p + 1)); }
+        else if (c == L"set") {
+            auto p = a.find(L' '); std::wstring id = a.substr(0, p), v = p == std::wstring::npos ? L"" : a.substr(p + 1);
+            if (g.edit.count(id)) WriteEdit(id.c_str(), v);
+            else {  // a room setting: in the room the host sends it, else it is remembered for the next create
+                net::Room r; bool in = net::GetRoom(r);
+                Cfg cf = in ? FromRoom(r) : g_saved;
+                if (in && r.you != r.host) fwprintf(o, L"not host\n");
+                else if (!CfgSet(cf, id, v, in ? r.cap : net::kMaxPlayers)) fwprintf(o, L"no setting %s\n", id.c_str());
+                else { if (in) SendCfg(cf); SaveCfg(cf); fwprintf(o, L"set %s = %s\n", id.c_str(), CfgValue(cf, id).c_str()); }
+            }
+        }
         else if (c == L"dump") Dump(o);
         else if (c == L"tree") { if (auto w = FindUserWidget(a)) DumpTree(o, w, 0); else fwprintf(o, L"no widget %s\n", a.c_str()); }
         else if (c == L"cls") {  // cls <full class name>: props + template WidgetTree of a BP widget class
@@ -1357,7 +1828,7 @@ void TestHook() {
                     fwprintf(o, L"  %s -> %s\n", key.c_str(), act ? NameOf(act).c_str() : L"-");
             }
         }
-        else if (c == L"hudtest") g.hudTest = a != L"0";  // hudtest 1|0: show the match HUD with a fake room (layout checks)
+        else if (c == L"hudtest") { g.hudTest = a != L"0"; g.hudMode = a == L"ffa" || a == L"kill" ? uex::Utf8(a) : "duel"; }  // fake room HUD
         else if (c == L"dead") { net::Room r; if (net::GetRoom(r)) net::Dead(r.round, _wtoi(a.c_str())); }
         else if (c == L"console") uex::Console(a.c_str());
         else if (c == L"equip") { fight::Equip(uex::Utf8(a)); fwprintf(o, L"equip %s -> %S key %s\n", a.c_str(), fight::CurrentWeaponPath(uex::Me()).c_str(), fight::AbilityKey(uex::Me()).c_str()); }  // equip <id> mid-match
@@ -1432,11 +1903,19 @@ void Tick(float) {
     if (!Valid()) return;
 
     net::Room r; bool inRoom = net::GetRoom(r);
-    if (g.hudTest && !inRoom) {  // fake 2-player room in its fight phase
+    if (g.hudTest && !inRoom) {  // fake room in its fight phase (hudtest duel|ffa|kill)
         r.you = 0; r.host = 0; r.phase = "fight"; r.round = 2; r.rounds = 3; r.leftMs = 47000; r.recvAt = net::Now();
-        r.members = {{0, "甲A", "", 1}, {1, "乙B", "", 0}};
-        inRoom = true;
+        r.mode = g.hudMode; r.kills = 10;
+        int n = r.mode == "duel" ? 2 : 6;
+        const char* names[] = {"甲A", "乙B", "丙C", "丁D", "戊E", "己F", "庚G", "辛H"};
+        for (int i = 0; i < n; ++i) { net::Member m; m.slot = i; m.name = names[i]; m.score = (i * 3 + 1) % 5; m.deaths = i % 3; m.alive = i != 3; m.conn = true; r.members.push_back(m); }
+        r.max = n; inRoom = true;
     }
+    if (inRoom && g_applyRoom && r.you >= 0) {  // our create came through: the host's remembered settings
+        g_applyRoom = false;
+        if (r.you == r.host && r.phase == "lobby") { Cfg c = g_saved; if (c.mode != "duel") c.max = std::clamp(c.max, 2, (std::max)(2, r.cap)); SendCfg(c); }
+    }
+    if (!inRoom && net::GetStatus() != net::Status::Connecting) g_applyRoom = false;
     auto st = net::GetStatus();
     bool pawn = uex::Me() != nullptr;
     bool match = inRoom && r.phase != "lobby";
@@ -1485,8 +1964,12 @@ void Tick(float) {
     if (!pawn) MenuEntry();
     // the corner button is only a fallback for when the title menu entry could not be added
     Vis(g.corner, !g.open && !pawn && !match && !MenuEntryOk() ? kSelfHitTestInvisible : kCollapsed);
-    Vis(g.connect, g.open && !inRoom ? kSelfHitTestInvisible : kCollapsed);
-    Vis(g.lobby, g.open && inRoom && !match ? kSelfHitTestInvisible : kCollapsed);
+    if (match) g.cfgOpen = false;
+    bool cfg = g.open && g.cfgOpen;
+    Vis(g.connect, g.open && !inRoom && !cfg ? kSelfHitTestInvisible : kCollapsed);
+    Vis(g.lobby, g.open && inRoom && !match && !cfg ? kSelfHitTestInvisible : kCollapsed);
+    Vis(g.cfg, cfg ? kSelfHitTestInvisible : kCollapsed);
+    if (cfg) UpdateCfg(r, inRoom);
     Vis(g.hud, match ? kHitTestInvisible : kCollapsed);
     Vis(g.result, match && (r.phase == "end" || r.phase == "over") ? kHitTestInvisible : kCollapsed);
     Vis(g.esc, g.escMenu ? kSelfHitTestInvisible : kCollapsed);
