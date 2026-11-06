@@ -99,7 +99,7 @@ static bool InMapLevel() {
 }
 static bool Stray() { return g_opened && !g_travel && uex::World() && !AtTitle() && InMapLevel(); }
 
-static void Flow() {
+static void Flow(float dt) {
     fileguard::Tick();
     Landing();
     net::Room r;
@@ -183,7 +183,7 @@ static void Flow() {
             g_tidyAt = net::Now(); arena::ClearLevel();
             if (auto me = uex::Me(); me && r.phase != "fight") FixPawn(me);
         }
-        arena::Tick(0); fight::Tick(0);
+        arena::Tick(dt); fight::Tick(dt);
     } else if (r.phase == "over" && g_round >= 0) {
         fight::End(); g_round = -1; uex::IgnoreInput(false, false);  // stay in the arena until lobby
     } else if (r.phase == "lobby" && (g_round != -1 || g_haveHome || Stray())) {
@@ -198,7 +198,7 @@ static void Caught(const wchar_t* what, int& n) {
 static void Tick(void*, float dt) {
     uex::SehScope seh;  // access violations below get logged with their location
     try { net::SteamPump(); } catch (...) { static int n; Caught(L"steam", n); }
-    try { Flow(); } catch (...) { static int n; Caught(L"flow", n); }
+    try { Flow(dt); } catch (...) { static int n; Caught(L"flow", n); }
     try { ui::Tick(dt); } catch (...) { static int n; Caught(L"ui", n); }
 }
 extern "C" __declspec(dllexport) void PbzInit(const PbzHost* h) { g_h = h; uex::SetHost(h); }

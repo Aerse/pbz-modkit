@@ -24,10 +24,21 @@
 // heavy) come from the ability, not the montage, so a ghost never shows them. A new one attached
 // under our mesh sends "V <asset>|<parent actor class>|<parent component>|<socket>|x y z|p y r"
 // (SURE); the receiver spawns it on the ghost's matching component (else its mesh).
+// Room rules (rules.h, read at Begin and every Tick): hp% scales our own Health_Max (base saved
+// at the first Begin, put back by End / MatchOver); a ghost's damage base is our base x hp%, so a
+// hit's frac is the share of the victim's scaled max. Combo protection (victim side, ApplyHit):
+// hits less than 0.8 s apart are one chain; from hit 4 cdmg scales the damage (ComboScale), after
+// hit "stun" no hit reaction / hit-stop plays. wban / wrand pick the weapon at Begin.
+// More than 2 players: a ghost's drop is measured against the value we wrote last frame (the
+// remote's own hp changes never count) and is reported only within kOwnHitWindow of a move of
+// ours (attack, skill montage); dead's "by" is the last hitter.
+// Kill mode: dead carries our life number; when the server re-alives us with a bigger life we
+// respawn at a free spawn point with 1.5 s of spawn protection (hits answered "res .. dodge").
 #include "fight.h"
 #include "weapons.h"
 #include "outfits.h"
 #include "houserules.h"
+#include "../arena/arena.h"
 #include <algorithm>
 #include <set>
 #include <windows.h>
@@ -74,6 +85,8 @@ struct Ghost {
     float shownHp = -1;       // Health value we last wrote
     float shownShield = 0;    // Shield value we last wrote
     float shownShachi = -1;   // Shachi (posture) value we last wrote
+    int chainN = 0;           // our hits on it in the current chain (log only)
+    double chainAt = -100;
     float lastRemoteHp = 1;
     bool rootMotionOff = false;
     double nextLog = 0;
@@ -89,6 +102,13 @@ struct Ghost {
     double fxAt = -100;       // start of the current alert VFX window
     int fxN = 0;              // alert VFX spawned in that window
     std::map<int, uex::Ref> fx;  // peer's fx id -> our copy (ended by "X <id>")
+    bool wasDead = false;     // last sample had the dead flag (kill mode: cleared again = respawned)
+    double revivedAt = -100;  // that respawn: teleported onto the remote, no hits counted for a moment
+    double notOursLog = 0;    // rate limit of the "drop without a move of ours" log
+    int pendN = 0;            // hits reported since pendAt and not yet seen in the remote's hp
+    float pendFrac = 0;       // their sum (killing blows as 1)
+    double pendAt = -100;
+    float pendHp0 = 1;        // remote hp + shield when the first of them went out
 };
 
 bool g_on;
@@ -126,6 +146,19 @@ std::map<std::wstring, uex::Ref> g_montByName, g_gaCls;
 UObject* g_fightWorld;            // world the ghosts were spawned in
 std::map<int, double> g_spawnAt;  // slot -> next ghost spawn try
 int g_deadBy = -1; double g_deadSentAt, g_countCheck; bool g_resetOk;
+rules::Rules g_rules;            // the room's rules (Begin, every Tick)
+float g_hpDelta;                 // hp rule: added to our Health_Max (base and current); End takes it off
+float g_hpBaseWrote;             // Health_Max base value as we left it (the game rewriting it drops our delta)
+int g_maxHpFixes;                // Tick had to put our scaled Health_Max back (logged a few times)
+int g_chainN; double g_chainAt = -100;  // combo protection: hits taken in this chain, last one's time
+float g_chainRaw; int g_chainRawN;      // unscaled damage of this chain's ordinary hits (a killing blow's estimate)
+constexpr double kChainGap = 0.8;       // hits closer than this are one chain (pvp-protocol.md)
+double g_lastActAt = -100;       // our own last move (attack / skill montage)
+constexpr double kOwnHitWindow = 5.0;  // a ghost's drop this long after a move of ours is ours (projectiles, burns)
+int g_hitsSent, g_hitsOk, g_hitsUnconfirmed, g_dropsNotOurs;  // per round, logged at End
+int g_deadLife = -1;             // kill mode: our life number when we died
+double g_protectUntil;           // kill mode: spawn protection after a respawn
+constexpr double kSpawnProtect = 1.5;
 
 // engine fields, by name (fallback = the 2026-11 build)
 constexpr const wchar_t* kChar = L"Class /Script/Engine.Character";
@@ -372,35 +405,125 @@ void DriveGhost(Ghost& g, const net::State& s) {
 int DmgPct() { net::Room r; return net::GetRoom(r) && r.dmg > 0 ? r.dmg : 100; }
 int MySlot() { net::Room r; return net::GetRoom(r) ? r.you : 0; }
 rules::Rules RoomRules() { net::Room r; return net::GetRoom(r) ? rules::Parse(r.rules) : rules::Rules{}; }
+const net::Member* Mine(const net::Room& r) {
+    for (auto& m : r.members) if (m.slot == r.you) return &m;
+    return nullptr;
+}
+
+// hp rule: Health_Max x hp%. The game's aggregation adds modifiers (gear) to the base, so the
+// difference goes onto the base as well as the current value and survives a recalculation; a
+// base the game rewrote itself has lost it. keepFrac: Health keeps its share of the max.
+void ApplyHpRule(bool keepFrac) {
+    using namespace uex::attr;
+    auto set = g_me ? uex::AttrSet(g_me) : nullptr; if (!set) return;
+    int off = HealthMax;
+    float* base = reinterpret_cast<float*>(set + off + 8);
+    float* cur = reinterpret_cast<float*>(set + off + 0xC);
+    if (*cur <= 0) return;
+    if (g_hpDelta != 0 && std::fabs(*base - g_hpBaseWrote) > 0.5f) {
+        uex::Log(L"fight: hp rule: the game set Health_Max base %.0f (we left %.0f), delta %.0f dropped", *base, g_hpBaseWrote, g_hpDelta);
+        g_hpDelta = 0;
+    }
+    float raw = *cur - g_hpDelta;
+    if (raw <= 0) { raw = *cur; g_hpDelta = 0; }
+    float want = raw * float(g_rules.hp) / 100.f, nd = want - raw;
+    if (std::fabs(*cur - want) < 0.5f && std::fabs(nd - g_hpDelta) < 0.5f) return;
+    float old = *cur, h = uex::Attr(g_me, Health);
+    *base += nd - g_hpDelta; *cur = want; g_hpDelta = nd; g_hpBaseWrote = *base;
+    if (keepFrac && old > 0) uex::SetAttr(g_me, Health, (std::max)(1.f, h * want / old));
+    if (g_maxHpFixes++ < 20) uex::Log(L"fight: hp rule %d%%: Health_Max %.0f -> %.0f (unscaled %.0f)", g_rules.hp, old, want, raw);
+}
+void RemoveHpRule() {
+    using namespace uex::attr;
+    auto set = g_me ? uex::AttrSet(g_me) : nullptr;
+    if (!set || g_hpDelta == 0) { g_hpDelta = 0; return; }
+    int off = HealthMax;
+    float* base = reinterpret_cast<float*>(set + off + 8);
+    float* cur = reinterpret_cast<float*>(set + off + 0xC);
+    float old = *cur;
+    if (std::fabs(*base - g_hpBaseWrote) <= 0.5f) *base -= g_hpDelta;  // else the game's own base already
+    *cur -= g_hpDelta; g_hpDelta = 0;
+    if (*cur < 1) *cur = 1;
+    float h = uex::Attr(g_me, Health);
+    if (old > 0) uex::SetAttr(g_me, Health, (std::max)(1.f, h * *cur / old));
+    uex::Log(L"fight: hp rule removed: Health_Max %.0f -> %.0f", old, *cur);
+}
 
 float ExtShield(const net::State& s) {  // remote Shield as a fraction of its Health_Max
     return s.extLen >= 3 && s.ext[0] == 'S' ? (s.ext[1] | s.ext[2] << 8) / 1000.f : 0.f;
 }
 
+// kill mode: the remote came back (dead flag gone): off the held death pose, onto its spawn point
+void GhostLife(Ghost& g, const net::State& s) {
+    bool dead = s.flags & kFlagDead;
+    if (g.wasDead && !dead) {
+        UObject* a = g.actor;
+        if (auto ai = AnimOf(a)) MontStop(ai, nullptr, 0.1f);  // null = every montage: the paused death one too
+        g.applied = nullptr; g.appliedId = 0; g.localMont = nullptr; g.localHitAt = -100;
+        g.shownHp = -1; g.shownShachi = -1; g.pendN = 0; g.pendFrac = 0; g.chainN = 0;
+        g.yaw = s.yaw; g.glide = false; g.offSince = -1;
+        Place(a, {s.pos[0] + g_testOff.x, s.pos[1] + g_testOff.y, s.pos[2]}, s.yaw, true);
+        g.revivedAt = net::Now();
+        uex::Log(L"fight: ghost %d respawned at %.0f %.0f %.0f", g.slot, s.pos[0], s.pos[1], s.pos[2]);
+    }
+    g.wasDead = dead;
+}
+
 // local hits on a ghost show as a drop of its Health + Shield (and Shachi); report it, then
-// show the remote's values again
+// show the remote's values again. The remote's own hp changes (hits by others, heals) never show
+// as a drop: the drop is taken against the value written last frame. What remains is anything
+// else the local game does to the ghost; only a drop within kOwnHitWindow of a move of ours is
+// reported. Every report is checked against the remote's hp afterwards (confirmed / unconfirmed).
 void GhostHp(Ghost& g, const net::State& s) {
     using namespace uex::attr;
     UObject* a = g.actor;
     float mx = uex::Attr(a, HealthMax); if (mx <= 0) return;  // as scaled last frame
-    if (g.baseMax <= 0) g.baseMax = mx;
+    // the ghost's damage base is our own (hp-rule scaled) Health_Max: a hit's frac is then the
+    // same share of the victim's own scaled max
+    float ours = g_me ? uex::Attr(g_me, HealthMax) : 0.f;
+    if (ours > 0) g.baseMax = ours; else if (g.baseMax <= 0) g.baseMax = mx;
     float h = uex::Attr(a, Health), sh = uex::Attr(a, Shield);
     float smx = uex::Attr(a, ShachiMax), sc = uex::Attr(a, Shachi);
+    double now = net::Now();
+    float tot = (s.flags & kFlagDead) ? 0.f : s.hp + ExtShield(s);
+    if (g.pendN) {  // our reports since pendAt: has the remote's hp gone down by (part of) them?
+        float want = (std::min)(g.pendFrac, g.pendHp0) * 0.3f;  // combo falloff takes up to 60% off
+        if (g.pendHp0 - tot >= want && g.pendHp0 - tot > 0.0005f) { g_hitsOk += g.pendN; g.pendN = 0; g.pendFrac = 0; }
+        else if (now - g.pendAt > 2.0) {
+            g_hitsUnconfirmed += g.pendN;
+            uex::Log(L"fight: %d hit(s) on ghost %d (%.1f%%) not seen in its hp (%.3f -> %.3f)", g.pendN, g.slot, g.pendFrac * 100, g.pendHp0, tot);
+            g.pendN = 0; g.pendFrac = 0;
+        }
+    }
     // a drop counts only in the fight (the victim takes no other) and not right after the spawn
     net::Room room; bool fightNow = !net::GetRoom(room) || room.phase == "fight";
-    if (g.shownHp >= 0 && !(s.flags & kFlagDead) && fightNow && net::Now() - g.spawnedAt > 1.0) {
-        float drop = (g.shownHp - h) + (g.shownShield - sh);
+    if (g.shownHp >= 0 && !(s.flags & kFlagDead) && fightNow && now - g.spawnedAt > 1.0 && now - g.revivedAt > 0.5) {
+        float drop = (std::max)(0.f, g.shownHp - h) + (std::max)(0.f, g.shownShield - sh);
+        if (drop < 0.5f) drop = 0;  // float noise: no move does less
         float pdrop = smx > 0 && g.shownShachi >= 0 ? (std::max)(0.f, g.shownShachi - sc) / smx : 0.f;
-        if (drop > 0.01f || pdrop > 0.01f) {
-            float hs = houserules::OutgoingScale(g_me);  // sd%: Phantom Edge moves
-            drop *= hs; pdrop *= hs;
-            float frac = drop / mx;     // as a fraction: the victim's max may differ
-            float amt = frac * g.baseMax;
-            // the ghost's Health_Min = 1 truncates the drop of a killing blow: make it lethal
-            if (drop > 0.01f && h <= 1.01f && sh <= 0.01f) frac = (std::max)(frac, 1.5f);
-            char b[160]; snprintf(b, sizeof b, "hit %d %.2f %d %.5f %d %.4f %.0f", g.slot, amt, MySlot(), frac, g_round, pdrop, RootYaw(g_me));
-            net::Sure(b); g_lastHitSent = net::Now();
-            uex::Log(L"fight: hit ghost %d dmg %.1f (%.1f%%) posture %.1f%% round %d", g.slot, amt, frac * 100, pdrop * 100, g_round);
+        if (pdrop <= 0.01f) pdrop = 0;
+        if (drop > 0 || pdrop > 0) {
+            if (now - g_lastActAt > kOwnHitWindow) {
+                ++g_dropsNotOurs;
+                if (now >= g.notOursLog) {
+                    g.notOursLog = now + 1;
+                    uex::Log(L"fight: ghost %d drop %.1f posture %.1f%% with no move of ours for %.1f s: not reported", g.slot, drop, pdrop * 100, now - g_lastActAt);
+                }
+            } else {
+                float hs = houserules::OutgoingScale(g_me);  // sd%: Phantom Edge moves
+                drop *= hs; pdrop *= hs;
+                float frac = drop / mx;     // as a fraction: the victim's max may differ
+                float amt = frac * g.baseMax;
+                // the ghost's Health_Min = 1 truncates the drop of a killing blow: make it lethal
+                if (drop > 0.01f && h <= 1.01f && sh <= 0.01f) frac = (std::max)(frac, 1.5f);
+                char b[160]; snprintf(b, sizeof b, "hit %d %.2f %d %.5f %d %.4f %.0f", g.slot, amt, MySlot(), frac, g_round, pdrop, RootYaw(g_me));
+                net::Sure(b); g_lastHitSent = now; ++g_hitsSent;
+                if (frac > 0.0005f) {
+                    if (!g.pendN) { g.pendHp0 = tot; g.pendFrac = 0; }
+                    ++g.pendN; g.pendFrac += (std::min)(frac, 1.f); g.pendAt = now;
+                }
+                uex::Log(L"fight: hit ghost %d dmg %.1f (%.1f%%) posture %.1f%% round %d", g.slot, amt, frac * 100, pdrop * 100, g_round);
+            }
         }
     }
     // damage %: the ghost's bar is scaled by 100/% instead of the hits, so a hit that its
@@ -453,24 +576,56 @@ bool FromBehind(int from, double attackerYaw) {
 }
 
 void HitStop();
+// Combo protection: hits less than kChainGap apart are one chain (any attacker). cdmg: from hit 4
+// the damage is scaled (rules::ComboScale); a killing blow (frac >= 1: the attacker's ghost only
+// saw that it was lethal) then counts as the chain's average hit, scaled, so falloff can save us.
+// stun: from hit "stun" on no hit reaction / hit-stop of ours, and ours still playing is cut, so
+// the victim can dodge out. A posture break (CharacterState.Stand.Break) is the game's own.
 void ApplyHit(float amt, float frac, int from, float posture, bool back) {
     using namespace uex::attr;
     if (g_dead || !g_me) return;
+    double now = net::Now();
+    g_chainN = now - g_chainAt < kChainGap ? g_chainN + 1 : 1; g_chainAt = now;
+    if (g_chainN == 1) { g_chainRaw = 0; g_chainRawN = 0; }
     float mx = uex::Attr(g_me, HealthMax);
-    float d = frac > 0 ? frac * mx : amt;
-    float sh = uex::Attr(g_me, Shield), fromShield = (std::min)(sh, d);
+    float sh = uex::Attr(g_me, Shield), h = uex::Attr(g_me, Health);
+    bool lethal = frac >= 1.f;
+    float raw = frac > 0 ? frac * mx : amt, d = raw;
+    float scale = rules::ComboScale(g_rules, g_chainN);
+    if (scale < 1.f) {
+        float base = raw;
+        if (lethal) base = (std::max)(h + sh, g_chainRawN ? g_chainRaw / g_chainRawN : 0.f);  // at least what was left
+        d = base * scale;
+    }
+    if (!lethal && raw > 0) { g_chainRaw += raw; ++g_chainRawN; }
+    float fromShield = (std::min)(sh, d);
     if (fromShield > 0) uex::SetAttr(g_me, Shield, sh - fromShield);
-    float h = uex::Attr(g_me, Health);
     float nh = (std::max)(1.f, h - (d - fromShield));
     uex::SetAttr(g_me, Health, nh);
     if (posture > 0) {
         float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, ShachiMin);
         uex::SetAttr(g_me, Shachi, (std::max)(smin, uex::Attr(g_me, Shachi) - posture * smx));
     }
-    g_lastHitter = from; g_lastHitAt = net::Now();
-    uex::Log(L"fight: took %.1f (shield %.1f) from %d hp %.1f -> %.1f", d, fromShield, from, h, nh);
+    g_lastHitter = from; g_lastHitAt = now;
+    bool noStun = g_rules.stun > 0 && g_chainN >= g_rules.stun;
+    uex::Log(L"fight: took %.1f (raw %.1f, chain %d x%.2f%s) (shield %.1f) from %d hp %.1f -> %.1f / %.0f", d, raw, g_chainN, scale,
+             noStun ? L", no stun" : L"", fromShield, from, h, nh, mx);
     g_lastHitBack = back;
-    if (nh > 1.f && d > 0.01f) { HitReaction(back); HitStop(); }  // posture only (deflected): no flinch
+    if (nh > 1.f && d > 0.01f) {  // posture only (deflected): no flinch
+        if (!noStun) { HitReaction(back); HitStop(); }
+        else if (auto ai = AnimOf(g_me)) {
+            UObject* cur = CurMontage(ai);
+            if (cur && (cur == uex::Get(g_hitMont[0]) || cur == uex::Get(g_hitMont[1]))) {
+                MontStop(ai, cur, 0.1f);
+                uex::Log(L"fight: combo protection: hit %d of the chain (stun %d), hit reaction %s cut", g_chainN, g_rules.stun, NameOf(cur).c_str());
+            }
+        }
+    }
+    static double breakLog;
+    if (posture > 0 && now > breakLog && HasTag(g_me, L"CharacterState.Stand.Break")) {
+        breakLog = now + 2;
+        uex::Log(L"fight: posture break (the game's own stun), chain %d", g_chainN);
+    }
 }
 
 // hit-stop on the victim: the game freezes only the attacker (CustomTimeDilation ~0.05 for ~70 ms);
@@ -491,6 +646,12 @@ void HitStopTick() {
 void ResolveHit(float amt, float frac, int from, float posture, int round, double attackerYaw) {
     if (g_dead || !g_me) return;
     const char* res = nullptr;
+    if (net::Now() < g_protectUntil) {  // kill mode spawn protection: the hit is ignored (answered like a dodge)
+        char b[96]; snprintf(b, sizeof b, "res %d %d dodge %d", from, MySlot(), round);
+        net::Sure(b);
+        uex::Log(L"fight: hit from %d (%.1f) -> ignored (spawn protection, %.2f s left)", from, amt, g_protectUntil - net::Now());
+        return;
+    }
     if (HasTag(g_me, L"CharacterState.Stand.Invulnerable.Dodge.Perfect")) res = "pdodge";
     else if (HasTag(g_me, L"CharacterState.Stand.Invulnerable.Dodge")) res = "dodge";
     else if (HasTag(g_me, L"Ability.Action.HoldDeflect")) res = "block";
@@ -537,6 +698,7 @@ void OnResult(int victim, const char* kind) {
     if (it == g_ghosts.end() || !GhostLive(it->second)) return;
     Ghost& g = it->second;
     g.resAt = net::Now();
+    if (g.pendN > 0) { --g.pendN; ++g_hitsOk; }  // resolved by the victim: it did get the hit
     if (g.localMont) { if (auto ai = AnimOf(g.actor)) MontStop(ai, g.localMont, 0.1f); g.localMont = nullptr; }
     g.localHitAt = -100; g.applied = nullptr;  // the remote's own montage (dash / guard) takes over
 }
@@ -803,6 +965,7 @@ void Publish() {
             if (it != g_montIds.end() && it->second.name == m->name.comparison && it->second.number == m->name.number) id = it->second.id;
             else { id = net::Intern(uex::Utf8(PathOf(m))); g_montIds[m] = {m->name.comparison, m->name.number, id}; }
             s.montage = id; s.montPos = MontPos(ai, m); s.montRate = MontRate(ai, m);
+            if (!g_dead && !IsHitMont(m)) g_lastActAt = net::Now();  // a move of ours: drops on ghosts now are ours
         }
         for (int k = 0; k < 7; ++k) s.anim[k] = reinterpret_cast<uint8_t*>(ai)[kAnimOff[k]];
     }
@@ -925,6 +1088,8 @@ void ResetLocal() {
     using namespace uex::attr;
     SaveOriginal();
     int moves = CancelMoves(g_me), fx = ClearTimedEffects(g_me);
+    g_rules = RoomRules();
+    ApplyHpRule(false);
     uex::SetAttr(g_me, HealthMin, 1.f);
     uex::SetAttr(g_me, Health, uex::Attr(g_me, HealthMax));
     uex::SetAttr(g_me, Shachi, uex::Attr(g_me, ShachiMax));
@@ -933,7 +1098,59 @@ void ResetLocal() {
     uex::SetAttr(g_me, uex::attr::Spirit, uex::Attr(g_me, uex::attr::SpiritMax));
     for (int off = uex::attr::AccFirst, last = uex::attr::AccLast; off <= last; off += 0x10) uex::SetAttr(g_me, off, 0.f);
     g_resetOk = uex::Attr(g_me, HealthMax) > 0;
+    g_chainN = 0; g_chainAt = -100;
     uex::Log(L"fight: reset hp %.0f shachi %.0f, cancelled %d, effects removed %d", uex::Attr(g_me, Health), uex::Attr(g_me, Shachi), moves, fx);
+}
+
+// own weapon for the round: wrand picks one from (room code, round, own slot) so every client
+// gets the same: FNV-1a 32 of "<code>:<round>:<slot>" modulo the count of allowed weapons
+// (Weapons()[1..] without the wban bits, in list order). Without wrand a banned pick falls back
+// to "" (the save's current weapon, which wban cannot ban).
+std::string PickWeapon(const net::Room& r, std::string id) {
+    auto& ws = Weapons();
+    auto banned = [&](size_t i) { return i >= 1 && i <= 30 && (g_rules.wban >> (i - 1) & 1u); };
+    if (g_rules.wrand) {
+        std::vector<size_t> ok;
+        for (size_t i = 1; i < ws.size(); ++i) if (!banned(i)) ok.push_back(i);
+        if (ok.empty()) { uex::Log(L"fight: wrand: every weapon banned, keeping the current one"); return ""; }
+        std::string key = r.code + ":" + std::to_string(g_round) + ":" + std::to_string(r.you);
+        uint32_t h = 2166136261u;
+        for (unsigned char c : key) { h ^= c; h *= 16777619u; }
+        const std::string& w = ws[ok[h % ok.size()]].id;
+        uex::Log(L"fight: wrand %S -> %S (%zu allowed)", key.c_str(), w.c_str(), ok.size());
+        return w;
+    }
+    for (size_t i = 1; i < ws.size(); ++i)
+        if (ws[i].id == id && banned(i)) { uex::Log(L"fight: weapon %S banned (wban %u), keeping the current one", id.c_str(), g_rules.wban); return ""; }
+    return id;
+}
+
+// kill mode: the server re-alived us with a bigger life: full reset at a spawn point away from the
+// others, spawn protection, input back (mp follows LocalDead)
+void Respawn(const net::Room& r, int life) {
+    using namespace uex::attr;
+    double now = net::Now();
+    g_dead = false; g_deathMont = {}; g_deathLenOf = nullptr; g_lastHitter = -1; g_lastHitAt = -100; g_deadBy = -1;
+    ResetLocal();  // cancels the death montage with the other moves
+    // the free-est of the 8 ring points: farthest from the nearest live ghost, ties at random
+    int best = r.you & 7; double bestD = -1;
+    int start = int(GetTickCount64() % 8);
+    for (int k = 0; k < 8; ++k) {
+        int sl = (start + k) % 8;
+        Vec p = arena::SpawnPoint(sl, nullptr);
+        double d = 1e18;
+        for (auto& [slot, g] : g_ghosts)
+            if (GhostLive(g)) { Vec q = RootLoc(g.actor); d = (std::min)(d, std::hypot(q.x - p.x, q.y - p.y)); }
+        if (d > bestD + 1) { bestD = d; best = sl; }
+    }
+    double yaw = 0; Vec p = arena::SpawnPoint(best, &yaw);
+    uex::SetMoveMode(g_me, 1);
+    uex::Teleport(g_me, p, yaw); uex::SetControlYaw(yaw);
+    g_protectUntil = now + kSpawnProtect;
+    g_deadLife = -1;
+    uex::IgnoreInput(false, false);
+    uex::Log(L"fight: respawn life %d at point %d (%.0f %.0f %.0f), nearest ghost %.0f, protected %.1f s", life, best, p.x, p.y, p.z,
+             bestD > 1e17 ? -1.0 : bestD, kSpawnProtect);
 }
 
 // Local helpers (proposed for uex): Destroy that hides + drops collision first, ability by class name.
@@ -1022,16 +1239,23 @@ bool GhostAnchor(int slot, float out[3]) {
 }
 
 void Begin(int round) {
+    if (g_me && g_me != uex::Me()) g_hpDelta = 0;  // that pawn (and our delta on it) is gone
     g_me = uex::Me();
     g_round = round; g_dead = false; g_lastHitter = -1; g_nextHp = 0; g_deathMont = {}; g_lastHitBack = false;
-    g_deadBy = -1; g_deadSentAt = 0;
+    g_deadBy = -1; g_deadSentAt = 0; g_deadLife = -1; g_protectUntil = 0; g_lastActAt = -100; g_maxHpFixes = 0;
+    g_hitsSent = g_hitsOk = g_hitsUnconfirmed = g_dropsNotOurs = 0;
+    g_rules = RoomRules();
     DrainEvents();  // hits still queued from the last round must not land in this one
     if (!g_me) { uex::Log(L"fight: Begin without player"); return; }
     SaveOriginal();
     {   // own weapon / Phantom Edge from the room (own slot); loopback test: TestWeapons
         std::string id = g_testWeapon, edge;
         net::Room r;
-        if (net::GetRoom(r)) for (auto& m : r.members) if (m.slot == r.you) { id = m.weapon; edge = m.edge; }
+        if (net::GetRoom(r)) {
+            for (auto& m : r.members) if (m.slot == r.you) { id = m.weapon; edge = m.edge; }
+            id = PickWeapon(r, id);
+            uex::Log(L"fight: rules %S (mode %S)", rules::Format(g_rules).c_str(), r.mode.c_str());
+        }
         Equip(id);
         EquipEdge(edge);
         g_sentWeapon.clear(); g_nextWeaponSend = 0;
@@ -1041,9 +1265,9 @@ void Begin(int round) {
     outfits::Wear(g_me, uex::Wide(outfits::Pick()));     // the lobby pick (no-op when already worn)
     g_sentOutfit.clear(); g_nextOutfitSend = 0;
     ResetLocal();
-    houserules::Begin(RoomRules(), g_me);
+    houserules::Begin(g_rules, g_me);
     if (uex::World() != g_fightWorld) { RemoveGhosts(); g_fightWorld = uex::World(); }  // the old ones went with their world
-    for (auto& [slot, g] : g_ghosts) { g.shownHp = -1; g.shownShachi = -1; g.applied = nullptr; }
+    for (auto& [slot, g] : g_ghosts) { g.shownHp = -1; g.shownShachi = -1; g.applied = nullptr; g.wasDead = false; g.pendN = 0; g.pendFrac = 0; }
     g_spawnAt.clear();
     for (int slot : net::RemoteSlots())
         try { SpawnGhost(slot); } catch (...) { auto w = uex::ExcWhere(); uex::Log(L"fight: ghost %d spawn exception %s", slot, w.c_str()); }
@@ -1056,33 +1280,42 @@ void Tick(float dt) {
     UObject* me = uex::Me();
     if (!me) return;
     if (me != g_me) {  // new pawn (respawned by the level): ours again, hostile to the ghosts
-        g_me = me; g_stopUntil = 0; ResetLocal();
+        g_me = me; g_stopUntil = 0; g_hpDelta = 0; ResetLocal();
         outfits::Wear(g_me, uex::Wide(outfits::Pick()));
         for (auto& [slot, g] : g_ghosts) if (GhostLive(g)) uex::Hostile(g_me, g.actor, true);
     }
     // a pawn whose attributes were not there yet at Begin (HealthMax 0) gets its reset once they are
     if (!g_resetOk && !g_dead && uex::Attr(g_me, uex::attr::HealthMax) > 0) ResetLocal();
-    houserules::Tick(RoomRules(), g_me, dt);
+    g_rules = RoomRules();
+    double now = net::Now();
+    static double hpCheck;
+    if (!g_dead && now >= hpCheck) { hpCheck = now + 0.5; ApplyHpRule(true); }  // the game may have recalculated Health_Max
+    houserules::Tick(g_rules, g_me, dt);
     Events();
     HitStopTick();
     Publish();
     outfits::Tick();
     net::Room r; bool room = net::GetRoom(r);
-    double now = net::Now();
+    const net::Member* mine = room ? Mine(r) : nullptr;
     // death: Health_Min keeps us at 1, the game's own death/respawn never runs. Only in the fight
     // (the server takes it only then); sent again while the room still has us alive
     if (!g_dead && (!room || r.phase == "fight") && uex::Attr(g_me, uex::attr::HealthMax) > 0 &&
         uex::Attr(g_me, uex::attr::Health) <= 1.01f) {
         g_dead = true;
         g_deadBy = now - g_lastHitAt < 8 ? g_lastHitter : -1;
-        net::Dead(g_round, g_deadBy); g_deadSentAt = now;
+        g_deadLife = mine ? mine->life : -1;
+        net::Dead(g_round, g_deadBy, g_deadLife); g_deadSentAt = now;
         uex::IgnoreInput(true, false);
-        uex::Log(L"fight: dead round %d by %d", g_round, g_deadBy);
+        uex::Log(L"fight: dead round %d by %d life %d (hits sent %d ok %d unconfirmed %d, drops not ours %d)", g_round, g_deadBy, g_deadLife,
+                 g_hitsSent, g_hitsOk, g_hitsUnconfirmed, g_dropsNotOurs);
         PlayDeath();
     }
-    if (g_dead && room && r.phase == "fight" && r.round == g_round && now - g_deadSentAt > 1.0)
-        for (auto& m : r.members)
-            if (m.slot == r.you && m.alive) { net::Dead(g_round, g_deadBy); g_deadSentAt = now; uex::Log(L"fight: dead sent again"); }
+    // the room has us alive again: kill mode with a bigger life = respawn; otherwise our dead was lost
+    if (g_dead && mine && mine->alive && r.phase == "fight" && r.round == g_round) {
+        if (r.mode == "kill" && mine->life > g_deadLife) Respawn(r, mine->life);
+        else if (now - g_deadSentAt > 1.0) { net::Dead(g_round, g_deadBy, g_deadLife); g_deadSentAt = now; uex::Log(L"fight: dead sent again"); }
+    }
+    if (g_protectUntil && now >= g_protectUntil) { g_protectUntil = 0; uex::Log(L"fight: spawn protection over"); }
     if (g_dead) HoldDeath();
     // countdown: movement is ignored but attacks are not, one started now is cancelled (an equip /
     // weapon swap montage is left alone: Begin's Equip may still be playing it)
@@ -1119,6 +1352,7 @@ void Tick(float dt) {
             GhostWeapon(g, s);
             GhostEdge(g);
             GhostOutfit(g);
+            GhostLife(g, s);
             DriveGhost(g, s);
             if (auto ai = AnimOf(g.actor)) SyncMontage(g, ai, s);
             GhostHp(g, s);
@@ -1129,14 +1363,16 @@ void Tick(float dt) {
 void End() {
     if (!g_on && g_ghosts.empty()) return;
     g_on = false;
+    uex::Log(L"fight: round %d hits sent %d confirmed %d unconfirmed %d, drops not ours %d", g_round, g_hitsSent, g_hitsOk, g_hitsUnconfirmed, g_dropsNotOurs);
     houserules::End(g_me && uex::Me() == g_me ? g_me : nullptr);
     RemoveGhosts();
     if (g_me && uex::Me() == g_me) {
+        RemoveHpRule();
         CancelMoves(g_me);
         if (uex::Attr(g_me, uex::attr::Health) < 1.f) uex::SetAttr(g_me, uex::attr::Health, 1.f);
     }
     if (g_dead) uex::IgnoreInput(false, false);
-    g_dead = false; g_deathMont = {}; g_lastHitBack = false;
+    g_dead = false; g_deathMont = {}; g_lastHitBack = false; g_protectUntil = 0; g_hpDelta = 0;
     g_remoteMont.clear();  // a peer that reconnected interns its montages again
     uex::Log(L"fight: end");
 }
@@ -1149,7 +1385,7 @@ void MatchOver() {
         uex::SetAttr(me, HealthMin, g_saved.healthMin);
         // hp 1 at the first Begin is a leftover of our own Health_Min clamp (mp reloaded mid-match)
         if (g_saved.health <= 1.01f) g_saved.health = uex::Attr(me, HealthMax);
-        uex::SetAttr(me, Health, (std::max)(1.f, g_saved.health));
+        uex::SetAttr(me, Health, (std::max)(1.f, (std::min)(g_saved.health, uex::Attr(me, HealthMax))));  // the hp rule is off again
         uex::SetAttr(me, Shachi, g_saved.shachi);
         uex::SetAttr(me, Shield, g_saved.shield);
         uex::SetAttr(me, Ult, g_saved.ult);
