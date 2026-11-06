@@ -495,9 +495,10 @@ void GhostHp(Ghost& g, const net::State& s) {
             g.pendN = 0; g.pendFrac = 0;
         }
     }
-    // a drop counts only in the fight (the victim takes no other) and not right after the spawn
+    // a drop counts only in the fight (the victim takes no other), not right after the spawn and
+    // not while we are dead (a move still playing out after our death deals nothing)
     net::Room room; bool fightNow = !net::GetRoom(room) || room.phase == "fight";
-    if (g.shownHp >= 0 && !(s.flags & kFlagDead) && fightNow && now - g.spawnedAt > 1.0 && now - g.revivedAt > 0.5) {
+    if (g.shownHp >= 0 && !(s.flags & kFlagDead) && !g_dead && fightNow && now - g.spawnedAt > 1.0 && now - g.revivedAt > 0.5) {
         float drop = (std::max)(0.f, g.shownHp - h) + (std::max)(0.f, g.shownShield - sh);
         if (drop < 0.5f) drop = 0;  // float noise: no move does less
         float pdrop = smx > 0 && g.shownShachi >= 0 ? (std::max)(0.f, g.shownShachi - sc) / smx : 0.f;

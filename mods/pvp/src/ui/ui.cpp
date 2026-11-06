@@ -506,7 +506,8 @@ void SendCfg(const Cfg& c) {
 std::wstring ModeLabel(const std::string& m) { return m == "ffa" ? L"混战" : m == "kill" ? L"击杀赛" : L"对决"; }
 bool Banned(const rules::Rules& R, int weapon) { return weapon >= 1 && weapon <= 30 && (R.wban >> (weapon - 1)) & 1; }
 const wchar_t* kBasicOpts[] = {L"gmode", L"players", L"rounds", L"time", L"mapsel", L"dmg", L"hp", L"preset"};
-const wchar_t* kMoreOpts[] = {L"sd", L"sr", L"ult", L"heal", L"cimu", L"acc", L"edgeon", L"wrand", L"stun", L"cdmg", L"respawn", L"kills"};
+// sr / ult are hidden: in online matches the ult meter never fills and Shachi only drops on hits
+const wchar_t* kMoreOpts[] = {L"sd", L"heal", L"cimu", L"acc", L"edgeon", L"wrand", L"stun", L"cdmg", L"respawn", L"kills"};
 template <size_t N> int Step(const int (&a)[N], int cur, int dir) {
     if (dir > 0) { for (size_t i = 0; i < N; ++i) if (a[i] > cur) return a[i]; return a[0]; }
     for (size_t i = N; i-- > 0;) if (a[i] < cur) return a[i]; return a[N - 1];
@@ -865,15 +866,15 @@ void Build() {
         };
         const wchar_t* basic[][2] = {{L"gmode", L"模式"}, {L"players", L"人数"}, {L"rounds", L"回合数"}, {L"time", L"限时"},
                                      {L"mapsel", L"地图"}, {L"dmg", L"伤害倍率"}, {L"hp", L"血量倍率"}, {L"preset", L"预设"}};
-        const wchar_t* more[][2] = {{L"sd", L"杀器伤害"}, {L"sr", L"杀气回复"}, {L"ult", L"大招充能"}, {L"heal", L"回血道具"},
+        const wchar_t* more[][2] = {{L"sd", L"杀器伤害"}, {L"heal", L"回血道具"},
                                     {L"cimu", L"慈母护符"}, {L"acc", L"饰品上限"}, {L"edgeon", L"杀器"}, {L"wrand", L"随机武器"},
                                     {L"stun", L"硬直递减"}, {L"cdmg", L"连段伤害递减"}, {L"respawn", L"复活等待"}, {L"kills", L"目标击杀"}};
         rows = VBox(); for (auto& o : basic) opt(o[0], o[1]);
         VAdd(v, rows, {0, 2, 0, 2}, 2); g.text[L"pagebasic"] = rows;
         auto page2 = VBox();
         auto two = HBox();
-        rows = VBox(); for (int i = 0; i < 6; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 12, 0});
-        rows = VBox(); for (int i = 6; i < 12; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 0, 0});
+        rows = VBox(); for (int i = 0; i < 5; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 12, 0});
+        rows = VBox(); for (int i = 5; i < 10; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 0, 0});
         VAdd(page2, two, {0, 0, 0, 4}, 2);
         // weapon bans: a toggle per weapon (wb<i>, bit i = Weapons()[i + 1]), 7 per line
         VAdd(page2, Center(MkText(L"wbtitle", L"禁用武器（点击切换）", 22, kDim)), {0, 2, 0, 2}, 2);

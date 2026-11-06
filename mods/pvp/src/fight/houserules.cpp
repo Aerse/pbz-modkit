@@ -1,7 +1,6 @@
 // houserules: see houserules.h.
-// sr / ult: every frame the rise of Shachi / UltimateCharge since the last frame is scaled to the
-// rule's %, so whatever raised it (regen, hits, accessories) is scaled the same; drops (hits taken,
-// spending) are left alone. Nothing of the game is changed persistently, so End only forgets.
+// sr / ult: not applied for now (see Tick). ScaleRise scales the rise of an attribute since the
+// last frame and is kept for when they come back. Nothing of the game is changed persistently.
 // sd / edge: Phantom Edge moves are GAs tagged Ability.Action.Hun.ShachiAbility.* (seen in game:
 // GA_BrutalAxe_Normal/Combo/Sprint). heal 0: GAs tagged *.UseItem (GA_Medicine_Common*) are cancelled;
 // heal 1: only the gourd (Hulu) may be equipped. cimu: 慈母护符 is accessory AC_BreakRegen.
@@ -78,7 +77,7 @@ int Cancel(UObject* ch, const wchar_t* tag) {
 }
 
 // scale the rise of an attribute since last frame to pct %
-void ScaleRise(UObject* me, int off, int maxOff, float& last, int pct) {
+[[maybe_unused]] void ScaleRise(UObject* me, int off, int maxOff, float& last, int pct) {
     float v = uex::Attr(me, off);
     if (last >= 0 && pct != 100 && v > last + 1e-4f) {
         float nv = last + (v - last) * pct / 100.f, mx = uex::Attr(me, maxOff);
@@ -100,8 +99,9 @@ void Tick(const rules::Rules& r, UObject* me, float) {
     if (me != g_me) { g_me = me; g_lastShachi = g_lastUlt = -1; }
     using namespace uex::attr;
     if (uex::Attr(me, ShachiMax) <= 0) return;  // attributes not there yet
-    ScaleRise(me, Shachi, ShachiMax, g_lastShachi, r.sr);
-    ScaleRise(me, Ult, UltMax, g_lastUlt, r.ult);
+    // sr / ult: off for now (hidden in the room settings). Measured online: UltimateCharge stays 0
+    // through hits dealt and taken, and Shachi (posture) only drops on hits taken, so a rise scale
+    // changes nothing; a room text from an older build with sr/ult != 100 is ignored.
     if (!r.edge && Active(me, kEdgeTag)) {
         int n = Cancel(me, kEdgeTag);
         if (g_edgeCancels++ < 20) uex::Log(L"houserules: edge off, cancelled %d Phantom Edge GA", n);
