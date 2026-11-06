@@ -6,6 +6,7 @@
 // and the weapon infos the swaps touch (red points) are restored by RestoreWeapons (fight::MatchOver).
 // Ghosts: CharacterWeaponsComponent::SetSlotWeapon/SetCurrentWeapon with the remote's config.
 #include "weapons.h"
+#include "../fileguard.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -85,6 +86,7 @@ int InfoLen(UObject* o) { int n = At<int32_t>(o->cls, kUStruct_PropsSize) - kInf
 // Not a property, so reflection has no name for it (the first property's offset, from clsprops, shows the gap)
 constexpr int kConfigIface = 0x30;
 
+UObject* g_arenaBp;                // backpack the edge was put into empty (cleared at match end)
 bool g_saved;                      // backpack snapshot taken (first Equip of a match)
 std::vector<FName> g_origSlots;    // PBZBackPackSubsystem::MainWeapons
 bool g_edgeSaved;                  // Phantom Edge snapshot taken (first EquipEdge of a match)
@@ -283,7 +285,18 @@ void EquipEdge(const std::string& id) {
     int cur = kCurShaqi.Of<int32_t>(bp), i = -1;
     if (cur >= 0 && cur < a.n && cur < 2 && !IsNone(s[cur])) i = cur;
     else for (int k = 0; k < a.n && k < 2; ++k) if (!IsNone(s[k])) { i = k; break; }
-    if (i < 0) { uex::Log(L"weapons: no Phantom Edge equipped in this save, %S skipped (an empty slot would add it to the inventory)", id.c_str()); return; }
+    if (i < 0) {
+        // empty slots (the arena world's own backpack starts empty): the edge is put into slot 0 of
+        // this world's backpack only. It dies with the arena world, and only while fileguard refuses
+        // every write under SaveGames, so it can never reach the player's save file.
+        if (!fileguard::Active()) { uex::Log(L"weapons: no Phantom Edge slot and no save guard, %S skipped", id.c_str()); return; }
+        ReplaceEdge(bp, it->second.id, 0);
+        g_arenaBp = bp;
+        a = EdgeSlots(bp);
+        uex::Log(L"weapons: Phantom Edge %S into the empty arena backpack (save guarded) -> %s", id.c_str(),
+                 a.d && a.n > 0 ? NameOf(reinterpret_cast<FName*>(a.d)[0]).c_str() : L"still empty");
+        return;
+    }
     if (Same(s[i], it->second.id)) return;  // already in that slot
     SaveInfos(bp);
     if (!g_edgeSaved) { g_origEdges.assign(s, s + a.n); g_edgeSaved = true; }
@@ -316,6 +329,15 @@ void Equip(const std::string& id) {
 }
 
 void RestoreWeapons() {
+    if (g_arenaBp) {  // only if it is still the same live backpack: the slot goes back to empty
+        UObject* bp = Backpack();
+        if (bp == g_arenaBp) {
+            Arr a = EdgeSlots(bp);
+            if (a.d && a.n > 0) reinterpret_cast<FName*>(a.d)[0] = FName{};
+            uex::Log(L"weapons: arena Phantom Edge cleared");
+        }
+        g_arenaBp = nullptr;
+    }
     if (!g_saved && !g_edgeSaved && !g_infosSaved) return;
     auto clear = [] { g_saved = g_edgeSaved = g_infosSaved = false; g_origSlots.clear(); g_origEdges.clear(); g_infos.clear(); };
     auto bp = Backpack(); if (!bp) { uex::Log(L"weapons: restore without backpack"); clear(); return; }

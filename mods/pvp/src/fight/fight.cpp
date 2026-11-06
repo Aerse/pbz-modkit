@@ -1262,6 +1262,7 @@ void Begin(int round) {
             uex::Log(L"fight: rules %S (mode %S)", rules::Format(g_rules).c_str(), r.mode.c_str());
         }
         Equip(id);
+        if (!g_rules.edge) edge.clear();  // room rule: no Phantom Edge (houserules also cancels its GAs)
         EquipEdge(edge);
         g_sentWeapon.clear(); g_nextWeaponSend = 0;
         g_sentEdge.clear(); g_nextEdgeSend = 0;
