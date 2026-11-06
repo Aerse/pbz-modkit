@@ -467,10 +467,20 @@ void ApplyHit(float amt, float frac, int from, float posture, bool back) {
         float smx = uex::Attr(g_me, ShachiMax), smin = uex::Attr(g_me, ShachiMin);
         uex::SetAttr(g_me, Shachi, (std::max)(smin, uex::Attr(g_me, Shachi) - posture * smx));
     }
-    g_lastHitter = from; g_lastHitAt = net::Now();
+    // measure (v1.5): hits < 0.8 s apart form one chain; log the gap, the chain index and what
+    // already holds the pawn (a game montage such as a knockdown / launch blocks our HitReaction)
+    static int s_chain = 0; static double s_chainT0 = 0;
+    double now = net::Now(), gap = now - g_lastHitAt;
+    if (gap >= 0.8) { s_chain = 0; s_chainT0 = now; }
+    ++s_chain;
+    g_lastHitter = from; g_lastHitAt = now;
     uex::Log(L"fight: took %.1f (shield %.1f) from %d hp %.1f -> %.1f", d, fromShield, from, h, nh);
     g_lastHitBack = back;
-    if (nh > 1.f && d > 0.01f) { HitReaction(back); HitStop(); }  // posture only (deflected): no flinch
+    auto ai0 = AnimOf(g_me); UObject* held = ai0 ? CurMontage(ai0) : nullptr;
+    bool react = nh > 1.f && d > 0.01f;
+    if (react) { HitReaction(back); HitStop(); }  // posture only (deflected): no flinch
+    uex::Log(L"fight: chain n=%d gap=%.3f len=%.3f held=%s ourReact=%d", s_chain, gap < 99 ? gap : -1.0, now - s_chainT0,
+             held ? NameOf(held).c_str() : L"-", int(react && !held));
 }
 
 // hit-stop on the victim: the game freezes only the attacker (CustomTimeDilation ~0.05 for ~70 ms);
@@ -503,6 +513,7 @@ void ResolveHit(float amt, float frac, int from, float posture, int round, doubl
         char b[96]; snprintf(b, sizeof b, "res %d %d %s %d", from, MySlot(), res, round);
         net::Sure(b);
         uex::Log(L"fight: hit from %d (%.1f) -> %S", from, amt, res);
+        uex::Log(L"fight: measure res=%S gap=%.3f", res, net::Now() - g_lastHitAt);
         return;
     }
     ApplyHit(amt, frac, from, posture, FromBehind(from, attackerYaw));
