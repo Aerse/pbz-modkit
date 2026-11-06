@@ -1,5 +1,5 @@
 name=联机 PVP
-version=1.4.2
+version=1.5
 author=Seed
 api=3
 game=CL-302256_JKS-17280 (2026-11-04)
