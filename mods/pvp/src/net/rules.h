@@ -17,6 +17,7 @@ struct Rules {
     int cimu = 0;      // 1 = 慈母护符 banned
     int acc = 9;       // accessory limit, 9 = any
     int edge = 1;      // 0 = Phantom Edge off
+    int ecd = 5;       // Phantom Edge cooldown, s after a move ends (0 = none), 0..30
     uint32_t wban = 0; // banned weapons, bit i = fight::Weapons()[i + 1]
     int wrand = 0;     // 1 = random weapon each round
     int stun = 6;      // combo protection: no hit-stun after the Nth hit of a chain, 0 = off
@@ -42,6 +43,7 @@ inline Rules Parse(const std::string& s) {
         else if (k == "cimu") r.cimu = Clamp(v, 0, 1);
         else if (k == "acc") r.acc = Clamp(v, 0, 9);
         else if (k == "edge") r.edge = Clamp(v, 0, 1);
+        else if (k == "ecd") r.ecd = Clamp(v, 0, 30);
         else if (k == "wban") r.wban = (uint32_t)strtoul(it.c_str() + c + 1, nullptr, 10) & 0x3FFFFFFFu;
         else if (k == "wrand") r.wrand = Clamp(v, 0, 1);
         else if (k == "stun") { r.stun = Clamp(v, 0, 10); if (r.stun && r.stun < 3) r.stun = 3; }
@@ -54,7 +56,7 @@ inline Rules Parse(const std::string& s) {
 inline std::string Format(const Rules& r) {
     auto kv = [](const char* k, long v) { return std::string(k) + ":" + std::to_string(v); };
     return kv("hp", r.hp) + "," + kv("sd", r.sd) + "," + kv("sr", r.sr) + "," + kv("ult", r.ult) + "," +
-           kv("heal", r.heal) + "," + kv("cimu", r.cimu) + "," + kv("acc", r.acc) + "," + kv("edge", r.edge) + "," +
+           kv("heal", r.heal) + "," + kv("cimu", r.cimu) + "," + kv("acc", r.acc) + "," + kv("edge", r.edge) + "," + kv("ecd", r.ecd) + "," +
            kv("wban", (long)r.wban) + "," + kv("wrand", r.wrand) + "," + kv("stun", r.stun) + "," + kv("cdmg", r.cdmg);
 }
 

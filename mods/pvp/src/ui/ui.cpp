@@ -120,6 +120,7 @@ const int kRounds[] = {1, 3, 5, 7, 9};
 const int kTimes[] = {0, 60, 90, 120, 180, 300};
 const int kStuns[] = {0, 3, 4, 5, 6, 7, 8, 9, 10};
 const int kRespawns[] = {3, 5, 8, 10, 15};
+const int kEcds[] = {0, 3, 5, 8, 10, 15};  // Phantom Edge cooldown steps, s
 const int kKills[] = {0, 5, 10, 15, 20, 30};
 
 // palette
@@ -507,7 +508,7 @@ std::wstring ModeLabel(const std::string& m) { return m == "ffa" ? L"混战" : m
 bool Banned(const rules::Rules& R, int weapon) { return weapon >= 1 && weapon <= 30 && (R.wban >> (weapon - 1)) & 1; }
 const wchar_t* kBasicOpts[] = {L"gmode", L"players", L"rounds", L"time", L"mapsel", L"dmg", L"hp", L"preset"};
 // sr / ult are hidden: in online matches the ult meter never fills and Shachi only drops on hits
-const wchar_t* kMoreOpts[] = {L"sd", L"heal", L"cimu", L"acc", L"edgeon", L"wrand", L"stun", L"cdmg", L"respawn", L"kills"};
+const wchar_t* kMoreOpts[] = {L"sd", L"heal", L"cimu", L"acc", L"edgeon", L"ecd", L"wrand", L"stun", L"cdmg", L"respawn", L"kills"};
 template <size_t N> int Step(const int (&a)[N], int cur, int dir) {
     if (dir > 0) { for (size_t i = 0; i < N; ++i) if (a[i] > cur) return a[i]; return a[0]; }
     for (size_t i = N; i-- > 0;) if (a[i] < cur) return a[i]; return a[N - 1];
@@ -533,6 +534,7 @@ bool CfgStep(Cfg& c, const std::wstring& id, int dir, int cap) {
     else if (id == L"cimu") R.cimu ^= 1;
     else if (id == L"acc") R.acc = Wrap(R.acc + dir, 0, 9, 1);
     else if (id == L"edgeon") R.edge ^= 1;
+    else if (id == L"ecd") R.ecd = Step(kEcds, R.ecd, dir);
     else if (id == L"wrand") R.wrand ^= 1;
     else if (id == L"stun") R.stun = Step(kStuns, R.stun, dir);
     else if (id == L"cdmg") R.cdmg ^= 1;
@@ -561,6 +563,7 @@ bool CfgSet(Cfg& c, const std::wstring& id, const std::wstring& v, int cap) {
     else if (id == L"cimu") R.cimu = num(0, 1, 1);
     else if (id == L"acc") R.acc = num(0, 9, 1);
     else if (id == L"edgeon") R.edge = num(0, 1, 1);
+    else if (id == L"ecd") R.ecd = num(0, 30, 1);
     else if (id == L"wrand") R.wrand = num(0, 1, 1);
     else if (id == L"stun") { R.stun = num(0, 10, 1); if (R.stun && R.stun < 3) R.stun = 3; }
     else if (id == L"cdmg") R.cdmg = num(0, 1, 1);
@@ -589,6 +592,7 @@ std::wstring CfgValue(const Cfg& c, const std::wstring& id) {
     if (id == L"cimu") return R.cimu ? L"禁用" : L"允许";
     if (id == L"acc") return R.acc >= 9 ? L"不限" : std::to_wstring(R.acc) + L" 件";
     if (id == L"edgeon") return OnOff(R.edge);
+    if (id == L"ecd") return R.ecd ? std::to_wstring(R.ecd) + L" 秒" : L"无";
     if (id == L"wrand") return OnOff(R.wrand);
     if (id == L"stun") return R.stun ? L"第 " + std::to_wstring(R.stun) + L" 下后" : L"关";
     if (id == L"cdmg") return OnOff(R.cdmg);
@@ -610,6 +614,7 @@ std::wstring CfgSummary(const Cfg& c) {
     if (R.cimu) s += L"  禁慈母";
     if (R.acc < 9) s += L"  饰品≤" + std::to_wstring(R.acc);
     if (!R.edge) s += L"  无杀器";
+    else if (R.ecd != d.ecd) s += L"  杀器冷却 " + CfgValue(c, L"ecd");
     if (R.wban) { int n = 0; for (uint32_t b = R.wban; b; b &= b - 1) ++n; s += L"  禁用武器 " + std::to_wstring(n); }
     if (R.wrand) s += L"  随机武器";
     if (R.stun != d.stun) s += L"  硬直递减 " + CfgValue(c, L"stun");
@@ -867,14 +872,14 @@ void Build() {
         const wchar_t* basic[][2] = {{L"gmode", L"模式"}, {L"players", L"人数"}, {L"rounds", L"回合数"}, {L"time", L"限时"},
                                      {L"mapsel", L"地图"}, {L"dmg", L"伤害倍率"}, {L"hp", L"血量倍率"}, {L"preset", L"预设"}};
         const wchar_t* more[][2] = {{L"sd", L"杀器伤害"}, {L"heal", L"回血道具"},
-                                    {L"cimu", L"慈母护符"}, {L"acc", L"饰品上限"}, {L"edgeon", L"杀器"}, {L"wrand", L"随机武器"},
+                                    {L"cimu", L"慈母护符"}, {L"acc", L"饰品上限"}, {L"edgeon", L"杀器"}, {L"ecd", L"杀器冷却"}, {L"wrand", L"随机武器"},
                                     {L"stun", L"硬直递减"}, {L"cdmg", L"连段伤害递减"}, {L"respawn", L"复活等待"}, {L"kills", L"目标击杀"}};
         rows = VBox(); for (auto& o : basic) opt(o[0], o[1]);
         VAdd(v, rows, {0, 2, 0, 2}, 2); g.text[L"pagebasic"] = rows;
         auto page2 = VBox();
         auto two = HBox();
-        rows = VBox(); for (int i = 0; i < 5; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 12, 0});
-        rows = VBox(); for (int i = 5; i < 10; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 0, 0});
+        rows = VBox(); for (int i = 0; i < 6; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 12, 0});
+        rows = VBox(); for (int i = 6; i < 11; ++i) opt(more[i][0], more[i][1]); HAdd(two, rows, {0, 0, 0, 0});
         VAdd(page2, two, {0, 0, 0, 4}, 2);
         // weapon bans: a toggle per weapon (wb<i>, bit i = Weapons()[i + 1]), 7 per line
         VAdd(page2, Center(MkText(L"wbtitle", L"禁用武器（点击切换）", 22, kDim)), {0, 2, 0, 2}, 2);
@@ -921,6 +926,23 @@ void Build() {
     };
     side(false, &g.myBar, L"myname", L"mypips", {0.86f, 0.18f, 0.14f, 1});
     side(true, &g.oppBar, L"oppname", L"opppips", {0.86f, 0.18f, 0.14f, 1});
+    {   // Phantom Edge cooldown under my bar: "杀器 就绪" / "杀器 冷却 3.2 秒" over a thin bar that fills up
+        UObject* ev; auto eb = Frame({0, 0}, {0, 0}, {60, 150}, &ev, {0, 0, 0, 0.45f}, g.hud);
+        Call1(eb, L"SetPadding", L"InPadding", Margin{16, 6, 16, 8});
+        auto h = HBox(); HAdd(h, MkText(L"ecdlabel", L"杀器", 22, kDim), {0, 0, 14, 0}); HAdd(h, MkText(L"ecdtext", L"就绪", 22, kGold));
+        VAdd(ev, h, {0, 0, 0, 4}, 1);
+        auto sb = New(L"SizeBox", g.tree); auto bar = New(L"ProgressBar", g.tree);
+        Call1<float>(sb, L"SetWidthOverride", L"InWidthOverride", 220.f);
+        Call1<float>(sb, L"SetHeightOverride", L"InHeightOverride", 8.f);
+        auto st = reinterpret_cast<uint8_t*>(bar) + kBarStyle;
+        MakeBrush(st + kPbBack, art::kHpBack, 3, {0.25f, 0.22f, 0.2f, 0.85f});
+        MakeBrush(st + kPbFill, art::kHpFill, 3, {1, 1, 1, 1});
+        Put(bar, kBarPad, V2{0, 0});
+        Call1(bar, L"SetFillColorAndOpacity", L"InColor", Color{0.92f, 0.74f, 0.36f, 1});
+        Call1<float>(bar, L"SetPercent", L"InPercent", 1.f);
+        Add(sb, bar); VAdd(ev, sb, {0, 0, 0, 0}, 1);
+        g.text[L"ecdbox"] = eb; g.text[L"ecdbar"] = bar; Put<uint8_t>(eb, kVis, kCollapsed);
+    }
     {   // centre plaque: round over a big timer
         UObject* pv; auto pl = Frame({0.5, 0}, {0.5, 0}, {0, 18}, &pv, {0, 0, 0, 0.45f}, g.hud);
         Call1(pl, L"SetPadding", L"InPadding", Margin{40, 8, 40, 10});
@@ -1442,6 +1464,19 @@ void UpdateFight(const net::Room& r) {
         uex::SetText(g.text[L"myhp"], std::to_wstring(int(f * 100 + 0.5f)) + L"%");
     }
     if (auto m = Find(r, r.you)) { uex::SetText(g.text[L"myname"], uex::Wide(m->name)); uex::SetText(g.text[L"mypips"], Pips(r, m->score)); }
+    {   // Phantom Edge cooldown (ecd): shown in the fight while the room has one and edges are on
+        auto cd = houserules::EdgeCooldown();
+        bool on = r.phase == "fight" && cd.len > 0 && rules::Parse(r.rules).edge;
+        Vis(g.text[L"ecdbox"], on ? kHitTestInvisible : kCollapsed);
+        if (on) {
+            static std::wstring shown;
+            wchar_t b[32]; if (cd.left > 0) swprintf(b, 32, L"冷却 %.1f 秒", cd.left); else wcscpy_s(b, L"就绪");
+            if (shown != b) { uex::SetText(g.text[L"ecdtext"], b); shown = b; }
+            bool flash = cd.sinceBlocked < 0.6;  // pressed while cooling down: red for a moment
+            TextColor(g.text[L"ecdtext"], flash ? kRed : cd.left > 0 ? kInk : kGold);
+            Call1<float>(g.text[L"ecdbar"], L"SetPercent", L"InPercent", cd.left > 0 ? 1.f - cd.left / cd.len : 1.f);
+        }
+    }
     for (auto& m : r.members) {
         if (m.slot == r.you) continue;
         net::State st;

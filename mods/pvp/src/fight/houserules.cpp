@@ -6,6 +6,7 @@
 // heal 1: only the gourd (Hulu) may be equipped. cimu: 慈母护符 is accessory AC_BreakRegen.
 // acc: AssemblyAccessory slots in use.
 #include "houserules.h"
+#include <algorithm>
 #include <cmath>
 #include "uex.h"
 #include "ue_call.h"
@@ -29,6 +30,9 @@ UObject* g_me;
 float g_lastShachi = -1, g_lastUlt = -1;
 int g_edgeCancels, g_healCancels;
 float g_sdScale = 1.f;
+// ecd: a Phantom Edge move running sets g_edgeBusy; when no move is active any more the cooldown
+// starts (a Normal -> Combo chain counts as one move). A move started during it is cancelled.
+bool g_edgeBusy; double g_edgeReadyAt, g_edgeBlockedAt = -100, g_clock; float g_ecdLen;
 
 UObject* Backpack(UObject* me) {
     auto cls = uex::Class(L"Class /Script/ProjectPBZ.PBZBackPackSubsystem");
@@ -91,10 +95,11 @@ int Cancel(UObject* ch, const wchar_t* tag) {
 void Begin(const rules::Rules& r, UObject* me) {
     g_on = me != nullptr; g_me = me;
     g_lastShachi = g_lastUlt = -1; g_edgeCancels = g_healCancels = 0; g_sdScale = r.sd / 100.f;
-    if (g_on) uex::Log(L"houserules: begin sr %d ult %d sd %d edge %d heal %d", r.sr, r.ult, r.sd, r.edge, r.heal);
+    g_edgeBusy = false; g_edgeReadyAt = 0; g_edgeBlockedAt = -100; g_clock = 0; g_ecdLen = float(r.ecd);  // every round starts ready
+    if (g_on) uex::Log(L"houserules: begin sd %d edge %d ecd %d heal %d", r.sd, r.edge, r.ecd, r.heal);
 }
 
-void Tick(const rules::Rules& r, UObject* me, float) {
+void Tick(const rules::Rules& r, UObject* me, float dt) {
     if (!g_on || !me) return;
     if (me != g_me) { g_me = me; g_lastShachi = g_lastUlt = -1; }
     using namespace uex::attr;
@@ -102,6 +107,16 @@ void Tick(const rules::Rules& r, UObject* me, float) {
     // sr / ult: off for now (hidden in the room settings). Measured online: UltimateCharge stays 0
     // through hits dealt and taken, and Shachi (posture) only drops on hits taken, so a rise scale
     // changes nothing; a room text from an older build with sr/ult != 100 is ignored.
+    g_clock += dt; g_ecdLen = float(r.ecd);
+    if (r.edge && r.ecd > 0) {
+        bool act = Active(me, kEdgeTag);
+        if (act && !g_edgeBusy && g_clock < g_edgeReadyAt) {  // started while cooling down
+            int n = Cancel(me, kEdgeTag); act = false; g_edgeBlockedAt = g_clock;
+            if (g_edgeCancels++ < 20) uex::Log(L"houserules: edge cooldown %.1f s left, cancelled %d GA", g_edgeReadyAt - g_clock, n);
+        }
+        if (g_edgeBusy && !act) g_edgeReadyAt = g_clock + r.ecd;
+        g_edgeBusy = act;
+    }
     if (!r.edge && Active(me, kEdgeTag)) {
         int n = Cancel(me, kEdgeTag);
         if (g_edgeCancels++ < 20) uex::Log(L"houserules: edge off, cancelled %d Phantom Edge GA", n);
@@ -115,6 +130,14 @@ void Tick(const rules::Rules& r, UObject* me, float) {
 void End(UObject* me) {
     if (g_on && me) uex::Log(L"houserules: end");
     g_on = false; g_me = nullptr; g_lastShachi = g_lastUlt = -1;
+}
+
+EdgeCd EdgeCooldown() {
+    EdgeCd c;
+    if (!g_on || g_ecdLen <= 0) return c;
+    c.len = g_ecdLen; c.left = g_edgeBusy ? 0.f : float((std::max)(0.0, g_edgeReadyAt - g_clock));
+    c.sinceBlocked = g_clock - g_edgeBlockedAt;
+    return c;
 }
 
 float OutgoingScale(UObject* me) {
